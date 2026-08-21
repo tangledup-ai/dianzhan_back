@@ -1,0 +1,274 @@
+import { Fragment, useMemo, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
+import { getElectricityMonthlyLedger } from "@/api/electricity";
+import { Button } from "@/components/ui/button";
+import { inputCls } from "@/components/fields";
+import { fmtMoney, fmtNum } from "@/lib/format";
+import { toCompact, toDisplay } from "@/lib/period";
+import { Building2, Tag, ChevronDown, ChevronRight } from "lucide-react";
+
+// 电费月台账（v2 重设计）：只显示电费经营信息
+// 参考 Rent 页风格：月份区间 + 按场地方/品牌方 + 区间总览 + 按月展开明细
+// 已移除「新增电费」「自动生成」按钮（台账由 电表归属/合同/读数 变更自动生成）
+
+function StatCard({ label, value, suffix = "", tone = "slate" }: { label: string; value?: number; suffix?: string; tone?: "emerald" | "rose" | "blue" | "slate" }) {
+  const color = tone === "emerald" ? "text-emerald-600" : tone === "rose" ? "text-rose-600" : tone === "blue" ? "text-blue-600" : "text-slate-700";
+  return (
+    <div className="rounded-xl border bg-white p-3 shadow-sm">
+      <div className="text-[11px] text-slate-400">{label}</div>
+      <div className={`text-lg font-bold tabular-nums ${color}`}>{suffix === "kwh" ? fmtNum(value ?? 0) : fmtMoney(value ?? 0)}</div>
+    </div>
+  );
+}
+
+const now = new Date();
+const CUR_MONTH = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, "0")}`;
+
+function shift(period: string, offset: number): string {
+  const y = parseInt(period.slice(0, 4), 10);
+  const m = parseInt(period.slice(4, 6), 10);
+  const dt = new Date(y, m - 1 + offset, 1);
+  return `${dt.getFullYear()}${String(dt.getMonth() + 1).padStart(2, "0")}`;
+}
+
+export default function Electricity() {
+  const [startPeriod, setStartPeriod] = useState(CUR_MONTH);
+  const [endPeriod, setEndPeriod] = useState(CUR_MONTH);
+  const [dim, setDim] = useState<"landlord" | "brand">("landlord");
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+
+  const monthRange = useMemo(() => {
+    const list: string[] = [];
+    let p = startPeriod;
+    let guard = 0;
+    while (p <= endPeriod && guard < 36) {
+      list.push(p);
+      p = shift(p, 1);
+      guard++;
+    }
+    return list;
+  }, [startPeriod, endPeriod]);
+
+  const q = useQuery({
+    queryKey: ["electricity-monthly-ledger-range", startPeriod, endPeriod, dim],
+    queryFn: async () => {
+      const results = await Promise.all(monthRange.map((p) => getElectricityMonthlyLedger(p, dim)));
+      return monthRange.map((p, i) => ({ period: p, ...results[i] }));
+    },
+    enabled: monthRange.length > 0,
+  });
+
+  const toggle = (key: string) => {
+    setExpanded(prev => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  };
+
+  const months: any[] = q.data ?? [];
+  const totals = useMemo(() => {
+    const t = { kwh: 0, payAmount: 0, collectAmount: 0, collectNet: 0, elecTax: 0, profit: 0 };
+    for (const m of months) {
+      const mt = m.totals ?? {};
+      t.kwh += mt.kwh ?? 0;
+      t.payAmount += mt.payAmount ?? 0;
+      t.collectAmount += mt.collectAmount ?? 0;
+      t.collectNet += mt.collectNet ?? 0;
+      t.elecTax += mt.elecTax ?? 0;
+      t.profit += mt.profit ?? 0;
+    }
+    return t;
+  }, [months]);
+
+  const quick = (n: number) => {
+    setEndPeriod(CUR_MONTH);
+    setStartPeriod(shift(CUR_MONTH, -(n - 1)));
+  };
+
+  return (
+    <div className="space-y-4">
+      {/* ── 顶部：月份区间 + 维度切换 ── */}
+      <div className="flex flex-wrap items-center gap-3">
+        <h2 className="text-lg font-bold">电费月台账</h2>
+        <div className="flex items-center gap-1 text-xs text-slate-500">
+          <span>从</span>
+          <input type="month" className={`${inputCls} w-36`} value={toDisplay(startPeriod)}
+            onChange={(e) => e.target.value && setStartPeriod(toCompact(e.target.value))} />
+          <span>到</span>
+          <input type="month" className={`${inputCls} w-36`} value={toDisplay(endPeriod)}
+            onChange={(e) => e.target.value && setEndPeriod(toCompact(e.target.value))} />
+        </div>
+        <div className="flex gap-1">
+          <Button size="sm" variant="outline" onClick={() => { setStartPeriod(CUR_MONTH); setEndPeriod(CUR_MONTH); }}>本月</Button>
+          <Button size="sm" variant="outline" onClick={() => quick(3)}>近3月</Button>
+          <Button size="sm" variant="outline" onClick={() => quick(6)}>近6月</Button>
+          <Button size="sm" variant="outline" onClick={() => quick(12)}>近12月</Button>
+        </div>
+        <div className="flex overflow-hidden rounded-lg border">
+          <Button size="sm" variant={dim === "landlord" ? "default" : "ghost"}
+            className={dim === "landlord" ? "bg-emerald-600 hover:bg-emerald-700" : ""}
+            onClick={() => setDim("landlord")}>
+            <Building2 className="mr-1 h-3.5 w-3.5" />按场地方
+          </Button>
+          <Button size="sm" variant={dim === "brand" ? "default" : "ghost"}
+            className={dim === "brand" ? "bg-blue-600 hover:bg-blue-700" : ""}
+            onClick={() => setDim("brand")}>
+            <Tag className="mr-1 h-3.5 w-3.5" />按品牌方
+          </Button>
+        </div>
+        <span className="text-xs text-slate-400">{toDisplay(startPeriod)} ~ {toDisplay(endPeriod)} · 电费经营信息</span>
+      </div>
+
+      {/* ── 区间总览 ── */}
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-6">
+        <StatCard label="区间电量（度）" value={totals.kwh} suffix="kwh" />
+        <StatCard label="电费付款（成本）" value={totals.payAmount} tone="rose" />
+        <StatCard label="电费收款（含税）" value={totals.collectAmount} />
+        <StatCard label="电费收款（不含税）" value={totals.collectNet} tone="emerald" />
+        <StatCard label="电费税费" value={totals.elecTax} />
+        <StatCard label="电费利润" value={totals.profit} tone="blue" />
+      </div>
+
+      {/* ── 按月总览表 ── */}
+      <div className="overflow-x-auto rounded-xl border bg-white shadow-sm">
+        <table className="w-full min-w-[1000px] text-xs">
+          <thead>
+            <tr className="border-b bg-slate-50 text-left text-[11px] text-slate-500">
+              <th className="w-8 px-2 py-2.5"></th>
+              <th className="px-3 py-2.5 font-medium">月份</th>
+              <th className="px-3 py-2.5 text-right font-medium">电量（度）</th>
+              <th className="px-3 py-2.5 text-right font-medium">电费付款</th>
+              <th className="px-3 py-2.5 text-right font-medium">收款含税</th>
+              <th className="px-3 py-2.5 text-right font-medium">收款不含税</th>
+              <th className="px-3 py-2.5 text-right font-medium">税费</th>
+              <th className="px-3 py-2.5 text-right font-medium">利润</th>
+            </tr>
+          </thead>
+          <tbody>
+            {months.length === 0 && (
+              <tr><td colSpan={8} className="px-3 py-8 text-center text-slate-400">
+                {q.isLoading ? "加载中…" : "请选择有效的月份区间"}
+              </td></tr>
+            )}
+            {months.map((m) => {
+              const mt = m.totals ?? {};
+              const mKey = `m-${m.period}`;
+              const mOpen = expanded.has(mKey);
+              return (
+                <Fragment key={mKey}>
+                  <tr className="cursor-pointer border-b hover:bg-slate-50/60" onClick={() => toggle(mKey)}>
+                    <td className="px-2 py-2.5 text-slate-400">
+                      {mOpen ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
+                    </td>
+                    <td className="px-3 py-2.5 font-medium text-slate-700">{toDisplay(m.period)}</td>
+                    <td className="px-3 py-2.5 text-right tabular-nums text-slate-600">{fmtNum(mt.kwh)}</td>
+                    <td className="px-3 py-2.5 text-right tabular-nums text-rose-600">{fmtMoney(mt.payAmount)}</td>
+                    <td className="px-3 py-2.5 text-right tabular-nums text-slate-500">{fmtMoney(mt.collectAmount)}</td>
+                    <td className="px-3 py-2.5 text-right tabular-nums text-emerald-600">{fmtMoney(mt.collectNet)}</td>
+                    <td className="px-3 py-2.5 text-right tabular-nums text-slate-500">{fmtMoney(mt.elecTax)}</td>
+                    <td className="px-3 py-2.5 text-right tabular-nums font-medium text-slate-700">{fmtMoney(mt.profit)}</td>
+                  </tr>
+                  {mOpen && (
+                    <tr className="border-b bg-slate-50/40">
+                      <td colSpan={8} className="px-6 py-3">
+                        <div className="space-y-1">
+                          <div className="text-[11px] font-medium text-slate-400">
+                            {toDisplay(m.period)} · 按{dim === "landlord" ? "场地方" : "品牌方"}明细（点击展开站点/电表）
+                          </div>
+                          {(m.rows ?? []).map((g: any) => {
+                            const rKey = `r-${m.period}-${dim}-${g.key}`;
+                            const rOpen = expanded.has(rKey);
+                            return (
+                              <Fragment key={rKey}>
+                                <div className="flex cursor-pointer items-center gap-x-4 rounded-md border bg-white px-3 py-1.5 text-xs hover:bg-slate-50" onClick={() => toggle(rKey)}>
+                                  <span className="text-slate-400">{rOpen ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}</span>
+                                  <span className="w-44 font-medium text-slate-700">{g.name}</span>
+                                  <span className="text-slate-500 tabular-nums">{fmtNum(g.kwh)} 度</span>
+                                  <span className="text-rose-600 tabular-nums">付 {fmtMoney(g.payAmount)}</span>
+                                  <span className="text-emerald-600 tabular-nums">收 {fmtMoney(g.collectNet)}</span>
+                                  <span className="text-slate-400 tabular-nums">税 {fmtMoney(g.elecTax)}</span>
+                                  <span className="ml-auto text-slate-700 tabular-nums">利 {fmtMoney(g.profit)}</span>
+                                </div>
+                                {rOpen && (
+                                  <div className="ml-6 overflow-x-auto rounded-lg border bg-white">
+                                    <table className="w-full min-w-[920px] text-[11px]">
+                                      <thead>
+                                        <tr className="border-b bg-slate-100 text-left text-[10px] text-slate-500">
+                                          <th className="px-2 py-1.5" rowSpan={2}>{dim === "landlord" ? "站点" : "电表"}</th>
+                                          <th className="px-2 py-1.5" rowSpan={2}>互感器倍数</th>
+                                          <th className="px-2 py-1.5" rowSpan={2}>度数(kWh)</th>
+                                          <th className="border-x bg-rose-50/70 px-2 py-1.5 text-center" colSpan={3}>付款信息</th>
+                                          <th className="border-x bg-emerald-50/70 px-2 py-1.5 text-center" colSpan={4}>收款信息</th>
+                                          <th className="px-2 py-1.5" rowSpan={2}>利润</th>
+                                        </tr>
+                                        <tr className="border-b bg-slate-100 text-[10px] text-slate-500">
+                                          <th className="border-x px-2 py-1">单价</th>
+                                          <th className="px-2 py-1">金额</th>
+                                          <th className="px-2 py-1">情况</th>
+                                          <th className="border-x px-2 py-1">单价</th>
+                                          <th className="px-2 py-1">金额(含税)</th>
+                                          <th className="px-2 py-1">不含税</th>
+                                          <th className="px-2 py-1">到账</th>
+                                        </tr>
+                                      </thead>
+                                      <tbody>
+                                        {(g.details ?? []).map((d: any, i: number) => (
+                                          <tr key={i} className="border-b last:border-0 hover:bg-slate-50/50">
+                                            <td className="px-2 py-1.5">
+                                              <div className="font-medium text-slate-700">{d.stationName ?? "—"}</div>
+                                              <div className="font-mono text-[10px] text-slate-400">{d.meterNo}{d.meterName ? ` · ${d.meterName}` : ""}</div>
+                                            </td>
+                                            <td className="px-2 py-1.5 text-right tabular-nums">{fmtNum(d.transformerRatio)}</td>
+                                            <td className="px-2 py-1.5 text-right tabular-nums">{fmtNum(d.kwh ?? d.payKwh)}</td>
+                                            <td className="border-x px-2 py-1.5 text-right tabular-nums">{d.payUnitPrice != null ? fmtNum(d.payUnitPrice) : "—"}</td>
+                                            <td className="px-2 py-1.5 text-right tabular-nums text-rose-600">{fmtMoney(d.payAmount)}</td>
+                                            <td className="px-2 py-1.5">{d.payStatus ?? "—"}</td>
+                                            <td className="border-x px-2 py-1.5 text-right tabular-nums">{d.collectUnitPrice != null ? fmtNum(d.collectUnitPrice) : "—"}</td>
+                                            <td className="px-2 py-1.5 text-right tabular-nums">{fmtMoney(d.collectAmount)}</td>
+                                            <td className="px-2 py-1.5 text-right tabular-nums text-emerald-600">{fmtMoney(d.collectNet)}</td>
+                                            <td className="px-2 py-1.5">{d.collectStatus ?? "—"}</td>
+                                            <td className="px-2 py-1.5 text-right tabular-nums font-medium text-slate-700">
+                                              {fmtMoney(d.profit ?? (Number(d.collectNet ?? 0) - Number(d.payAmount ?? 0)))}
+                                            </td>
+                                          </tr>
+                                        ))}
+                                      </tbody>
+                                    </table>
+                                  </div>
+                                )}
+                              </Fragment>
+                            );
+                          })}
+                        </div>
+                      </td>
+                    </tr>
+                  )}
+                </Fragment>
+              );
+            })}
+          </tbody>
+          {months.length > 0 && (
+            <tfoot>
+              <tr className="border-t bg-slate-50 font-medium">
+                <td className="px-2 py-2.5" colSpan={2}>区间合计（{months.length} 个月）</td>
+                <td className="px-3 py-2.5 text-right tabular-nums">{fmtNum(totals.kwh)}</td>
+                <td className="px-3 py-2.5 text-right tabular-nums text-rose-600">{fmtMoney(totals.payAmount)}</td>
+                <td className="px-3 py-2.5 text-right tabular-nums">{fmtMoney(totals.collectAmount)}</td>
+                <td className="px-3 py-2.5 text-right tabular-nums text-emerald-600">{fmtMoney(totals.collectNet)}</td>
+                <td className="px-3 py-2.5 text-right tabular-nums">{fmtMoney(totals.elecTax)}</td>
+                <td className="px-3 py-2.5 text-right tabular-nums">{fmtMoney(totals.profit)}</td>
+              </tr>
+            </tfoot>
+          )}
+        </table>
+      </div>
+
+      <p className="text-[11px] text-slate-400">
+        口径：电费付款=实际度数×场地合同单价；电费收款=实际度数×品牌方合同单价（按电表品牌匹配）；
+        税费=含税收款−不含税收款；利润=不含税收款−付款。台账由「电表归属/合同/读数」变更自动生成，无需手动操作。
+      </p>
+    </div>
+  );
+}

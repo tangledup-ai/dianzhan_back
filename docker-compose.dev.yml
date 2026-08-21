@@ -1,0 +1,22 @@
+# 开发环境专用配置
+# 使用方法: docker-compose -f docker-compose.dev.yml up
+
+services:
+  # FastAPI 后端（带热重载）
+  backend:
+    build: ./backend
+    container_name: battery-swap-backend
+    ports:
+      - "3001:3001"
+    environment:
+      - DATABASE_URL=postgresql://quant:quant-speed123@host.docker.internal:5432/dianzhan-test
+      - PORT=3001
+      - TQ_API_URL=https://api1.tqdianbiao.com
+      - TQ_AUTH_CODE=5ec0b6bf6f59984d97ec54f775a3c780
+      - RENT_EXCEL_PATH=/app/data/2026-2027美团场租.xlsx
+    volumes:
+      - ./backend/app:/app/app
+      - ./backend/data:/app/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped

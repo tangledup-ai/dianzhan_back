@@ -1,0 +1,1097 @@
+import { useState, useMemo } from "react";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { listEntities, listLandlords } from "@/api/directory";
+import { listContracts } from "@/api/contracts";
+import { listMeters, updateMeter } from "@/api/meters";
+import { listCabinets } from "@/api/cabinets";
+import { getLandlordMeterView } from "@/api/stations";
+import { StatusBadge } from "@/components/Stat";
+import { Button } from "@/components/ui/button";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { inputCls } from "@/components/fields";
+import * as XLSX from "xlsx";
+import { fmtMoney, fmtNum, fmtDate } from "@/lib/format";
+import { Download, Search, ChevronDown, ChevronRight, FileText, Building2, DollarSign, Zap, Link, Trash2, Check } from "lucide-react";
+import { toast } from "sonner";
+
+export default function Entities() {
+  const [keyword, setKeyword] = useState("");
+  const [expandedId, setExpandedId] = useState<number | null>(null);
+  const [viewMode, setViewMode] = useState<"场租" | "电租">("场租");
+  const [selectedMonth, setSelectedMonth] = useState(() => {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+  });
+  const [linkDialogOpen, setLinkDialogOpen] = useState(false);
+  const [linkEntityId, setLinkEntityId] = useState<number | null>(null);
+
+  const entities = useQuery({ queryKey: ["entities"], queryFn: listEntities });
+  const contracts = useQuery({ queryKey: ["contracts"], queryFn: () => listContracts() });
+  const meters = useQuery({ queryKey: ["meters"], queryFn: () => listMeters() });
+  const cabinets = useQuery({ queryKey: ["allCabinets"], queryFn: () => listCabinets() });
+
+  const entityData = useMemo(() => {
+    const entityList = entities.data ?? [];
+    const contractList = contracts.data ?? [];
+    const meterList = meters.data ?? [];
+    const cabinetList = cabinets.data ?? [];
+
+    return entityList
+      .filter((e: any) => !keyword || e.name?.includes(keyword) || e.shortName?.includes(keyword))
+      .map((entity: any) => {
+        // 该主体的电表（通过entity_id关联）
+        const entityMeters = meterList.filter((m: any) => m.entityId === entity.id);
+
+        // 该主体关联的场地ID集合（来自电表的landlord_id）
+        const entityLandlordIds = new Set(entityMeters.map((m: any) => m.landlordId).filter(Boolean));
+
+        // 该主体的合同：优先按 entity_id 外键关联（改名自动同步）；无 entity_id 时回退 pay_entity 文本
+        const entityContracts = contractList.filter((c: any) => {
+          if (c.entityId !== undefined && c.entityId !== null) {
+            if (entityLandlordIds.size > 0) {
+              return c.entityId === entity.id && c.landlordId && entityLandlordIds.has(c.landlordId);
+            }
+            return c.entityId === entity.id;
+          }
+          // 旧数据回退：pay_entity 文本匹配
+          if (c.payEntity !== entity.name && c.payEntity !== entity.shortName) return false;
+          if (entityLandlordIds.size > 0) {
+            return c.landlordId && entityLandlordIds.has(c.landlordId);
+          }
+          return true;
+        });
+
+        // 汇总数据
+        const totalMonthlyRent = entityContracts.reduce((sum: number, c: any) => sum + (Number(c.monthlyRent) || 0), 0);
+        const totalAnnualRent = entityContracts.reduce((sum: number, c: any) => sum + (Number(c.rentAmount) || 0), 0);
+        const costContracts = entityContracts.filter((c: any) => c.contractType === "场地合同");
+        const incomeContracts = entityContracts.filter((c: any) => c.contractType === "品牌方合同");
+
+        // 按场地分组，再按品牌分组（v3：无站点层）
+        const metersByLandlord = new Map<number, any>();
+        for (const m of entityMeters) {
+          const lid = m.landlordId || 0;
+          if (!metersByLandlord.has(lid)) {
+            metersByLandlord.set(lid, {
+              landlordId: lid,
+              landlordName: m.landlordName || "未设置场地方",
+              meters: [],
+              brands: new Map<number, any>(),
+            });
+          }
+          const group = metersByLandlord.get(lid);
+          group.meters.push(m);
+
+          // 按品牌分组
+          const bid = m.brandId || 0;
+          if (!group.brands.has(bid)) {
+            group.brands.set(bid, {
+              brandId: bid,
+              brandName: m.brandName || "未关联品牌",
+              meters: [],
+            });
+          }
+          group.brands.get(bid).meters.push(m);
+        }
+
+        // 为每个场地构建详细数据
+        const landlordDetails = [...metersByLandlord.values()].map((group: any) => {
+          // 该场地下的合同
+          const landlordCostContracts = costContracts.filter((c: any) => c.landlordId === group.landlordId);
+          const landlordIncomeContracts = incomeContracts.filter((c: any) => c.landlordId === group.landlordId);
+
+          // 品牌详情
+          const brandDetails = [...group.brands.values()].map((brand: any) => {
+            // 该品牌的电表ID集合
+            const meterIds = new Set(brand.meters.map((m: any) => m.id));
+
+            // 该品牌的柜子
+            const brandCabinets = cabinetList.filter((cab: any) => meterIds.has(cab.meterId));
+            let chargeCabinets = brandCabinets.filter((cab: any) => cab.cabinetType === "充电柜").length;
+            let storageCabinets = brandCabinets.filter((cab: any) => cab.cabinetType === "储电柜").length;
+            // 没有添加柜子时，默认算1个充电柜
+            if (brandCabinets.length === 0 && brand.meters.length > 0) {
+              chargeCabinets = 1;
+            }
+            const totalCabinets = Math.max(1, brandCabinets.length);
+
+            // 该品牌的品牌方合同（收款）
+            const brandIncomeContracts = landlordIncomeContracts.filter((c: any) => {
+              // 匹配品牌：合同的 brand_id = 品牌 id（外键关联，改名自动同步）
+              return c.brandId != null && c.brandId === brand.brandId;
+            });
+
+            // 该场地的场地合同（付款）
+            const brandCostContract = landlordCostContracts[0]; // 通常一个场地一份场地合同
+
+            return {
+              ...brand,
+              chargeCabinets,
+              storageCabinets,
+              totalCabinets,
+              costContract: brandCostContract,
+              incomeContracts: brandIncomeContracts,
+            };
+          });
+
+          return {
+            ...group,
+            brands: brandDetails,
+            costContracts: landlordCostContracts,
+            incomeContracts: landlordIncomeContracts,
+          };
+        });
+
+        return {
+          ...entity,
+          meters: entityMeters,
+          contracts: entityContracts,
+          costContracts,
+          incomeContracts,
+          landlordDetails,
+          meterCount: entityMeters.length,
+          contractCount: entityContracts.length,
+          totalMonthlyRent,
+          totalAnnualRent,
+        };
+      });
+  }, [entities.data, contracts.data, meters.data, cabinets.data, keyword]);
+
+  const toggleExpand = (id: number) => {
+    setExpandedId(prev => prev === id ? null : id);
+  };
+
+  const openLinkDialog = (entityId: number) => {
+    setLinkEntityId(entityId);
+    setLinkDialogOpen(true);
+  };
+
+  const doExport = async () => {
+    if (entityData.length === 0) { toast.error("暂无数据可导出"); return; }
+
+    if (viewMode === "场租") {
+      // ── 场租导出：完全参照 2026-2027美团场租.xlsx 格式 ──
+      // Row 0: 标题 "美团租金台账" 合并全部列
+      // Row 1: 一级表头（站点配置/付款信息/收款信息合并单元格）
+      // Row 2: 二级明细表头
+      // Row 3+: 数据行
+
+      const header1 = [
+        "序号", "收款公司", "占股", "品牌", "",
+        "品牌配置", "", "",   // F-H
+        "付款信息", "", "", "", "", "", "", "", "", "", "",   // I-S (cols 8-18)
+        "收款信息", "", "", "", "", "", "", "", "", "", "", "",   // T-AE (cols 19-30)
+      ];
+      const header2 = [
+        "", "", "", "", "",
+        "充电柜", "储电柜", "合计",
+        "负责人", "合同租期", "合作\n年限", "租金成本", "付款方式", "25年~26年\n付款情况", "26年~27年\n付款情况", "付款情况", "单台成本", "发票", "押金",
+        "合同收款租期", "到账情况", "26-27收款信息\n签约/开票/到账情况", "单台月租金\n（含税）", "单台年收入（含税）", "租金收入\n（含税）", "税率", "租金收入\n（不含税）", "进项成本", "租金利润", "分红金额", "分红后\n租金利润",
+      ];
+
+      const allRows: any[][] = [];
+      let seq = 0;
+
+      for (const entity of entityData) {
+        for (const landlord of entity.landlordDetails || []) {
+          for (const station of landlord.brands || []) {
+            seq++;
+            const costContract = station.costContract;
+            const inc = (station.incomeContracts || [])[0];
+
+            const startDate = costContract?.startDate ? new Date(costContract.startDate) : null;
+            const endDate = costContract?.endDate ? new Date(costContract.endDate) : null;
+            const years = startDate && endDate
+              ? Math.round((endDate.getTime() - startDate.getTime()) / (365.25 * 24 * 60 * 60 * 1000) * 10) / 10
+              : "";
+            const totalCabinets = station.totalCabinets || 1;
+            const unitCost = costContract?.monthlyRent
+              ? Math.round(Number(costContract.monthlyRent) / totalCabinets)
+              : "";
+            const monthlyRent = inc?.monthlyRent ? Number(inc.monthlyRent) : 0;
+            const annualIncome = monthlyRent * 12;
+            const taxRate = inc?.taxEnabled ? Number(inc.taxRate) || 0 : 0;
+            const netIncome = taxRate > 0 ? Math.round(monthlyRent * (1 - taxRate) * 12 * 100) / 100 : annualIncome;
+            const rentProfit = netIncome - (Number(costContract?.monthlyRent) || 0);
+
+            allRows.push([
+              seq,                          // A: 序号
+              entity.name ?? "",            // B: 收款公司
+              "",                           // C: 占股
+              station.brandName,            // D: 品牌
+              station.brandId ?? "",        // E: 品牌号
+              station.chargeCabinets,       // F: 充电柜
+              station.storageCabinets,      // G: 储电柜
+              station.totalCabinets,        // H: 合计
+              "",                           // I: 负责人
+              costContract ? `${fmtDate(costContract.startDate)} ~ ${fmtDate(costContract.endDate)}` : "", // J: 合同租期
+              years ? years + "年" : "",    // K: 合作年限
+              costContract?.monthlyRent ?? "", // L: 租金成本
+              costContract?.payMethod ?? "",   // M: 付款方式
+              "",                           // N: 25年~26年付款情况
+              "",                           // O: 26年~27年付款情况
+              costContract?.payStatus ?? "",   // P: 付款情况
+              unitCost,                     // Q: 单台成本
+              costContract?.invoiceType ?? "", // R: 发票
+              costContract?.deposit ?? "",  // S: 押金
+              inc ? `${fmtDate(inc.startDate)} ~ ${fmtDate(inc.endDate)}` : "", // T: 合同收款租期
+              inc?.payStatus ?? "",        // U: 到账情况
+              "",                           // V: 26-27收款信息
+              inc?.unitMonthlyRent ?? "", // W: 单台月租金含税
+              inc?.unitMonthlyRent ? Number(inc.unitMonthlyRent) * 12 : "", // X: 单台年收入含税
+              monthlyRent,                  // Y: 租金收入含税
+              taxRate ? (taxRate * 100).toFixed(0) + "%" : "", // Z: 税率
+              netIncome,                    // AA: 租金收入不含税
+              "",                           // AB: 进项成本
+              rentProfit,                   // AC: 租金利润
+              "",                           // AD: 分红金额
+              rentProfit,                   // AE: 分红后租金利润
+            ]);
+          }
+        }
+      }
+
+      // 合计行
+      const sumCharge = allRows.reduce((s, r) => s + (Number(r[5]) || 0), 0);
+      const sumStorage = allRows.reduce((s, r) => s + (Number(r[6]) || 0), 0);
+      const sumTotal = allRows.reduce((s, r) => s + (Number(r[7]) || 0), 0);
+      const sumCost = allRows.reduce((s, r) => s + (Number(r[11]) || 0), 0);
+      const sumUnitCost = sumTotal > 0 ? Math.round(sumCost / sumTotal) : "";
+      const sumIncomeRent = allRows.reduce((s, r) => s + (Number(r[24]) || 0), 0);
+      const sumNetIncome = allRows.reduce((s, r) => s + (Number(r[26]) || 0), 0);
+      const sumProfit = allRows.reduce((s, r) => s + (Number(r[28]) || 0), 0);
+      allRows.push([
+        "", "合计", "", "", "",
+        sumCharge, sumStorage, sumTotal,
+        "", "", "", sumCost, "", "", "", "", sumUnitCost, "", "",
+        "", "", "", "", "", sumIncomeRent, "", sumNetIncome, "", sumProfit, "", sumProfit,
+      ]);
+
+      const aoa = [["美团租金台账"], header1, header2, ...allRows];
+      const ws = XLSX.utils.aoa_to_sheet(aoa);
+
+      // 合并单元格 — 完全参照原 Excel
+      ws["!merges"] = [
+        // 标题行：A1:AE1 (cols 0-30)
+        { s: { r: 0, c: 0 }, e: { r: 0, c: 30 } },
+        // 站点配置：F2:H2 (cols 5-7)
+        { s: { r: 1, c: 5 }, e: { r: 1, c: 7 } },
+        // 付款信息：I2:S2 (cols 8-18)
+        { s: { r: 1, c: 8 }, e: { r: 1, c: 18 } },
+        // 收款信息：T2:AE2 (cols 19-30)
+        { s: { r: 1, c: 19 }, e: { r: 1, c: 30 } },
+        // 一级表头跨行：序号、收款公司、占股、站名、站点号
+        { s: { r: 1, c: 0 }, e: { r: 2, c: 0 } },
+        { s: { r: 1, c: 1 }, e: { r: 2, c: 1 } },
+        { s: { r: 1, c: 2 }, e: { r: 2, c: 2 } },
+        { s: { r: 1, c: 3 }, e: { r: 2, c: 3 } },
+        { s: { r: 1, c: 4 }, e: { r: 2, c: 4 } },
+      ];
+
+      ws["!cols"] = [
+        { wch: 5 },   // A: 序号
+        { wch: 20 },  // B: 收款公司
+        { wch: 6 },   // C: 占股
+        { wch: 14 },  // D: 站名
+        { wch: 8 },   // E: 站点号
+        { wch: 8 },   // F: 充电柜
+        { wch: 8 },   // G: 储电柜
+        { wch: 8 },   // H: 合计
+        { wch: 10 },  // I: 负责人
+        { wch: 22 },  // J: 合同租期
+        { wch: 8 },   // K: 合作年限
+        { wch: 12 },  // L: 租金成本
+        { wch: 10 },  // M: 付款方式
+        { wch: 14 },  // N: 25年~26年付款情况
+        { wch: 14 },  // O: 26年~27年付款情况
+        { wch: 10 },  // P: 付款情况
+        { wch: 10 },  // Q: 单台成本
+        { wch: 8 },   // R: 发票
+        { wch: 8 },   // S: 押金
+        { wch: 22 },  // T: 合同收款租期
+        { wch: 10 },  // U: 到账情况
+        { wch: 18 },  // V: 26-27收款信息
+        { wch: 14 },  // W: 单台月租金含税
+        { wch: 16 },  // X: 单台年收入含税
+        { wch: 14 },  // Y: 租金收入含税
+        { wch: 8 },   // Z: 税率
+        { wch: 16 },  // AA: 租金收入不含税
+        { wch: 10 },  // AB: 进项成本
+        { wch: 14 },  // AC: 租金利润
+        { wch: 10 },  // AD: 分红金额
+        { wch: 14 },  // AE: 分红后租金利润
+      ];
+
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, "场租台账");
+      XLSX.writeFile(wb, `场租台账_${selectedMonth}.xlsx`);
+    } else {
+      // 电租导出：需要异步获取电表数据
+      toast.info("正在生成电租报表…");
+
+      // 收集所有场地ID（v3）
+      const landlordIds: number[] = [];
+      for (const entity of entityData) {
+        for (const landlord of entity.landlordDetails || []) {
+          if (landlord.landlordId) landlordIds.push(landlord.landlordId);
+        }
+      }
+
+      // 获取所有场地的电表详情（v3）
+      const views: Record<number, any> = {};
+      for (const lid of landlordIds) {
+        try {
+          views[lid] = await getLandlordMeterView(lid, selectedMonth);
+        } catch { views[lid] = null; }
+      }
+
+      const meterList = meters.data ?? [];
+      const allRows: any[][] = [];
+
+      for (const entity of entityData) {
+        for (const landlord of entity.landlordDetails || []) {
+          const landlordRows: any[][] = [];
+          const mv = views[landlord.landlordId];
+          if (mv) {
+            for (const group of mv.brandGroups || []) {
+              for (const meter of group.meters || []) {
+                const meterRecord = meterList.find((m: any) => m.meterNo === meter.meterNo);
+                const transformerRatio = meterRecord?.transformerRatio ?? 1;
+
+                const dailyEnergy = meter.dailyEnergy || [];
+                const lastDay = dailyEnergy.length > 0 ? dailyEnergy[dailyEnergy.length - 1] : null;
+                const readingTime = lastDay?.dayDate ? String(lastDay.dayDate).replace(/(\d{4})(\d{2})(\d{2})/, "$1-$2-$3") : "";
+
+                const prevReading = meter.prevEndReading || 0;
+                const currReading = meter.endReading || 0;
+                const intervalKwh = currReading - prevReading;
+                const profit = (meter.collectNet || 0) - (meter.payAmount || 0);
+
+                landlordRows.push([
+                  landlord.landlordName,
+                  meter.meterNo,
+                  transformerRatio,
+                  prevReading,
+                  readingTime,
+                  currReading,
+                  intervalKwh > 0 ? intervalKwh : meter.payKwh || 0,
+                  meter.payUnitPrice ?? "",
+                  meter.payAmount ?? "",
+                  meter.payStatus ?? "未付款",
+                  meter.collectUnitPrice ?? "",
+                  meter.collectAmount ?? "",
+                  meter.collectNet ?? "",
+                  meter.collectStatus ?? "未到账",
+                  profit,
+                ]);
+              }
+            }
+          }
+
+          if (landlordRows.length > 0) {
+            // 场地标题行
+            allRows.push([landlord.landlordName, "", "", "", "", "", "", "", "", "", "", "", "", "", ""]);
+            allRows.push(...landlordRows);
+
+            // 场地合计
+            if (landlordRows.length > 1) {
+              const tInterval = landlordRows.reduce((s, r) => s + (Number(r[6]) || 0), 0);
+              const tPay = landlordRows.reduce((s, r) => s + (Number(r[8]) || 0), 0);
+              const tCollect = landlordRows.reduce((s, r) => s + (Number(r[11]) || 0), 0);
+              const tNet = landlordRows.reduce((s, r) => s + (Number(r[12]) || 0), 0);
+              const tProfit = landlordRows.reduce((s, r) => s + (Number(r[14]) || 0), 0);
+              allRows.push(["合计", "", "", "", "", "", tInterval, "", tPay, "", "", tCollect, tNet, "", tProfit]);
+            }
+            allRows.push([]); // 空行分隔
+          }
+        }
+      }
+
+      const header = ["场地方", "电表编号", "互感器倍数", "上月抄表度数", "抄表时间", "抄表度数", "区间度数", "付款单价", "付款金额", "付款情况", "收款单价", "收款金额", "不含税收入", "到账情况", "利润"];
+      const aoa = [header, ...allRows];
+      const ws = XLSX.utils.aoa_to_sheet(aoa);
+
+      // 自动列宽
+      const colWidths = [24, 16, 10, 14, 20, 12, 12, 10, 12, 10, 10, 12, 12, 10, 12];
+      ws["!cols"] = colWidths.map(w => ({ wch: w }));
+
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, "电租台账");
+      XLSX.writeFile(wb, `电租台账_${selectedMonth}.xlsx`);
+    }
+
+    toast.success("已导出 Excel");
+  };
+
+  const th = "px-3 py-2 text-left text-xs font-medium text-slate-500";
+
+  return (
+    <div className="space-y-4">
+      {/* 工具栏 */}
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="relative">
+          <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-slate-400" />
+          <input className={`${inputCls} w-56 pl-8`} placeholder="搜索公司名称…" value={keyword} onChange={(e) => setKeyword(e.target.value)} />
+        </div>
+        <input type="month" className={inputCls + " w-40"} value={selectedMonth} onChange={e => setSelectedMonth(e.target.value)} />
+        <select className={`${inputCls} w-28`} value={viewMode} onChange={e => setViewMode(e.target.value as any)}>
+          <option value="场租">场租</option>
+          <option value="电租">电租</option>
+        </select>
+        <div className="ml-auto flex gap-2">
+          <Button variant="outline" onClick={doExport}><Download className="mr-1.5 h-4 w-4" />导出表格</Button>
+        </div>
+      </div>
+
+      {/* 主体列表 */}
+      <div className="space-y-4">
+        {entityData.map((entity: any) => {
+          const isExpanded = expandedId === entity.id;
+
+          return (
+            <div key={entity.id} className="rounded-xl border bg-white shadow-sm">
+              {/* 主体头部 */}
+              <div
+                className="flex items-center justify-between px-5 py-3 cursor-pointer hover:bg-slate-50/60"
+                onClick={() => toggleExpand(entity.id)}
+              >
+                <div className="flex items-center gap-3">
+                  {isExpanded ? <ChevronDown className="h-4 w-4 text-slate-400" /> : <ChevronRight className="h-4 w-4 text-slate-300" />}
+                  <div>
+                    <div className="font-semibold text-slate-800">{entity.name}</div>
+                    {entity.shortName && <div className="text-xs text-slate-400">简称：{entity.shortName}</div>}
+                  </div>
+                </div>
+                <div className="flex items-center gap-6 text-xs">
+                  <div className="flex items-center gap-1">
+                    <Zap className="h-3.5 w-3.5 text-amber-500" />
+                    <span className="tabular-nums">{entity.meterCount}</span> 电表
+                  </div>
+                  <div className="flex items-center gap-1">
+                    <FileText className="h-3.5 w-3.5 text-emerald-500" />
+                    <span className="tabular-nums">{entity.contractCount}</span> 合同
+                  </div>
+                  <div className="flex items-center gap-1">
+                    <DollarSign className="h-3.5 w-3.5 text-rose-500" />
+                    月租金 <span className="tabular-nums font-medium">{fmtMoney(entity.totalMonthlyRent)}</span>
+                  </div>
+                  <Button size="sm" variant="outline" onClick={(e) => { e.stopPropagation(); openLinkDialog(entity.id); }}>
+                    <Link className="mr-1 h-3 w-3" />关联电表
+                  </Button>
+                </div>
+              </div>
+
+              {/* 展开内容 */}
+              {isExpanded && viewMode === "场租" && (
+                <div className="border-t px-5 py-4 space-y-6">
+                  {/* 汇总数据 */}
+                  <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+                    <div className="rounded-lg border bg-slate-50 px-3 py-2">
+                      <div className="text-[10px] text-slate-400">电表数量</div>
+                      <div className="text-lg font-semibold tabular-nums">{entity.meterCount}</div>
+                    </div>
+                    <div className="rounded-lg border bg-slate-50 px-3 py-2">
+                      <div className="text-[10px] text-slate-400">合同总数</div>
+                      <div className="text-lg font-semibold tabular-nums">{entity.contractCount}</div>
+                    </div>
+                    <div className="rounded-lg border bg-slate-50 px-3 py-2">
+                      <div className="text-[10px] text-slate-400">成本合同</div>
+                      <div className="text-lg font-semibold tabular-nums text-rose-600">{entity.costContracts.length}</div>
+                    </div>
+                    <div className="rounded-lg border bg-slate-50 px-3 py-2">
+                      <div className="text-[10px] text-slate-400">收入合同</div>
+                      <div className="text-lg font-semibold tabular-nums text-emerald-600">{entity.incomeContracts.length}</div>
+                    </div>
+                  </div>
+
+                  {/* 按场地展示详细信息 */}
+                  {entity.landlordDetails.map((landlord: any) => (
+                    <div key={landlord.landlordId} className="rounded-xl border overflow-hidden">
+                      {/* 场地标题 */}
+                      <div className="flex items-center gap-2 bg-slate-50 px-4 py-2.5 border-b">
+                        <Building2 className="h-4 w-4 text-emerald-600" />
+                        <span className="text-sm font-semibold text-slate-700">{landlord.landlordName}</span>
+                        <span className="text-xs text-slate-400">（{landlord.brands.length} 个品牌，{landlord.meters.length} 块电表）</span>
+                      </div>
+
+                      {/* 品牌配置表（v3：站点 → 品牌） */}
+                      <div className="px-4 py-3">
+                        <h4 className="mb-2 text-xs font-semibold text-slate-600">品牌配置</h4>
+                        <div className="overflow-x-auto rounded-lg border">
+                          <table className="w-full text-xs">
+                            <thead>
+                              <tr className="border-b bg-slate-50">
+                                <th className={th}>品牌</th>
+                                <th className={`${th} text-right`}>充电柜数量</th>
+                                <th className={`${th} text-right`}>储电柜数量</th>
+                                <th className={`${th} text-right`}>合计数量</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {landlord.brands.map((station: any) => (
+                                <tr key={station.brandId} className="border-b last:border-0">
+                                  <td className="px-3 py-2 font-medium">{station.brandName}</td>
+                                  <td className="px-3 py-2 text-right tabular-nums">{station.chargeCabinets}</td>
+                                  <td className="px-3 py-2 text-right tabular-nums">{station.storageCabinets}</td>
+                                  <td className="px-3 py-2 text-right tabular-nums font-semibold">{station.totalCabinets}</td>
+                                </tr>
+                              ))}
+                              {landlord.brands.length > 1 && (
+                                <tr className="bg-slate-50 font-semibold">
+                                  <td className="px-3 py-2">合计</td>
+                                  <td className="px-3 py-2 text-right tabular-nums">{landlord.brands.reduce((s: number, st: any) => s + st.chargeCabinets, 0)}</td>
+                                  <td className="px-3 py-2 text-right tabular-nums">{landlord.brands.reduce((s: number, st: any) => s + st.storageCabinets, 0)}</td>
+                                  <td className="px-3 py-2 text-right tabular-nums">{landlord.brands.reduce((s: number, st: any) => s + st.totalCabinets, 0)}</td>
+                                </tr>
+                              )}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+
+                      {/* 付款信息表（场地合同） */}
+                      {landlord.costContracts.length > 0 && (
+                        <div className="px-4 py-3 border-t">
+                          <h4 className="mb-2 text-xs font-semibold text-rose-600">付款信息（场地合同）</h4>
+                          <div className="overflow-x-auto rounded-lg border">
+                            <table className="w-full text-xs">
+                              <thead>
+                                <tr className="border-b bg-rose-50/50">
+                                  <th className={th}>合同租期</th>
+                                  <th className={`${th} text-right`}>合作年限</th>
+                                  <th className={`${th} text-right`}>租金成本</th>
+                                  <th className={th}>付款方式</th>
+                                  <th className={th}>付款情况</th>
+                                  <th className={`${th} text-right`}>单台成本</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {landlord.costContracts.map((c: any) => {
+                                  const startDate = c.startDate ? new Date(c.startDate) : null;
+                                  const endDate = c.endDate ? new Date(c.endDate) : null;
+                                  const years = startDate && endDate
+                                    ? Math.round((endDate.getTime() - startDate.getTime()) / (365.25 * 24 * 60 * 60 * 1000) * 10) / 10
+                                    : null;
+                                  const totalCabinets = landlord.brands.reduce((s: number, st: any) => s + st.totalCabinets, 0) || 1;
+                                  const unitCost = c.monthlyRent ? Math.round(Number(c.monthlyRent) / totalCabinets) : null;
+
+                                  return (
+                                    <tr key={c.id} className="border-b last:border-0">
+                                      <td className="px-3 py-2 whitespace-nowrap">{fmtDate(c.startDate)} ~ {fmtDate(c.endDate)}</td>
+                                      <td className="px-3 py-2 text-right tabular-nums">{years ? `${years}年` : "-"}</td>
+                                      <td className="px-3 py-2 text-right tabular-nums font-medium">{c.monthlyRent ? fmtMoney(Number(c.monthlyRent)) : "-"}</td>
+                                      <td className="px-3 py-2">{c.payMethod ?? "-"}</td>
+                                      <td className="px-3 py-2">
+                                        <StatusBadge status={c.payStatus || "未付款"} />
+                                      </td>
+                                      <td className="px-3 py-2 text-right tabular-nums">{unitCost ? fmtMoney(unitCost) : "-"}</td>
+                                    </tr>
+                                  );
+                                })}
+                              </tbody>
+                            </table>
+                          </div>
+                        </div>
+                      )}
+
+                      {/* 收款信息表（品牌方合同） */}
+                      {landlord.incomeContracts.length > 0 && (
+                        <div className="px-4 py-3 border-t">
+                          <h4 className="mb-2 text-xs font-semibold text-emerald-600">收款信息（品牌方合同）</h4>
+                          <div className="overflow-x-auto rounded-lg border">
+                            <table className="w-full text-xs">
+                              <thead>
+                                <tr className="border-b bg-emerald-50/50">
+                                  <th className={th}>品牌方</th>
+                                  <th className={th}>合同收款租期</th>
+                                  <th className={`${th} text-right`}>单台月租金（含税）</th>
+                                  <th className={`${th} text-right`}>单台年收入（含税）</th>
+                                  <th className={`${th} text-right`}>租金收入（含税）</th>
+                                  <th className={`${th} text-right`}>税率</th>
+                                  <th className={`${th} text-right`}>租金收入（不含税）</th>
+                                  <th className={th}>付款方式</th>
+                                  <th className={th}>状态</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {landlord.incomeContracts.map((c: any) => {
+                                  const monthlyRent = Number(c.monthlyRent) || 0;
+                                  const annualIncome = monthlyRent * 12;
+                                  const taxRate = c.taxEnabled ? Number(c.taxRate) || 0 : 0;
+                                  const netIncome = taxRate > 0
+                                    ? Math.round(monthlyRent * (1 - taxRate) * 12 * 100) / 100
+                                    : annualIncome;
+
+                                  return (
+                                    <tr key={c.id} className="border-b last:border-0">
+                                      <td className="px-3 py-2 font-medium">{c.brandName ?? "-"}</td>
+                                      <td className="px-3 py-2 whitespace-nowrap">{fmtDate(c.startDate)} ~ {fmtDate(c.endDate)}</td>
+                                      <td className="px-3 py-2 text-right tabular-nums">{c.unitMonthlyRent ? fmtMoney(Number(c.unitMonthlyRent)) : "-"}</td>
+                                      <td className="px-3 py-2 text-right tabular-nums">{c.unitMonthlyRent ? fmtMoney(Number(c.unitMonthlyRent) * 12) : "-"}</td>
+                                      <td className="px-3 py-2 text-right tabular-nums font-medium">{fmtMoney(monthlyRent)}</td>
+                                      <td className="px-3 py-2 text-right tabular-nums">{c.taxEnabled ? `${(taxRate * 100).toFixed(0)}%` : "-"}</td>
+                                      <td className="px-3 py-2 text-right tabular-nums text-emerald-600">{fmtMoney(netIncome)}</td>
+                                      <td className="px-3 py-2">{c.payMethod ?? "-"}</td>
+                                      <td className="px-3 py-2"><StatusBadge status={c.status} /></td>
+                                    </tr>
+                                  );
+                                })}
+                                {landlord.incomeContracts.length > 1 && (
+                                  <tr className="bg-emerald-50/30 font-semibold">
+                                    <td className="px-3 py-2">合计</td>
+                                    <td className="px-3 py-2">-</td>
+                                    <td className="px-3 py-2">-</td>
+                                    <td className="px-3 py-2">-</td>
+                                    <td className="px-3 py-2 text-right tabular-nums">{fmtMoney(landlord.incomeContracts.reduce((s: number, c: any) => s + (Number(c.monthlyRent) || 0), 0))}</td>
+                                    <td className="px-3 py-2">-</td>
+                                    <td className="px-3 py-2 text-right tabular-nums text-emerald-600">
+                                      {fmtMoney(landlord.incomeContracts.reduce((s: number, c: any) => {
+                                        const mr = Number(c.monthlyRent) || 0;
+                                        const tr = c.taxEnabled ? Number(c.taxRate) || 0 : 0;
+                                        return s + (tr > 0 ? mr * (1 - tr) * 12 : mr * 12);
+                                      }, 0))}
+                                    </td>
+                                    <td className="px-3 py-2">-</td>
+                                    <td className="px-3 py-2">-</td>
+                                  </tr>
+                                )}
+                              </tbody>
+                            </table>
+                          </div>
+                        </div>
+                      )}
+
+                      {/* 无合同提示 */}
+                      {landlord.costContracts.length === 0 && landlord.incomeContracts.length === 0 && (
+                        <div className="px-4 py-6 text-center text-sm text-slate-400">
+                          该场地暂无合同数据
+                        </div>
+                      )}
+                    </div>
+                  ))}
+
+                  {entity.landlordDetails.length === 0 && (
+                    <div className="py-6 text-center text-sm text-slate-400">
+                      暂无关联数据，请先关联电表
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* 电租视图 */}
+              {isExpanded && viewMode === "电租" && (
+                <ElectricityRentView
+                  entity={entity}
+                  period={selectedMonth}
+                />
+              )}
+            </div>
+          );
+        })}
+        {entityData.length === 0 && (
+          <div className="rounded-xl border border-dashed py-16 text-center text-slate-400">
+            {entities.isLoading ? "加载中…" : "暂无公司主体数据，请先在「基础档案」中添加"}
+          </div>
+        )}
+      </div>
+
+      {/* 关联电表弹窗 */}
+      <EntityMeterLinkDialog
+        open={linkDialogOpen}
+        onClose={() => { setLinkDialogOpen(false); setLinkEntityId(null); }}
+        entityId={linkEntityId}
+      />
+    </div>
+  );
+}
+
+
+// ─── 电租视图组件 ───────────────────────────────────────────
+
+function ElectricityRentView({ entity, period }: { entity: any; period: string }) {
+  const meters = useQuery({ queryKey: ["meters"], queryFn: () => listMeters() });
+
+  // 收集该主体下所有场地的ID（v3：按场地查电表视图）
+  const landlordIds = useMemo(() => {
+    const ids = new Set<number>();
+    for (const landlord of entity.landlordDetails || []) {
+      if (landlord.landlordId) ids.add(landlord.landlordId);
+    }
+    return [...ids];
+  }, [entity]);
+
+  // 为每个场地获取电表详情（v3：getLandlordMeterView）
+  const meterViewQueries = useQuery({
+    queryKey: ["entityLandlordViews", landlordIds, period],
+    queryFn: async () => {
+      const results: Record<number, any> = {};
+      for (const lid of landlordIds) {
+        try {
+          results[lid] = await getLandlordMeterView(lid, period);
+        } catch {
+          results[lid] = null;
+        }
+      }
+      return results;
+    },
+    enabled: landlordIds.length > 0,
+  });
+
+  const th = "px-2.5 py-2 text-left text-xs font-medium text-slate-500 whitespace-nowrap";
+  const thR = "px-2.5 py-2 text-right text-xs font-medium text-slate-500 whitespace-nowrap";
+
+  if (meterViewQueries.isLoading) {
+    return <div className="border-t px-5 py-10 text-center text-slate-400">加载电租数据中…</div>;
+  }
+
+  const views = meterViewQueries.data || {};
+  const meterList = meters.data ?? [];
+
+  // 按场地方分组构建数据（v3：一个场地一个视图，无站点层级）
+  const landlordGroups = (entity.landlordDetails || []).map((landlord: any) => {
+    const rows: any[] = [];
+    const mv = views[landlord.landlordId];
+    if (mv) {
+      for (const group of mv.brandGroups || []) {
+        for (const meter of group.meters || []) {
+          const meterRecord = meterList.find((m: any) => m.meterNo === meter.meterNo);
+          const transformerRatio = meterRecord?.transformerRatio ?? 1;
+
+          const dailyEnergy = meter.dailyEnergy || [];
+          const lastDay = dailyEnergy.length > 0 ? dailyEnergy[dailyEnergy.length - 1] : null;
+          const readingTime = lastDay?.dayDate ? String(lastDay.dayDate).replace(/(\d{4})(\d{2})(\d{2})/, "$1-$2-$3") : "";
+
+          const prevReading = meter.prevEndReading || 0;
+          const currReading = meter.endReading || 0;
+          const intervalKwh = currReading - prevReading;
+          const profit = (meter.collectNet || 0) - (meter.payAmount || 0);
+
+          rows.push({
+            stationName: landlord.landlordName || "",
+            meterNo: meter.meterNo,
+            transformerRatio,
+            prevReading,
+            readingTime,
+            currReading,
+            intervalKwh: intervalKwh > 0 ? intervalKwh : meter.payKwh || 0,
+            payUnitPrice: meter.payUnitPrice,
+            payAmount: meter.payAmount,
+            payStatus: meter.payStatus,
+            collectUnitPrice: meter.collectUnitPrice,
+            collectAmount: meter.collectAmount,
+            collectNet: meter.collectNet,
+            collectStatus: meter.collectStatus,
+            profit,
+          });
+        }
+      }
+    }
+
+    // 该场地的汇总
+    const totals = rows.reduce((acc: any, r: any) => ({
+      intervalKwh: (acc.intervalKwh || 0) + (r.intervalKwh || 0),
+      payAmount: (acc.payAmount || 0) + (r.payAmount || 0),
+      collectAmount: (acc.collectAmount || 0) + (r.collectAmount || 0),
+      collectNet: (acc.collectNet || 0) + (r.collectNet || 0),
+      profit: (acc.profit || 0) + (r.profit || 0),
+    }), { intervalKwh: 0, payAmount: 0, collectAmount: 0, collectNet: 0, profit: 0 });
+
+    return { landlord, rows, totals };
+  });
+
+  // 过滤掉没有数据的场地
+  const validGroups = landlordGroups.filter((g: any) => g.rows.length > 0);
+
+  if (validGroups.length === 0) {
+    return (
+      <div className="border-t px-5 py-10 text-center text-sm text-slate-400">
+        暂无电租数据，请确保站点已关联电表并同步了用电数据
+      </div>
+    );
+  }
+
+  // 总汇总
+  const grandTotals = validGroups.reduce((acc: any, g: any) => ({
+    intervalKwh: (acc.intervalKwh || 0) + g.totals.intervalKwh,
+    payAmount: (acc.payAmount || 0) + g.totals.payAmount,
+    collectAmount: (acc.collectAmount || 0) + g.totals.collectAmount,
+    collectNet: (acc.collectNet || 0) + g.totals.collectNet,
+    profit: (acc.profit || 0) + g.totals.profit,
+  }), { intervalKwh: 0, payAmount: 0, collectAmount: 0, collectNet: 0, profit: 0 });
+
+  return (
+    <div className="border-t px-5 py-4 space-y-4">
+      <h4 className="text-xs font-semibold text-blue-600">电费明细（{period}）</h4>
+
+      {validGroups.map(({ landlord, rows, totals }: any) => (
+        <div key={landlord.landlordId} className="rounded-xl border overflow-hidden">
+          {/* 场地标题 */}
+          <div className="flex items-center gap-2 bg-blue-50/50 px-4 py-2.5 border-b">
+            <Building2 className="h-4 w-4 text-blue-600" />
+            <span className="text-sm font-semibold text-slate-700">{landlord.landlordName}</span>
+            <span className="text-xs text-slate-400">（{rows.length} 块电表）</span>
+            <div className="ml-auto flex items-center gap-4 text-xs">
+              <span className="text-rose-600">付款 <b className="tabular-nums">{fmtMoney(totals.payAmount)}</b></span>
+              <span className="text-emerald-600">收款 <b className="tabular-nums">{fmtMoney(totals.collectNet)}</b></span>
+              <span className={totals.profit >= 0 ? "text-emerald-600" : "text-rose-600"}>利润 <b className="tabular-nums">{fmtMoney(totals.profit)}</b></span>
+            </div>
+          </div>
+
+          {/* 电费明细表 */}
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="border-b bg-slate-50">
+                  <th className={th}>场地方</th>
+                  <th className={th}>电表编号</th>
+                  <th className={thR}>互感器倍数</th>
+                  <th className={thR}>上月抄表度数</th>
+                  <th className={th}>抄表时间</th>
+                  <th className={thR}>抄表度数</th>
+                  <th className={thR}>区间度数</th>
+                  <th className={thR}>付款单价</th>
+                  <th className={thR}>付款金额</th>
+                  <th className={th}>付款情况</th>
+                  <th className={thR}>收款单价</th>
+                  <th className={thR}>收款金额</th>
+                  <th className={thR}>不含税收入</th>
+                  <th className={th}>到账情况</th>
+                  <th className={thR}>利润</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((r: any, i: number) => (
+                  <tr key={i} className="border-b last:border-0 hover:bg-slate-50/60">
+                    <td className="px-2.5 py-2 font-medium">{r.stationName}</td>
+                    <td className="px-2.5 py-2 font-mono">{r.meterNo}</td>
+                    <td className="px-2.5 py-2 text-right tabular-nums">{r.transformerRatio}</td>
+                    <td className="px-2.5 py-2 text-right tabular-nums">{fmtNum(r.prevReading)}</td>
+                    <td className="px-2.5 py-2 whitespace-nowrap text-[11px]">{r.readingTime || "-"}</td>
+                    <td className="px-2.5 py-2 text-right tabular-nums">{fmtNum(r.currReading)}</td>
+                    <td className="px-2.5 py-2 text-right tabular-nums font-medium">{fmtNum(r.intervalKwh)}</td>
+                    <td className="px-2.5 py-2 text-right tabular-nums">{r.payUnitPrice ? fmtNum(r.payUnitPrice) : "-"}</td>
+                    <td className="px-2.5 py-2 text-right tabular-nums text-rose-600">{r.payAmount ? fmtMoney(r.payAmount) : "-"}</td>
+                    <td className="px-2.5 py-2"><StatusBadge status={r.payStatus || "未付款"} /></td>
+                    <td className="px-2.5 py-2 text-right tabular-nums">{r.collectUnitPrice ? fmtNum(r.collectUnitPrice) : "-"}</td>
+                    <td className="px-2.5 py-2 text-right tabular-nums text-emerald-600">{r.collectAmount ? fmtMoney(r.collectAmount) : "-"}</td>
+                    <td className="px-2.5 py-2 text-right tabular-nums">{r.collectNet ? fmtMoney(r.collectNet) : "-"}</td>
+                    <td className="px-2.5 py-2"><StatusBadge status={r.collectStatus || "未到账"} /></td>
+                    <td className={`px-2.5 py-2 text-right tabular-nums font-semibold ${r.profit >= 0 ? "text-emerald-600" : "text-rose-600"}`}>{fmtMoney(r.profit)}</td>
+                  </tr>
+                ))}
+                {/* 场地合计行 */}
+                {rows.length > 1 && (
+                  <tr className="bg-blue-50/30 font-semibold">
+                    <td className="px-2.5 py-2">合计</td>
+                    <td className="px-2.5 py-2">-</td>
+                    <td className="px-2.5 py-2">-</td>
+                    <td className="px-2.5 py-2">-</td>
+                    <td className="px-2.5 py-2">-</td>
+                    <td className="px-2.5 py-2">-</td>
+                    <td className="px-2.5 py-2 text-right tabular-nums">{fmtNum(totals.intervalKwh)}</td>
+                    <td className="px-2.5 py-2">-</td>
+                    <td className="px-2.5 py-2 text-right tabular-nums text-rose-600">{fmtMoney(totals.payAmount)}</td>
+                    <td className="px-2.5 py-2">-</td>
+                    <td className="px-2.5 py-2">-</td>
+                    <td className="px-2.5 py-2 text-right tabular-nums text-emerald-600">{fmtMoney(totals.collectAmount)}</td>
+                    <td className="px-2.5 py-2 text-right tabular-nums">{fmtMoney(totals.collectNet)}</td>
+                    <td className="px-2.5 py-2">-</td>
+                    <td className={`px-2.5 py-2 text-right tabular-nums ${totals.profit >= 0 ? "text-emerald-600" : "text-rose-600"}`}>{fmtMoney(totals.profit)}</td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      ))}
+
+      {/* 总汇总 */}
+      {validGroups.length > 1 && (
+        <div className="rounded-lg border bg-blue-50/30 px-4 py-3">
+          <div className="flex items-center justify-between text-xs font-semibold">
+            <span className="text-slate-700">总汇总</span>
+            <div className="flex items-center gap-4">
+              <span className="text-rose-600">总付款 {fmtMoney(grandTotals.payAmount)}</span>
+              <span className="text-emerald-600">总收款 {fmtMoney(grandTotals.collectNet)}</span>
+              <span className={grandTotals.profit >= 0 ? "text-emerald-600" : "text-rose-600"}>总利润 {fmtMoney(grandTotals.profit)}</span>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+// ─── 关联电表弹窗 ───────────────────────────────────────────
+
+function EntityMeterLinkDialog({ open, onClose, entityId }: { open: boolean; onClose: () => void; entityId: number | null }) {
+  const queryClient = useQueryClient();
+  const [selectedLandlordId, setSelectedLandlordId] = useState("");
+  const [selectedMeterIds, setSelectedMeterIds] = useState<Set<number>>(new Set());
+
+  const landlords = useQuery({ queryKey: ["landlords"], queryFn: listLandlords, enabled: open });
+  const allMeters = useQuery({ queryKey: ["meters"], queryFn: () => listMeters(), enabled: open });
+
+  // 该场地下的电表（未关联到其他主体的）
+  const availableMeters = useMemo(() => {
+    if (!selectedLandlordId) return [];
+    return (allMeters.data ?? []).filter((m: any) =>
+      m.landlordId === Number(selectedLandlordId) && (m.entityId === null || m.entityId === entityId)
+    );
+  }, [allMeters.data, selectedLandlordId, entityId]);
+
+  // 已关联到该主体的电表
+  const linkedMeters = useMemo(() => {
+    if (!selectedLandlordId) return [];
+    return (allMeters.data ?? []).filter((m: any) =>
+      m.landlordId === Number(selectedLandlordId) && m.entityId === entityId
+    );
+  }, [allMeters.data, selectedLandlordId, entityId]);
+
+  const toggleMeter = (meterId: number) => {
+    setSelectedMeterIds(prev => {
+      const next = new Set(prev);
+      if (next.has(meterId)) next.delete(meterId);
+      else next.add(meterId);
+      return next;
+    });
+  };
+
+  const selectAll = () => {
+    setSelectedMeterIds(new Set(availableMeters.map((m: any) => m.id)));
+  };
+
+  const deselectAll = () => {
+    setSelectedMeterIds(new Set());
+  };
+
+  const save = useMutation({
+    mutationFn: async () => {
+      const promises = Array.from(selectedMeterIds).map(meterId =>
+        updateMeter(meterId, { entityId })
+      );
+      await Promise.all(promises);
+    },
+    onSuccess: () => {
+      toast.success("已关联");
+      setSelectedMeterIds(new Set());
+      queryClient.invalidateQueries({ queryKey: ["meters"] });
+    },
+    onError: (e: any) => toast.error(e.message),
+  });
+
+  const unlink = useMutation({
+    mutationFn: async (meterId: number) => {
+      await updateMeter(meterId, { entityId: null });
+    },
+    onSuccess: () => {
+      toast.success("已解除关联");
+      queryClient.invalidateQueries({ queryKey: ["meters"] });
+    },
+    onError: (e: any) => toast.error(e.message),
+  });
+
+  return (
+    <Dialog open={open} onOpenChange={(o) => !o && onClose()}>
+      <DialogContent className="max-w-lg">
+        <DialogHeader>
+          <DialogTitle>关联电表</DialogTitle>
+        </DialogHeader>
+        <div className="space-y-4">
+          {/* 选择场地 */}
+          <div>
+            <label className="mb-1 block text-xs font-medium text-slate-500">选择场地</label>
+            <select
+              className="w-full rounded border border-slate-200 px-3 py-1.5 text-sm"
+              value={selectedLandlordId}
+              onChange={(e) => { setSelectedLandlordId(e.target.value); setSelectedMeterIds(new Set()); }}
+            >
+              <option value="">请选择场地</option>
+              {(landlords.data ?? []).map((l: any) => (
+                <option key={l.id} value={String(l.id)}>{l.name}</option>
+              ))}
+            </select>
+          </div>
+
+          {selectedLandlordId && (
+            <>
+              {/* 已关联的电表 */}
+              {linkedMeters.length > 0 && (
+                <div>
+                  <div className="mb-1 text-xs font-semibold text-slate-600">已关联（{linkedMeters.length} 块）</div>
+                  <div className="space-y-1 max-h-32 overflow-y-auto">
+                    {linkedMeters.map((m: any) => (
+                      <div key={m.id} className="flex items-center justify-between rounded border bg-emerald-50 px-3 py-1.5">
+                        <div className="flex items-center gap-2">
+                          <Check className="h-3.5 w-3.5 text-emerald-600" />
+                          <span className="text-xs font-mono">{m.meterNo}</span>
+                          <span className="text-xs text-slate-500">{m.brandName}</span>
+                        </div>
+                        <button
+                          className="rounded p-0.5 text-slate-400 hover:text-rose-500"
+                          onClick={() => window.confirm("解除关联？") && unlink.mutate(m.id)}
+                        >
+                          <Trash2 className="h-3 w-3" />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* 可关联的电表 */}
+              <div>
+                <div className="mb-1 flex items-center justify-between">
+                  <span className="text-xs font-semibold text-slate-600">可关联（{availableMeters.length} 块）</span>
+                  <div className="flex gap-1">
+                    <button className="text-[10px] text-emerald-600 hover:underline" onClick={selectAll}>全选</button>
+                    <span className="text-[10px] text-slate-300">|</span>
+                    <button className="text-[10px] text-slate-500 hover:underline" onClick={deselectAll}>取消</button>
+                  </div>
+                </div>
+                <div className="space-y-1 max-h-48 overflow-y-auto rounded border p-2">
+                  {availableMeters.map((m: any) => {
+                    const isSelected = selectedMeterIds.has(m.id);
+                    return (
+                      <label
+                        key={m.id}
+                        className={`flex items-center gap-2 rounded px-2 py-1.5 cursor-pointer transition-colors ${isSelected ? "bg-emerald-50" : "hover:bg-slate-50"}`}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={isSelected}
+                          onChange={() => toggleMeter(m.id)}
+                          className="rounded border-slate-300"
+                        />
+                        <span className="text-xs font-mono">{m.meterNo}</span>
+                        <span className="text-xs text-slate-500">{m.meterName ?? ""}</span>
+                        <span className="ml-auto text-[10px] text-slate-400">{m.brandName}</span>
+                      </label>
+                    );
+                  })}
+                  {availableMeters.length === 0 && (
+                    <div className="py-4 text-center text-xs text-slate-400">该场地下暂无可关联的电表</div>
+                  )}
+                </div>
+              </div>
+
+              {/* 操作按钮 */}
+              <div className="flex justify-end gap-2">
+                <Button variant="outline" size="sm" onClick={onClose}>关闭</Button>
+                <Button
+                  size="sm"
+                  className="bg-emerald-600 hover:bg-emerald-700"
+                  disabled={selectedMeterIds.size === 0 || save.isPending}
+                  onClick={() => save.mutate()}
+                >
+                  关联选中的 {selectedMeterIds.size} 块电表
+                </Button>
+              </div>
+            </>
+          )}
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
