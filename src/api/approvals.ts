@@ -51,12 +51,13 @@ export interface StationApprovalData {
   totalAmount: number;
   applicant: string;
   reason?: string;
+  title?: string;
 }
 
 export const submitStationApproval = (data: StationApprovalData) =>
   client.post("/approvals", {
     bizType: data.approvalType === "电费付款" ? "电费付款" : data.approvalType === "场地费付款" ? "场地费付款" : "电费+场地费",
-    title: `${data.landlordName} ${data.period} ${data.approvalType}`,
+    title: data.title || `${data.landlordName} ${data.period} ${data.approvalType}`,
     applicant: data.applicant,
     amount: data.totalAmount,
     reason: data.reason || `${data.landlordName} ${data.period} ${data.approvalType}，金额 ${data.totalAmount} 元`,

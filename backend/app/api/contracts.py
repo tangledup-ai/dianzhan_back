@@ -125,7 +125,14 @@ def _find_brand_id(name: str) -> int | None:
 
 @router.post("/import")
 async def import_contracts(request: Request, file: UploadFile = File(...)):
-    """Import contracts from Excel file"""
+    """Import contracts from Excel file（场地信息关联表 测试2 格式）
+
+    列布局（sheet1）：
+      场地合同 A~M：类型/场地方/区域/地址/年租金/月租金(可空→年/12)/电费单价/付款方式/押金/提前天数/开始/结束/备注
+      品牌合同 N~AE：类型/品牌方/计费方式/单柜月租/柜数/品牌月租(可空)/品牌年租(可空)/承担成本(忽略)/
+                     电费收款单价/收款方式/押金/首月租金/退款/电费税率%/场地费税率%/开始/结束/备注
+    品牌合同无"关联场地"列：按顺序关联前一行场地合同对应的场地方。
+    """
     if not file.filename.endswith(('.xlsx', '.xls')):
         raise HTTPException(400, "请上传Excel文件(.xlsx)")
 
@@ -160,105 +167,105 @@ async def import_contracts(request: Request, file: UploadFile = File(...)):
 
     for row_idx, row in enumerate(rows[3:], start=4):
         try:
-            contract_type_venue = _str(row[0])  # A
-            landlord_name = _str(row[1])  # B
-            region = _str(row[2])  # C
-            address = _str(row[3])  # D
-            rent_amount = _num(row[4])  # E
-            monthly_rent = _num(row[5])  # F
-            electricity_price = _num(row[6])  # G
-            pay_method_venue = _str(row[7])  # H
-            deposit_venue = _num(row[8])  # I
-            rent_advance_days = _num(row[9])  # J
+            ct_venue = _str(row[0])   # A 合同类型(场地)
+            landlord_name = _str(row[1])  # B 场地方
+            region = _str(row[2])     # C 区域
+            address = _str(row[3])    # D 地址
+            rent_amount = _num(row[4])   # E 场地年租金
+            monthly_rent = _num(row[5])  # F 场地月租金（可空 → 年/12）
+            elec_pay_price = _num(row[6])  # G 电费付款单价
+            pay_method_venue = _str(row[7])  # H 场地租金付款方式
+            deposit_venue = _num(row[8])  # I 场地押金
+            rent_advance_days = _num(row[9])  # J 提前支付天数
             start_date_venue = _parse_date(row[10])  # K
             end_date_venue = _parse_date(row[11])  # L
             remark_venue = _str(row[12])  # M
 
-            contract_type_brand = _str(row[13])  # N
-            linked_landlord = _str(row[14])  # O
-            brand_name = _str(row[15])  # P
-            rent_calc_method = _str(row[16])  # Q
-            unit_monthly_rent = _num(row[17])  # R
-            cabinets_count = _num(row[18])  # S
-            brand_monthly_rent = _num(row[19])  # T
-            brand_rent_amount = _num(row[20])  # U
-            brand_electricity_price = _num(row[22])  # W
-            pay_method_brand = _str(row[23])  # X
-            deposit_brand = _num(row[24])  # Y
-            first_month_rent = _num(row[25])  # Z
-            rent_refund = _num(row[26])  # AA
-            start_date_brand = _parse_date(row[29])  # AD
-            end_date_brand = _parse_date(row[30])  # AE
-            remark_brand = _str(row[31])  # AF
+            ct_brand = _str(row[13])   # N 合同类型(品牌)
+            brand_name = _str(row[14])  # O 品牌方
+            rent_calc_method = _str(row[15])  # P 计费方式
+            unit_monthly_rent = _num(row[16])  # Q 单柜场地月租金
+            cabinets_count = _num(row[17])  # R 计费柜数
+            brand_monthly_rent = _num(row[18])  # S 品牌场地月租金（可空）
+            brand_rent_amount = _num(row[19])  # T 品牌合同年租金（可空）
+            # row[20] U 承担场地成本（分摊计算值，忽略）
+            brand_elec_price = _num(row[21])  # V 电费收款单价
+            pay_method_brand = _str(row[22])  # W 场地租金收款方式
+            deposit_brand = _num(row[23])  # X 品牌押金
+            first_month_rent = _num(row[24])  # Y 首月场地租金
+            rent_refund = _num(row[25])  # Z 场地费退款
+            elec_tax_pct = _num(row[26])  # AA 电费税率(%)
+            rent_tax_pct = _num(row[27])  # AB 场地费税率(%)
+            start_date_brand = _parse_date(row[28])  # AC
+            end_date_brand = _parse_date(row[29])  # AD
+            remark_brand = _str(row[30])  # AE
 
-            is_venue = contract_type_venue and "场地" in contract_type_venue
-            is_brand = contract_type_brand and "品牌" in contract_type_brand
+            is_venue = ct_venue and "场地" in ct_venue
+            is_brand = ct_brand and "品牌" in ct_brand
 
             if not is_venue and not is_brand:
                 continue
 
+            # 注意：场地合同与品牌合同可能出现在同一行（场地行合并单元格的首行 = 第一个品牌行）。
+            # 必须各自独立处理：场地块更新 current_landlord 后，同行的品牌继续用该场地。
             if is_venue:
                 if not landlord_name:
                     results["errors"].append(f"第{row_idx}行: 场地方名称为空")
+                else:
+                    landlord_id = _find_landlord_id(landlord_name)
+                    if landlord_id is None:
+                        landlord_id = _get_or_create_landlord(landlord_name)
+                        results["created_landlords"].append(landlord_name)
+
+                    current_landlord_id = landlord_id
+                    current_landlord_name = landlord_name
+
+                    # 月租缺失 → 年租/12
+                    if monthly_rent is None and rent_amount:
+                        monthly_rent = round(rent_amount / 12, 2)
+                    pm = pay_method_venue or "月付"
+
+                    # Check duplicate
+                    conn = get_connection()
+                    cur = get_dict_cursor(conn)
+                    try:
+                        cur.execute("""
+                            SELECT id FROM contracts
+                            WHERE contract_type = '场地合同' AND landlord_id = %s
+                              AND start_date = %s AND end_date = %s
+                        """, (landlord_id, start_date_venue, end_date_venue))
+                        existing = cur.fetchone()
+                    finally:
+                        cur.close()
+                        conn.close()
+
+                    if existing:
+                        results["skipped"] += 1
+                        results["errors"].append(f"第{row_idx}行: 场地合同已存在（{landlord_name}），跳过")
+                    else:
+                        contract_data = {
+                            "contractType": "场地合同",
+                            "landlordId": landlord_id,
+                            "region": region,
+                            "address": address,
+                            "rentAmount": rent_amount,
+                            "monthlyRent": monthly_rent,
+                            "electricityPrice": elec_pay_price,
+                            "payMethod": pm,
+                            "deposit": deposit_venue,
+                            "rentAdvanceDays": int(rent_advance_days) if rent_advance_days else 0,
+                            "startDate": start_date_venue,
+                            "endDate": end_date_venue,
+                            "remark": remark_venue,
+                        }
+                        contract_repo.create_contract(contract_data)
+                        results["imported"] += 1
+
+            if is_brand:
+                if not current_landlord_id:
+                    results["errors"].append(f"第{row_idx}行: 品牌合同前缺少场地合同行，无法关联场地方")
                     continue
-
-                landlord_id = _find_landlord_id(landlord_name)
-                if landlord_id is None:
-                    landlord_id = _get_or_create_landlord(landlord_name)
-                    results["created_landlords"].append(landlord_name)
-
-                current_landlord_id = landlord_id
-                current_landlord_name = landlord_name
-
-                pm = pay_method_venue or "月付"
-
-                # Check duplicate
-                conn = get_connection()
-                cur = get_dict_cursor(conn)
-                try:
-                    cur.execute("""
-                        SELECT id FROM contracts
-                        WHERE contract_type = '场地合同' AND landlord_id = %s
-                          AND start_date = %s AND end_date = %s
-                    """, (landlord_id, start_date_venue, end_date_venue))
-                    existing = cur.fetchone()
-                finally:
-                    cur.close()
-                    conn.close()
-
-                if existing:
-                    results["skipped"] += 1
-                    results["errors"].append(f"第{row_idx}行: 场地合同已存在（{landlord_name}），跳过")
-                    continue
-
-                contract_data = {
-                    "contractType": "场地合同",
-                    "landlordId": landlord_id,
-                    "region": region,
-                    "address": address,
-                    "rentAmount": rent_amount,
-                    "monthlyRent": monthly_rent,
-                    "electricityPrice": electricity_price,
-                    "payMethod": pm,
-                    "deposit": deposit_venue,
-                    "rentAdvanceDays": int(rent_advance_days) if rent_advance_days else 0,
-                    "startDate": start_date_venue,
-                    "endDate": end_date_venue,
-                    "remark": remark_venue,
-                }
-                contract_repo.create_contract(contract_data)
-                results["imported"] += 1
-
-            elif is_brand:
-                landlord_lookup = linked_landlord or current_landlord_name
-                if not landlord_lookup:
-                    results["errors"].append(f"第{row_idx}行: 品牌合同缺少关联场地方")
-                    continue
-
-                landlord_id = _find_landlord_id(landlord_lookup)
-                if landlord_id is None:
-                    landlord_id = _get_or_create_landlord(landlord_lookup)
-                    results["created_landlords"].append(landlord_lookup)
+                landlord_id = current_landlord_id
 
                 if not brand_name:
                     results["errors"].append(f"第{row_idx}行: 品牌方名称为空")
@@ -269,18 +276,29 @@ async def import_contracts(request: Request, file: UploadFile = File(...)):
                     brand_id = _get_or_create_brand(brand_name)
                     results["created_brands"].append(brand_name)
 
-                rcm = "按柜子数量"
-                if rent_calc_method:
-                    if "固定" in rent_calc_method:
-                        rcm = "固定价格"
-                    elif "柜" in rent_calc_method:
-                        rcm = "按柜子数量"
+                is_fixed = rent_calc_method and "固定" in rent_calc_method
+                rcm = "固定价格" if is_fixed else "按柜子数量"
+
+                # 品牌月租：按柜 → 单柜×柜数；固定租金 → Q 视为年租金/12
+                if brand_monthly_rent is None:
+                    if is_fixed:
+                        brand_monthly_rent = round((unit_monthly_rent or 0) / 12, 2) if unit_monthly_rent else None
+                    elif unit_monthly_rent and cabinets_count:
+                        brand_monthly_rent = round(unit_monthly_rent * cabinets_count, 2)
+                # 品牌年租：缺失 → 固定租金用 Q（年租金）；按柜 → 月租×12
+                if brand_rent_amount is None:
+                    if is_fixed:
+                        brand_rent_amount = unit_monthly_rent
+                    elif brand_monthly_rent:
+                        brand_rent_amount = round(brand_monthly_rent * 12, 2)
 
                 pm = pay_method_brand or "月付"
 
-                mr = brand_monthly_rent
-                if mr is None and unit_monthly_rent and cabinets_count:
-                    mr = unit_monthly_rent * cabinets_count
+                # 税率（% → 小数）+ 税后单价
+                elec_tax_rate = round((elec_tax_pct or 0) / 100, 4) if elec_tax_pct else None
+                rent_tax_rate = round((rent_tax_pct or 0) / 100, 4) if rent_tax_pct else None
+                post_tax_elec = round(brand_elec_price * (1 - elec_tax_rate), 4) if brand_elec_price and elec_tax_rate else None
+                post_tax_rent = round(brand_monthly_rent * (1 - rent_tax_rate), 2) if brand_monthly_rent and rent_tax_rate else None
 
                 # Check duplicate
                 conn = get_connection()
@@ -298,7 +316,7 @@ async def import_contracts(request: Request, file: UploadFile = File(...)):
 
                 if existing:
                     results["skipped"] += 1
-                    results["errors"].append(f"第{row_idx}行: 品牌方合同已存在（{landlord_lookup} - {brand_name}），跳过")
+                    results["errors"].append(f"第{row_idx}行: 品牌方合同已存在（{current_landlord_name} - {brand_name}），跳过")
                     continue
 
                 contract_data = {
@@ -308,13 +326,19 @@ async def import_contracts(request: Request, file: UploadFile = File(...)):
                     "rentCalcMethod": rcm,
                     "unitMonthlyRent": unit_monthly_rent,
                     "cabinetsCount": cabinets_count,
-                    "monthlyRent": mr,
+                    "monthlyRent": brand_monthly_rent,
                     "rentAmount": brand_rent_amount,
-                    "electricityPrice": brand_electricity_price,
+                    "electricityPrice": brand_elec_price,
                     "payMethod": pm,
                     "deposit": deposit_brand,
                     "firstMonthRent": first_month_rent,
                     "rentRefund": rent_refund,
+                    "taxEnabled": bool(elec_tax_rate and elec_tax_rate > 0),
+                    "taxRate": elec_tax_rate or 0.01,
+                    "postTaxElectricityPrice": post_tax_elec,
+                    "rentTaxEnabled": bool(rent_tax_rate and rent_tax_rate > 0),
+                    "rentTaxRate": rent_tax_rate or 0.01,
+                    "postTaxRentPrice": post_tax_rent,
                     "startDate": start_date_brand,
                     "endDate": end_date_brand,
                     "remark": remark_brand,

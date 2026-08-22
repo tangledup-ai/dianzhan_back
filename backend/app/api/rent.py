@@ -422,3 +422,132 @@ async def monthly_ledger(request: Request, period: str = Query(..., description=
     yearly_rows = sorted(yearly_map.values(), key=lambda x: x["landlordName"] or "")
 
     return {"period": period, "dim": dim, "rows": result_rows, "totals": totals, "yearlyRows": yearly_rows}
+
+
+# ─── 年度付款计划（Rent 页底部模块）──────────────────────────
+# 返回某场地方的场地合同在指定年份的付款分期明细 + 关联审批记录
+
+@router.get("/yearly-payment-schedule")
+async def yearly_payment_schedule(request: Request, landlordId: int = Query(...), year: str = Query(...)):
+    """年度付款计划：场地合同的当年付款分期明细 + 审批状态"""
+    from ..infra.database import get_connection, get_dict_cursor
+
+    # 股东账号：只能查看关联场地的付款计划
+    allowed = scope_landlord_ids(request)
+    if allowed is not None and landlordId not in allowed:
+        raise HTTPException(403, "无权查看该场地付款计划")
+
+    year_s = str(year).strip()[:4]
+    year_start = f"{year_s}-01-01"
+    year_end = f"{year_s}-12-31"
+
+    conn = get_connection()
+    cur = get_dict_cursor(conn)
+    try:
+        # 查场地合同
+        cur.execute("""
+            SELECT c.id AS contract_id, c.monthly_rent, c.rent_amount, c.pay_method,
+                   c.start_date, c.end_date, c.early_end_date,
+                   l.id AS landlord_id, l.name AS landlord_name
+            FROM contracts c
+            JOIN landlords l ON c.landlord_id = l.id
+            WHERE c.landlord_id = %s AND c.contract_type = '场地合同'
+            ORDER BY c.id DESC LIMIT 1
+        """, (landlordId,))
+        venue = cur.fetchone()
+
+        if not venue:
+            return {
+                "landlordId": landlordId, "landlordName": "", "year": year_s,
+                "venueContract": None, "schedules": [],
+                "totalAmount": 0, "paidAmount": 0, "paidCount": 0, "totalCount": 0,
+            }
+
+        # 查该场地合同当年的付款分期
+        cur.execute("""
+            SELECT id, seq, period_start, period_end, amount, status, pay_date, invoice, remark
+            FROM rent_payment_schedule
+            WHERE contract_id = %s
+              AND period_start <= %s::date
+              AND period_end >= %s::date
+            ORDER BY seq
+        """, (venue["contract_id"], year_end, year_start))
+        schedules = cur.fetchall()
+
+        # 查该场地方当年的场地费付款审批记录
+        cur.execute("""
+            SELECT id, title, amount, status, period, rent_amount, created_at, finished_at
+            FROM approval_requests
+            WHERE landlord_id = %s
+              AND biz_type = '场地费付款'
+              AND status IN ('审批中', '已通过', '已驳回')
+            ORDER BY created_at DESC
+        """, (landlordId,))
+        approvals = cur.fetchall()
+
+        # 为每个分期关联审批记录（按 period 匹配）+ 经营佐证（供审核核验真实性）
+        # 场地租金收入（品牌方合同月租合计，按场地固定）；电费收入按该期首月台账
+        cur.execute("""
+            SELECT COALESCE(SUM(c.monthly_rent), 0) as total
+            FROM contracts c
+            WHERE c.contract_type = '品牌方合同' AND c.landlord_id = %s
+        """, (landlordId,))
+        venue_income = float(cur.fetchone()["total"] or 0)
+
+        for s in schedules:
+            s_period_start = s["period_start"]
+            if s_period_start:
+                s_month = str(s_period_start)[:7]  # YYYY-MM
+                s["approvals"] = [
+                    a for a in approvals
+                    if a.get("period") and str(a["period"]).replace("-", "")[:6] == s_month.replace("-", "")[:6]
+                ]
+                # 该期首月电费收入（台账口径，不含税）
+                s_month_key = s_month.replace("-", "")[:6]
+                cur.execute("""
+                    SELECT COALESCE(SUM(e.collect_net), 0) as total
+                    FROM electricity_records e
+                    WHERE e.landlord_id = %s AND e.period = %s
+                """, (landlordId, s_month_key))
+                s["monthElecIncome"] = float(cur.fetchone()["total"] or 0)
+            else:
+                s["approvals"] = []
+                s["monthElecIncome"] = 0.0
+            s["monthIncome"] = venue_income
+
+        paid_count = sum(1 for s in schedules if s["status"] == "已付款")
+        paid_amount = sum(float(s["amount"] or 0) for s in schedules if s["status"] == "已付款")
+        total_amount = sum(float(s["amount"] or 0) for s in schedules)
+
+        return {
+            "landlordId": landlordId,
+            "landlordName": venue["landlord_name"],
+            "year": year_s,
+            "venueContract": {
+                "contractId": venue["contract_id"],
+                "monthlyRent": float(venue["monthly_rent"] or 0),
+                "annualRent": float(venue["rent_amount"] or venue["monthly_rent"] or 0) * 12 if not venue["rent_amount"] else float(venue["rent_amount"]),
+                "payMethod": venue["pay_method"],
+                "startDate": str(venue["start_date"])[:10] if venue["start_date"] else None,
+                "endDate": str(venue["early_end_date"] or venue["end_date"])[:10] if (venue["early_end_date"] or venue["end_date"]) else None,
+            },
+            "schedules": [{
+                "id": s["id"],
+                "seq": s["seq"],
+                "periodStart": str(s["period_start"])[:10] if s["period_start"] else None,
+                "periodEnd": str(s["period_end"])[:10] if s["period_end"] else None,
+                "amount": float(s["amount"] or 0),
+                "status": s["status"],
+                "payDate": str(s["pay_date"])[:10] if s["pay_date"] else None,
+                "monthIncome": s.get("monthIncome", 0.0),
+                "monthElecIncome": s.get("monthElecIncome", 0.0),
+                "approvals": s.get("approvals", []),
+            } for s in schedules],
+            "totalAmount": round(total_amount, 2),
+            "paidAmount": round(paid_amount, 2),
+            "paidCount": paid_count,
+            "totalCount": len(schedules),
+        }
+    finally:
+        cur.close()
+        conn.close()

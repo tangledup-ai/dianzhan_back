@@ -1136,6 +1136,20 @@ export default function Stations() {
     });
   };
 
+  // 提交整个场地的应付账款审批（电费/场地费/都提交，用户自选）
+  const [payApproval, setPayApproval] = useState<{ landlordId: number; landlordName: string; mv: any } | null>(null);
+  const openPayApproval = async (r: any) => {
+    const tid = toast.loading("正在加载场地数据…");
+    try {
+      const mv = await getLandlordMeterView(r.landlord.id, selectedMonth);
+      setPayApproval({ landlordId: r.landlord.id, landlordName: r.landlord.name, mv });
+      toast.dismiss(tid);
+    } catch (e) {
+      toast.dismiss(tid);
+      toast.error("加载场地数据失败，请重试");
+    }
+  };
+
   const doExport = async () => {
     const exportRows = selectedLandlordIds.size > 0 ? selectedRows : rows;
     if (exportRows.length === 0) { toast.error("暂无数据可导出"); return; }
@@ -1303,7 +1317,7 @@ export default function Stations() {
         </div>
         <MonthPicker value={selectedMonth} onChange={setSelectedMonth} />
         <div className="ml-auto flex gap-2">
-          <Button variant="outline" onClick={doExport}>
+          <Button className="bg-blue-600 hover:bg-blue-700" onClick={doExport}>
             <Download className="mr-1.5 h-4 w-4" />
             {selectedLandlordIds.size > 0 ? `导出选中（${selectedLandlordIds.size}）` : "导出全部"}
           </Button>
@@ -1343,6 +1357,7 @@ export default function Stations() {
                 <th className="px-3 py-2.5 text-right font-medium">运营费用</th>
                 <th className="px-3 py-2.5 text-right font-medium">总利润</th>
                 <th className="px-3 py-2.5 text-center font-medium">合同</th>
+                <th className="px-3 py-2.5 text-center font-medium">操作</th>
               </tr>
             </thead>
             <tbody>
@@ -1395,10 +1410,18 @@ export default function Stations() {
                           {r.expiringContracts > 0 && <span className="ml-1 text-amber-600">({r.expiringContracts}临期)</span>}
                         </div>
                       </td>
+                      <td className="px-3 py-2.5 text-center" onClick={(e) => e.stopPropagation()}>
+                        <button
+                          onClick={() => openPayApproval(r)}
+                          className="rounded-md border border-blue-200 bg-blue-50 px-2 py-1 text-[10px] font-medium text-blue-700 hover:border-blue-300 hover:bg-blue-100"
+                        >
+                          <FileCheck2 className="mr-1 inline h-3 w-3" />提交审核
+                        </button>
+                      </td>
                     </tr>
                     {isExpanded && (
                       <tr key={`${r.landlord.id}-expanded`}>
-                        <td colSpan={12} className="border-b bg-white px-6 py-4">
+                        <td colSpan={13} className="border-b bg-white px-6 py-4">
                           <ExpandedDetail landlordId={r.landlord.id} meters={r.meters} period={selectedMonth} landlordName={r.landlord.name} summary={{ totalKwh: r.totalKwh, elecPay: r.elecPay, elecCollect: r.elecCollect, elecProfit: r.elecProfit, elecTax: r.elecTax, rentCost: r.rentCost, rentIncome: r.rentIncome, rentProfit: r.rentProfit, rentTax: r.rentTax, opExpense: r.opExpense, dividend: r.dividend, totalProfit: r.totalProfit, stationBreakdown: r.stationBreakdown, contractBreakdown: r.contractBreakdown }} />
                         </td>
                       </tr>
@@ -1407,7 +1430,7 @@ export default function Stations() {
                 );
               })}
               {rows.length === 0 && (
-                <tr><td colSpan={12} className="py-16 text-center text-slate-400">{board.isLoading ? "加载中…" : "暂无场地数据"}</td></tr>
+                <tr><td colSpan={13} className="py-16 text-center text-slate-400">{board.isLoading ? "加载中…" : "暂无场地数据"}</td></tr>
               )}
             </tbody>
             {rows.length > 0 && (
@@ -1423,6 +1446,7 @@ export default function Stations() {
                   <td className="px-3 py-2.5 text-right tabular-nums">{fmtMoney(totals.opExpense)}</td>
                   <td className="px-3 py-2.5 text-right tabular-nums">{fmtMoney(totals.totalProfit)}</td>
                   <td></td>
+                  <td></td>
                 </tr>
               </tfoot>
             )}
@@ -1434,6 +1458,16 @@ export default function Stations() {
           <VisualizationPanel rows={selectedRows} expandedRow={expandedRow} collapsed={panelCollapsed} onToggle={() => setPanelCollapsed(p => !p)} />
         </div>
       </div>
+
+      {/* 提交整个场地的应付账款审批（电费/场地费/都提交） */}
+      <SubmitApprovalDialog
+        open={payApproval !== null}
+        onClose={() => setPayApproval(null)}
+        landlordId={payApproval?.landlordId ?? 0}
+        landlordName={payApproval?.landlordName ?? ""}
+        period={selectedMonth}
+        mv={payApproval?.mv ?? null}
+      />
     </div>
   );
 }

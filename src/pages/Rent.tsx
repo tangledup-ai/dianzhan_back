@@ -1,13 +1,15 @@
 import { Fragment, useMemo, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
-import { getMonthlyLedger } from "@/api/rent";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { getMonthlyLedger, getYearlyPaymentSchedule } from "@/api/rent";
+import { submitStationApproval } from "@/api/approvals";
 import { listEntities } from "@/api/directory";
 import { Button } from "@/components/ui/button";
-import { inputCls } from "@/components/fields";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Field, TextInput, inputCls } from "@/components/fields";
 import { fmtMoney, fmtNum } from "@/lib/format";
 import { toCompact, toDisplay } from "@/lib/period";
 import { exportXlsxWithTitle } from "@/lib/export";
-import { Building2, Tag, ChevronDown, ChevronRight, Download } from "lucide-react";
+import { Building2, Tag, ChevronDown, ChevronRight, Download, CalendarCheck, Clock, CheckCircle2, AlertCircle, Send, FileText } from "lucide-react";
 import { toast } from "sonner";
 
 // 场地费月台账（v2 重设计）：只含场地费（不含电费）
@@ -160,6 +162,442 @@ function YearlyTable({ yearlyRows, yearLabels }: { yearlyRows: any[]; yearLabels
           </div>
         );
       })}
+    </div>
+  );
+}
+
+// ─── 付款审批提交弹窗 ───
+function PayApprovalDialog({
+  open, onClose, landlordId, landlordName, schedule, year, venueContract, paidCount, totalCount, paidAmount,
+}: {
+  open: boolean; onClose: () => void;
+  landlordId: number; landlordName: string;
+  schedule: { id: number; seq: number; periodStart: string; periodEnd?: string; amount: number; monthIncome?: number; monthElecIncome?: number } | null;
+  year: string;
+  venueContract?: any; paidCount?: number; totalCount?: number; paidAmount?: number;
+}) {
+  const [applicant, setApplicant] = useState("");
+  const [extraNote, setExtraNote] = useState("");
+  const queryClient = useQueryClient();
+
+  // 当前系统月份（YYYYMM）
+  const nowYM = (() => {
+    const d = new Date();
+    return `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}`;
+  })();
+  // 该期的付款周期（月范围）：periodStart ~ periodEnd 覆盖的月份
+  const cycleStartYM = schedule?.periodStart?.slice(0, 7).replace("-", "") ?? "";
+  const cycleEndYM = schedule?.periodEnd?.slice(0, 7).replace("-", "") ?? "";
+  // 周期状态：current=应付周期内 / overdue=已逾期（可补提交）/ future=未到期（不可提交）
+  const cycleState = !cycleStartYM || !cycleEndYM
+    ? "current"
+    : nowYM < cycleStartYM ? "future"
+    : nowYM <= cycleEndYM ? "current"
+    : "overdue";
+  const canSubmit = cycleState !== "future";
+
+  // 公共计算
+  const vc = venueContract || {};
+  const seq = schedule?.seq ?? 0;
+  const amount = schedule?.amount ?? 0;
+  const monthly = vc.monthlyRent ?? 0;
+  const annual = vc.annualRent ?? 0;
+  const payMethod = vc.payMethod || "—";
+  const monthsPerTerm = payMethod === "月付" ? 1 : payMethod === "季付" ? 3 : payMethod === "半年付" ? 6 : payMethod === "年付" ? 12 : null;
+  const termsPerYear = monthly && monthsPerTerm ? Math.round((annual || 0) / (monthly * monthsPerTerm)) || 0 : 0;
+  const period = schedule?.periodStart?.slice(0, 7) || `${year}-01`;
+  const remain = Math.round(((annual || 0) - (paidAmount ?? 0)) * 100) / 100;
+  const payCount = paidCount ?? 0;
+  const totalCountN = totalCount ?? 0;
+
+  // 生成随审批单提交的文本依据
+  const buildReason = (): string => {
+    const lines = [
+      `【场地费付款审批】${landlordName} 第${seq}期`,
+      `期次：${schedule?.periodStart?.slice(0, 10) || "—"} ~ ${schedule?.periodEnd?.slice(0, 10) || "—"}`,
+      `应付金额：${amount} 元`,
+      "",
+      "【合同依据】",
+      `合同租期：${vc.startDate || "—"} ~ ${vc.endDate || "—"}`,
+      `付款方式：${payMethod}${monthsPerTerm ? `（每年 ${termsPerYear || "—"} 期，每期 ${monthsPerTerm} 个月）` : ""}`,
+      `月租金：${monthly} 元/月`,
+      `年租金：${annual} 元/年`,
+      monthsPerTerm ? `勾稽：${amount} 元 = ${monthly} 元/月 × ${monthsPerTerm} 个月（本期 ${monthsPerTerm} 个月）` : "",
+      "",
+      `【付款进度】已付 ${payCount}/${totalCountN} 期，已付金额 ${paidAmount ?? 0} 元，剩余待付 ${remain} 元`,
+      "",
+      `【经营佐证（${period}）】`,
+      `场地租金收入（品牌方合同）：${schedule?.monthIncome ?? 0} 元/月`,
+      `电费收入（台账不含税）：${schedule?.monthElecIncome ?? 0} 元`,
+    ];
+    if (extraNote.trim()) {
+      lines.push("", `【补充说明】${extraNote.trim()}`);
+    }
+    return lines.join("\n");
+  };
+
+  const mut = useMutation({
+    mutationFn: () => {
+      if (!schedule) throw new Error("无分期信息");
+      // 付款周期校验：未到期的期次不可提交（应付周期内 + 已逾期的可提交）
+      if (!canSubmit) {
+        throw new Error(`当前月份（${toDisplay(nowYM)}）未到该期的付款月份（应付 ${schedule.periodStart?.slice(0, 10) || "—"} 开始），请到付款周期内再提交`);
+      }
+      return submitStationApproval({
+        landlordId,
+        landlordName,
+        period,
+        approvalType: "场地费付款",
+        rentAmount: schedule.amount,
+        totalAmount: schedule.amount,
+        applicant: applicant.trim() || "经办人",
+        title: `${landlordName} ${period} 场地费付款（第${schedule.seq}期）`,
+        reason: buildReason(),
+      });
+    },
+    onSuccess: () => {
+      toast.success("付款审批已提交");
+      queryClient.invalidateQueries({ queryKey: ["yearly-payment-schedule"] });
+      onClose();
+      setApplicant("");
+      setExtraNote("");
+    },
+    onError: (e: any) => toast.error(e.response?.data?.detail || e.message || "提交失败"),
+  });
+
+  const EvRow = ({ k, v, span }: { k: string; v: string; span?: boolean }) => (
+    <div className={`flex items-baseline justify-between gap-2 ${span ? "col-span-2" : ""}`}>
+      <span className="shrink-0 text-slate-400">{k}</span>
+      <span className="text-right font-medium tabular-nums text-slate-700">{v}</span>
+    </div>
+  );
+
+  return (
+    <Dialog open={open} onOpenChange={(o) => !o && onClose()}>
+      <DialogContent className="max-w-xl">
+        <DialogHeader>
+          <DialogTitle>
+            <div className="flex items-center gap-2">
+              <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-gradient-to-br from-indigo-500 to-indigo-600 text-white">
+                <Send className="h-4 w-4" />
+              </span>
+              <div>
+                <div>提交付款审批</div>
+                <div className="mt-0.5 text-[11px] font-normal text-slate-400">场地费付款 · 提交后按审批流程流转</div>
+              </div>
+            </div>
+          </DialogTitle>
+        </DialogHeader>
+        {schedule && (
+          <div className="space-y-3">
+            {/* 付款周期提示 */}
+            <div className={`flex items-center gap-2 rounded-lg border px-3 py-2 text-[11px] ${cycleState === "future" ? "border-amber-100 bg-amber-50 text-amber-700" : "border-emerald-100 bg-emerald-50 text-emerald-700"}`}>
+              <Clock className="h-3.5 w-3.5 shrink-0" />
+              {cycleState === "current" && (
+                <>当前月份（{toDisplay(nowYM)}）在该期付款周期内，可以提交审批</>
+              )}
+              {cycleState === "overdue" && (
+                <>当前月份（{toDisplay(nowYM)}）已超过该期付款周期（应付 {schedule.periodStart?.slice(0, 10) || "—"} ~ {schedule.periodEnd?.slice(0, 10) || "—"}），可补提交</>
+              )}
+              {cycleState === "future" && (
+                <>当前月份（{toDisplay(nowYM)}）未到该期付款周期（应付 {schedule.periodStart?.slice(0, 10) || "—"} 开始），暂不能提交</>
+              )}
+            </div>
+
+            {/* 审核依据（结构化排版） */}
+            <div className="overflow-hidden rounded-xl border border-slate-200">
+              <div className="flex items-center gap-1.5 border-b bg-indigo-50/60 px-3 py-2">
+                <FileText className="h-3.5 w-3.5 text-indigo-600" />
+                <span className="text-[11px] font-semibold text-indigo-700">审核依据（将随审批单提交）</span>
+              </div>
+              <div className="space-y-3 p-3">
+                {/* 本期信息 */}
+                <div className="rounded-lg bg-slate-50 px-3 py-2.5">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <div className="text-xs font-semibold text-slate-700">{landlordName} · 第{seq}期</div>
+                      <div className="mt-0.5 text-[10px] text-slate-400">
+                        {schedule.periodStart?.slice(0, 10) || "—"} ~ {schedule.periodEnd?.slice(0, 10) || "—"}
+                      </div>
+                    </div>
+                    <div className="text-right">
+                      <div className="text-[10px] text-slate-400">应付金额</div>
+                      <div className="text-base font-bold tabular-nums text-indigo-600">{fmtMoney(amount)}</div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* 合同依据 */}
+                <div>
+                  <div className="mb-1.5 text-[10px] font-semibold text-slate-500">合同依据</div>
+                  <div className="grid grid-cols-2 gap-x-5 gap-y-1.5 text-[11px]">
+                    <EvRow k="合同租期" v={`${vc.startDate || "—"} ~ ${vc.endDate || "—"}`} span />
+                    <EvRow k="付款方式" v={monthsPerTerm ? `${payMethod} · 每年 ${termsPerYear || "—"} 期` : payMethod} />
+                    <EvRow k="月租金" v={`${monthly} 元/月`} />
+                    <EvRow k="年租金" v={`${annual} 元/年`} />
+                    {monthsPerTerm && <EvRow k="勾稽验证" v={`${amount} = ${monthly} × ${monthsPerTerm} 个月`} span />}
+                  </div>
+                </div>
+
+                {/* 付款进度 */}
+                <div className="rounded-lg border border-slate-100 bg-slate-50/50 px-3 py-2 text-[11px]">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="text-slate-500">付款进度：已付 <b className="tabular-nums text-slate-700">{payCount}/{totalCountN}</b> 期 · 已付 {fmtMoney(paidAmount ?? 0)}</span>
+                    <span className="text-slate-500">剩余待付 <b className="tabular-nums text-amber-600">{fmtMoney(remain)}</b></span>
+                  </div>
+                </div>
+
+                {/* 经营佐证 */}
+                <div>
+                  <div className="mb-1.5 text-[10px] font-semibold text-slate-500">经营佐证（{period}）</div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <div className="rounded-lg border border-emerald-100 bg-emerald-50/40 px-2.5 py-2">
+                      <div className="text-[9px] text-emerald-600">场地租金收入 / 月</div>
+                      <div className="mt-0.5 text-sm font-bold tabular-nums text-emerald-700">{fmtMoney(schedule.monthIncome ?? 0)}</div>
+                    </div>
+                    <div className="rounded-lg border border-blue-100 bg-blue-50/40 px-2.5 py-2">
+                      <div className="text-[9px] text-blue-600">电费收入（不含税）</div>
+                      <div className="mt-0.5 text-sm font-bold tabular-nums text-blue-700">{fmtMoney(schedule.monthElecIncome ?? 0)}</div>
+                    </div>
+                  </div>
+                </div>
+
+                {extraNote.trim() && (
+                  <div className="rounded-lg border border-amber-100 bg-amber-50/50 px-3 py-2 text-[11px] text-amber-700">
+                    <span className="font-semibold">补充说明：</span>{extraNote.trim()}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <Field label="申请人 *">
+              <TextInput value={applicant} onChange={setApplicant} placeholder="经办人姓名" />
+            </Field>
+            <Field label="补充说明（可选）">
+              <textarea className={`${inputCls} w-full`} rows={2} value={extraNote} onChange={(e) => setExtraNote(e.target.value)} placeholder="如：发票已开、押金抵扣等补充情况…" />
+            </Field>
+            <div className="flex justify-end gap-2">
+              <Button variant="outline" onClick={onClose}>取消</Button>
+              <Button
+                className="bg-emerald-600 hover:bg-emerald-700"
+                disabled={mut.isPending || !canSubmit}
+                onClick={() => mut.mutate()}
+              >
+                <Send className="mr-1.5 h-4 w-4" />{canSubmit ? "提交审批" : "未到付款周期"}
+              </Button>
+            </div>
+          </div>
+        )}
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+// ─── 年度付款计划模块 ───
+function RentPaymentSchedule({ landlordId, landlordName, year }: { landlordId: number; landlordName: string; year: string }) {
+  const [payDialog, setPayDialog] = useState<{ id: number; seq: number; periodStart: string; periodEnd?: string; amount: number; monthIncome?: number; monthElecIncome?: number } | null>(null);
+  const [collapsed, setCollapsed] = useState(true);
+
+  const { data, isLoading } = useQuery({
+    queryKey: ["yearly-payment-schedule", landlordId, year],
+    queryFn: () => getYearlyPaymentSchedule(landlordId, year),
+    enabled: !!landlordId && !!year,
+  });
+
+  if (isLoading) {
+    return (
+      <div className="rounded-xl border bg-white p-4 text-center text-xs text-slate-400">
+        加载付款计划中…
+      </div>
+    );
+  }
+
+  if (!data || !data.venueContract) {
+    return null;
+  }
+
+  const vc = data.venueContract;
+  const schedules = data.schedules ?? [];
+  const totalAmount = data.totalAmount || 0;
+  const paidAmount = data.paidAmount || 0;
+  const paidCount = data.paidCount || 0;
+  const totalCount = data.totalCount || 0;
+  const progress = totalAmount > 0 ? Math.min(100, Math.round((paidAmount / totalAmount) * 100)) : 0;
+  const firstAmount = schedules[0]?.amount ?? 0;
+
+  return (
+    <div className="overflow-hidden rounded-2xl border border-indigo-100/80 bg-white shadow-sm">
+      {/* 标题栏（点击展开/收起） */}
+      <button
+        type="button"
+        onClick={() => setCollapsed((c) => !c)}
+        className="flex w-full flex-wrap items-center gap-3 border-b border-indigo-50 bg-gradient-to-r from-indigo-50 via-white to-white px-5 py-4 text-left transition-colors hover:bg-indigo-50/40"
+      >
+        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-indigo-500 to-indigo-600 text-white shadow-sm">
+          <CalendarCheck className="h-5 w-5" />
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-sm font-semibold text-slate-800">{landlordName}</span>
+            <span className="rounded-full bg-indigo-100 px-2 py-0.5 text-[10px] font-medium text-indigo-700">年度付款计划 · {year}年</span>
+            {schedules.length > 0 && (
+              <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-medium text-slate-500">共 {totalCount} 期</span>
+            )}
+            {schedules.length > 0 && (
+              <span className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${paidCount >= totalCount && totalCount > 0 ? "bg-emerald-100 text-emerald-700" : "bg-amber-50 text-amber-600"}`}>
+                已付 {paidCount}/{totalCount}
+              </span>
+            )}
+          </div>
+          <div className="mt-1 text-[11px] text-slate-400">
+            合同 {vc.startDate || "—"} ~ {vc.endDate || "—"} · {vc.payMethod || "—"}付款
+            {schedules.length > 0 && <> · 每期 {fmtMoney(firstAmount)}</>}
+          </div>
+        </div>
+        <div className="flex items-center gap-3">
+          <div className="text-right">
+            <div className="text-[10px] text-slate-400">年租金成本</div>
+            <div className="text-lg font-bold tabular-nums text-slate-800">{fmtMoney(totalAmount)}</div>
+          </div>
+          {collapsed ? (
+            <ChevronRight className="h-4 w-4 text-slate-400" />
+          ) : (
+            <ChevronDown className="h-4 w-4 text-slate-400" />
+          )}
+        </div>
+      </button>
+
+      {!collapsed && (
+        <>
+      {/* 付款进度 */}
+      <div className="border-b border-slate-100 px-5 py-4">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2 text-[11px] text-slate-500">
+            <span className="font-medium">付款进度</span>
+            <span className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${progress >= 100 ? "bg-emerald-100 text-emerald-700" : "bg-indigo-50 text-indigo-600"}`}>
+              {paidCount}/{totalCount} 期 · {progress}%
+            </span>
+          </div>
+          <span className="text-[10px] text-slate-400">{paidAmount > 0 ? `已付 ${fmtMoney(paidAmount)}` : "尚未付款"}</span>
+        </div>
+        <div className="mt-2.5 h-2 overflow-hidden rounded-full bg-slate-100">
+          <div
+            className="h-full rounded-full bg-gradient-to-r from-indigo-500 via-indigo-400 to-emerald-400 transition-all duration-500"
+            style={{ width: `${progress}%` }}
+          />
+        </div>
+        <div className="mt-4 grid grid-cols-3 gap-3">
+          <div className="rounded-xl border border-slate-100 bg-slate-50/60 px-3 py-2.5">
+            <div className="text-[10px] text-slate-400">已付金额</div>
+            <div className="mt-0.5 text-sm font-bold tabular-nums text-emerald-600">{fmtMoney(paidAmount)}</div>
+          </div>
+          <div className="rounded-xl border border-slate-100 bg-slate-50/60 px-3 py-2.5">
+            <div className="text-[10px] text-slate-400">待付金额</div>
+            <div className="mt-0.5 text-sm font-bold tabular-nums text-amber-600">{fmtMoney(totalAmount - paidAmount)}</div>
+          </div>
+          <div className="rounded-xl border border-slate-100 bg-slate-50/60 px-3 py-2.5">
+            <div className="text-[10px] text-slate-400">付款方式</div>
+            <div className="mt-0.5 text-sm font-semibold tabular-nums text-slate-700">{vc.payMethod || "—"}</div>
+          </div>
+        </div>
+      </div>
+
+      {/* 分期表格 */}
+      <div className="overflow-x-auto">
+        <table className="w-full text-xs">
+          <thead>
+            <tr className="text-left text-[10px] uppercase tracking-wider text-slate-400">
+              <th className="px-5 py-2.5 font-medium">期数</th>
+              <th className="px-4 py-2.5 font-medium">应付时间</th>
+              <th className="px-4 py-2.5 text-right font-medium">应付金额</th>
+              <th className="px-4 py-2.5 font-medium">状态</th>
+              <th className="px-4 py-2.5 font-medium">实际付款时间</th>
+              <th className="px-4 py-2.5 text-center font-medium">操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            {schedules.length === 0 && (
+              <tr><td colSpan={6} className="py-10 text-center text-slate-400">
+                暂无付款分期数据（请先在合同管理中生成分期）
+              </td></tr>
+            )}
+            {schedules.map((s: any) => {
+              const isPaid = s.status === "已付款";
+              const isPending = !isPaid;
+              const hasApproval = (s.approvals ?? []).length > 0;
+              const latestApproval = hasApproval ? s.approvals[0] : null;
+              return (
+                <tr key={s.id} className={`border-t border-slate-50 transition-colors hover:bg-slate-50/50 ${isPaid ? "bg-emerald-50/20" : ""}`}>
+                  <td className="px-5 py-3">
+                    <span className={`inline-flex h-6 w-6 items-center justify-center rounded-full text-[11px] font-semibold ${isPaid ? "bg-emerald-100 text-emerald-700" : "bg-slate-100 text-slate-500"}`}>{s.seq}</span>
+                  </td>
+                  <td className="px-4 py-3 whitespace-nowrap text-slate-600">
+                    {s.periodStart?.slice(0, 10) || "—"} ~ {s.periodEnd?.slice(0, 10) || "—"}
+                  </td>
+                  <td className="px-4 py-3 text-right font-medium tabular-nums text-slate-700">{fmtMoney(s.amount)}</td>
+                  <td className="px-4 py-3">
+                    {isPaid ? (
+                      <span className="inline-flex items-center gap-1 rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-medium text-emerald-700">
+                        <CheckCircle2 className="h-3 w-3" />已付款
+                      </span>
+                    ) : hasApproval && latestApproval?.status === "审批中" ? (
+                      <span className="inline-flex items-center gap-1 rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-medium text-amber-700">
+                        <Clock className="h-3 w-3" />审批中
+                      </span>
+                    ) : hasApproval && latestApproval?.status === "已驳回" ? (
+                      <span className="inline-flex items-center gap-1 rounded-full bg-rose-100 px-2 py-0.5 text-[10px] font-medium text-rose-700">
+                        <AlertCircle className="h-3 w-3" />已驳回
+                      </span>
+                    ) : (
+                      <span className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-white px-2 py-0.5 text-[10px] font-medium text-slate-500">
+                        未付款
+                      </span>
+                    )}
+                  </td>
+                  <td className="px-4 py-3">
+                    {isPaid && s.payDate ? (
+                      <span className="tabular-nums text-emerald-600">{s.payDate}</span>
+                    ) : (
+                      <span className="text-slate-300">—</span>
+                    )}
+                  </td>
+                  <td className="px-4 py-3 text-center">
+                    {isPending && (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="h-7 rounded-lg border-indigo-200 bg-indigo-50/60 px-2.5 text-xs font-medium text-indigo-600 hover:border-indigo-300 hover:bg-indigo-100"
+                        onClick={() => setPayDialog({ id: s.id, seq: s.seq, periodStart: s.periodStart, periodEnd: s.periodEnd, amount: s.amount, monthIncome: s.monthIncome, monthElecIncome: s.monthElecIncome })}
+                      >
+                        <Send className="mr-1 h-3 w-3" />提交审批
+                      </Button>
+                    )}
+                    {isPaid && (
+                      <span className="text-[10px] text-slate-300">已完成</span>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      {/* 提交审批弹窗 */}
+        </>
+      )}
+      <PayApprovalDialog
+        open={payDialog !== null}
+        onClose={() => setPayDialog(null)}
+        landlordId={landlordId}
+        landlordName={landlordName}
+        schedule={payDialog}
+        year={year}
+        venueContract={data.venueContract}
+        paidCount={data.paidCount}
+        totalCount={data.totalCount}
+        paidAmount={data.paidAmount}
+      />
     </div>
   );
 }
@@ -376,6 +814,29 @@ export default function Rent() {
             <span className="text-[11px] text-slate-400">付款信息=场地合同 · 收款信息=品牌方合同 · 按合同周期计算</span>
           </div>
           <YearlyTable yearlyRows={yearlyRows} yearLabels={yearLabels} />
+        </div>
+      )}
+
+      {/* ── 年度付款计划（底部模块：每个场地方一行） ── */}
+      {yearlyRows.length > 0 && (
+        <div>
+          <div className="mb-3 flex items-center gap-2.5">
+            <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-indigo-100 text-indigo-600">
+              <CalendarCheck className="h-4 w-4" />
+            </span>
+            <h3 className="text-sm font-semibold text-slate-700">年度付款计划（{yearLabel}）</h3>
+            <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-medium text-slate-500">场地合同付款分期 · 提交审批 · 查看付款进度</span>
+          </div>
+          <div className="space-y-4">
+            {yearlyRows.map((gy: any) => (
+              <RentPaymentSchedule
+                key={gy.landlordId}
+                landlordId={gy.landlordId}
+                landlordName={gy.landlordName}
+                year={(startPeriod || CUR_MONTH).slice(0, 4)}
+              />
+            ))}
+          </div>
         </div>
       )}
 

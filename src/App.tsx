@@ -5,7 +5,6 @@ import { AuthProvider, useAuth } from "@/providers/auth";
 import Login from "@/pages/Login";
 import Dashboard from "@/pages/Dashboard";
 import Stations from "@/pages/Stations";
-import StationMap from "@/pages/StationMap";
 import Electricity from "@/pages/Electricity";
 import Rent from "@/pages/Rent";
 import Brands from "@/pages/Brands";
@@ -16,6 +15,7 @@ import Contracts from "@/pages/Contracts";
 import Approvals from "@/pages/Approvals";
 import Meters from "@/pages/Meters";
 import Directory from "@/pages/Directory";
+import Alerts from "@/pages/Alerts";
 
 // 登录守卫：未登录跳转 /login
 function RequireAuth({ children }: { children: React.ReactNode }) {
@@ -49,11 +49,10 @@ function AppRoutes() {
         {/* 股东不能查看「经营总览」，访问 / 自动跳转股东分红 */}
         <Route path="/" element={isShareholder ? <Navigate to="/shareholders" replace /> : <Dashboard />} />
         {/* 股东访问被隐藏页面（直接输 URL 也拦截）→ 跳转股东分红 */}
-        {isShareholder && (["/brands", "/entities", "/landlords", "/approvals", "/directory"] as const).map((p) => (
+        {isShareholder && (["/brands", "/entities", "/landlords", "/approvals", "/directory", "/alerts"] as const).map((p) => (
           <Route key={p} path={p} element={<Navigate to="/shareholders" replace />} />
         ))}
         <Route path="/stations" element={<Stations />} />
-        <Route path="/station-map" element={<StationMap />} />
         <Route path="/electricity" element={<Electricity />} />
         <Route path="/rent" element={<Rent />} />
         <Route path="/brands" element={<Brands />} />
@@ -64,6 +63,7 @@ function AppRoutes() {
         <Route path="/approvals" element={<Approvals />} />
         <Route path="/meters" element={<Meters />} />
         <Route path="/directory" element={<Directory />} />
+        <Route path="/alerts" element={<Alerts />} />
         <Route path="*" element={<Navigate to={isShareholder ? "/shareholders" : "/"} replace />} />
       </Route>
     </Routes>

@@ -1,6 +1,6 @@
 import { useState, useMemo, useEffect, useCallback, useRef } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { listMeters, createMeter, updateMeter, deleteMeter } from "@/api/meters";
+import { listMeters, createMeter, updateMeter, deleteMeter, importMetersExcel } from "@/api/meters";
 import { listCabinets, createCabinet, updateCabinet, deleteCabinet } from "@/api/cabinets";
 import { listBrands, listLandlords, listEntities } from "@/api/directory";
 import { generateElectricity } from "@/api/electricity";
@@ -12,7 +12,7 @@ import { Field, NumInput, TextInput, SelectInput, inputCls } from "@/components/
 import { exportXlsx } from "@/lib/export";
 import { fmtNum } from "@/lib/format";
 import { toCompact, toDisplay } from "@/lib/period";
-import { Download, Search, Plus, Pencil, Trash2, Gauge, ChevronDown, ChevronRight, RefreshCw, BookOpen } from "lucide-react";
+import { Download, Search, Plus, Pencil, Trash2, Gauge, ChevronDown, ChevronRight, RefreshCw, BookOpen, Upload } from "lucide-react";
 import { toast } from "sonner";
 
 // ─── 倒计时格式化 ───
@@ -225,6 +225,26 @@ export default function Meters() {
     toast.success("已导出 Excel");
   };
 
+  // ── 电表读数 Excel 导入 ──
+  const importFileRef = useRef<HTMLInputElement>(null);
+  const [importing, setImporting] = useState(false);
+  const [importResult, setImportResult] = useState<any>(null);
+  const handleImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    setImporting(true);
+    try {
+      const res = await importMetersExcel(file);
+      setImportResult(res);
+      queryClient.invalidateQueries({ queryKey: ["meters"] });
+    } catch (err: any) {
+      toast.error(err?.response?.data?.detail || err?.message || "导入失败");
+    } finally {
+      setImporting(false);
+    }
+  };
+
   const toggleExpand = (id: number) => {
     setExpandedMeterId((prev) => (prev === id ? null : id));
   };
@@ -268,7 +288,11 @@ export default function Meters() {
                 : `刷新电表数据 (${syncLimit.remaining})`
             }
           </Button>
-          <Button variant="outline" onClick={doExport}><Download className="mr-1.5 h-4 w-4" />导出表格</Button>
+          <Button className="bg-blue-600 hover:bg-blue-700" onClick={doExport}><Download className="mr-1.5 h-4 w-4" />导出表格</Button>
+          <Button variant="outline" className="text-blue-600" disabled={importing} onClick={() => importFileRef.current?.click()}>
+            <Upload className="mr-1.5 h-4 w-4" />{importing ? "导入中…" : "导入 Excel"}
+          </Button>
+          <input ref={importFileRef} type="file" accept=".xlsx,.xls" className="hidden" onChange={handleImport} />
           <Button className="bg-emerald-600 hover:bg-emerald-700" onClick={() => { setEditRecord(null); setFormOpen(true); }}>
             <Plus className="mr-1.5 h-4 w-4" />新增电表
           </Button>
@@ -350,6 +374,45 @@ export default function Meters() {
                 确认刷新
               </Button>
             </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* Excel 导入结果 */}
+      <Dialog open={importResult !== null} onOpenChange={(o) => !o && setImportResult(null)}>
+        <DialogContent className="max-w-md">
+          <DialogHeader><DialogTitle>电表导入结果</DialogTitle></DialogHeader>
+          <div className="space-y-3 text-xs">
+            <div className="flex flex-wrap gap-2">
+              <span className="rounded-full bg-emerald-100 px-2.5 py-1 font-medium text-emerald-700">成功处理 {importResult?.updated ?? 0} 行</span>
+            </div>
+            {((importResult?.created_landlords ?? []).length > 0 || (importResult?.created_brands ?? []).length > 0) && (
+              <div className="rounded-lg border border-amber-100 bg-amber-50/60 px-3 py-2">
+                <div className="mb-1 font-medium text-amber-700">自动关联：</div>
+                <div className="text-slate-600">
+                  {(importResult?.created_landlords ?? []).length > 0 && <>场地方：{importResult.created_landlords.join("、")}<br /></>}
+                  {(importResult?.created_brands ?? []).length > 0 && <>品牌方：{importResult.created_brands.join("、")}</>}
+                </div>
+              </div>
+            )}
+            {(importResult?.errors ?? []).length > 0 ? (
+              <div className="max-h-48 overflow-y-auto rounded-lg border border-rose-100 bg-rose-50/60 px-3 py-2">
+                <div className="mb-1 font-medium text-rose-700">提示 / 跳过原因：</div>
+                {importResult.errors.map((e: string, i: number) => (
+                  <div key={i} className="py-0.5 text-slate-600">· {e}</div>
+                ))}
+              </div>
+            ) : (
+              (importResult?.updated ?? 0) === 0 && (
+                <div className="text-slate-500">未处理任何行（可能数据为空或全部是示例行）</div>
+              )
+            )}
+            <div className="text-[10px] text-slate-400">
+              已关联场地的电表保存了读数；未关联的电表已自动关联场地方并保存读数；电费台账已自动重新生成。
+            </div>
+          </div>
+          <div className="mt-4 flex justify-end">
+            <Button variant="outline" onClick={() => setImportResult(null)}>关闭</Button>
           </div>
         </DialogContent>
       </Dialog>

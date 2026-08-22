@@ -1,6 +1,6 @@
-import { useMemo, useState, useEffect, type ReactNode } from "react";
+import { useMemo, useState, useEffect, useRef, type ReactNode } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { listContracts, createContract, updateContract, deleteContract } from "@/api/contracts";
+import { listContracts, createContract, updateContract, deleteContract, importContractsExcel } from "@/api/contracts";
 import { listBrands, listLandlords } from "@/api/directory";
 import { listMeters } from "@/api/meters";
 import { listCabinets } from "@/api/cabinets";
@@ -12,7 +12,7 @@ import { Field, NumInput, TextInput, DateInput, SelectInput, inputCls } from "@/
 import { MapPicker } from "@/components/MapPicker";
 import * as XLSX from "xlsx";
 import { fmtMoney, fmtNum, fmtDate, numOrNull } from "@/lib/format";
-import { Download, Plus, Search, Pencil, Trash2, AlertTriangle, FileText, ArrowDownCircle, ArrowUpCircle, ExternalLink, ChevronDown, ChevronRight } from "lucide-react";
+import { Download, Plus, Search, Pencil, Trash2, AlertTriangle, FileText, ArrowDownCircle, ArrowUpCircle, ExternalLink, ChevronDown, ChevronRight, Upload } from "lucide-react";
 import { ContractSchedule } from "@/components/ContractSchedule";
 import { toast } from "sonner";
 
@@ -47,6 +47,26 @@ export default function Contracts() {
     mutationFn: deleteContract,
     onSuccess: () => { toast.success("已删除"); queryClient.invalidateQueries({ queryKey: ["contracts"] }); },
   });
+
+  // ── Excel 导入合同 ──
+  const fileRef = useRef<HTMLInputElement>(null);
+  const [importing, setImporting] = useState(false);
+  const [importResult, setImportResult] = useState<any>(null);
+  const handleImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    setImporting(true);
+    try {
+      const res = await importContractsExcel(file);
+      setImportResult(res);
+      queryClient.invalidateQueries({ queryKey: ["contracts"] });
+    } catch (err: any) {
+      toast.error(err?.response?.data?.detail || err?.message || "导入失败");
+    } finally {
+      setImporting(false);
+    }
+  };
 
   // 年份选项：当前年 ±5 年，再合并合同数据中出现的年份
   const yearOptions = useMemo(() => {
@@ -204,7 +224,11 @@ export default function Contracts() {
           {(brands.data ?? []).map((b: any) => <option key={b.id} value={String(b.id)}>{b.name}</option>)}
         </select>
         <div className="ml-auto flex gap-2">
-          <Button variant="outline" onClick={doExport}><Download className="mr-1.5 h-4 w-4" />导出表格</Button>
+          <Button className="bg-blue-600 hover:bg-blue-700" onClick={doExport}><Download className="mr-1.5 h-4 w-4" />导出表格</Button>
+          <Button variant="outline" className="text-blue-600" disabled={importing} onClick={() => fileRef.current?.click()}>
+            <Upload className="mr-1.5 h-4 w-4" />{importing ? "导入中…" : "导入 Excel"}
+          </Button>
+          <input ref={fileRef} type="file" accept=".xlsx,.xls" className="hidden" onChange={handleImport} />
           <Button variant="outline" className="text-rose-600" onClick={() => openCreate("场地合同")}>
             <Plus className="mr-1 h-4 w-4" />场地合同
           </Button>
@@ -406,6 +430,44 @@ export default function Contracts() {
       </div>
 
       <ContractForm open={formOpen} onClose={() => { setFormOpen(false); setEditing(null); }} record={editing} defaultType={formType} />
+
+      {/* Excel 导入结果 */}
+      <Dialog open={importResult !== null} onOpenChange={(o) => !o && setImportResult(null)}>
+        <DialogContent className="max-w-md">
+          <DialogHeader><DialogTitle>Excel 导入结果</DialogTitle></DialogHeader>
+          <div className="space-y-3 text-xs">
+            <div className="flex flex-wrap gap-2">
+              <span className="rounded-full bg-emerald-100 px-2.5 py-1 font-medium text-emerald-700">成功导入 {importResult?.imported ?? 0} 条</span>
+              <span className="rounded-full bg-slate-100 px-2.5 py-1 font-medium text-slate-600">跳过 {importResult?.skipped ?? 0} 条</span>
+            </div>
+            {((importResult?.created_landlords ?? []).length > 0 || (importResult?.created_brands ?? []).length > 0) && (
+              <div className="rounded-lg border border-amber-100 bg-amber-50/60 px-3 py-2">
+                <div className="mb-1 font-medium text-amber-700">自动新建（Excel 中不存在的基础档案）</div>
+                <div className="text-slate-600">
+                  {(importResult?.created_landlords ?? []).length > 0 && <>场地方：{importResult.created_landlords.join("、")}<br /></>}
+                  {(importResult?.created_brands ?? []).length > 0 && <>品牌方：{importResult.created_brands.join("、")}</>}
+                </div>
+              </div>
+            )}
+            {(importResult?.errors ?? []).length > 0 ? (
+              <div className="max-h-48 overflow-y-auto rounded-lg border border-rose-100 bg-rose-50/60 px-3 py-2">
+                <div className="mb-1 font-medium text-rose-700">提示 / 跳过原因：</div>
+                {importResult.errors.map((e: string, i: number) => (
+                  <div key={i} className="py-0.5 text-slate-600">· {e}</div>
+                ))}
+              </div>
+            ) : (
+              (importResult?.imported ?? 0) === 0 && (
+                <div className="text-slate-500">未导入新合同（可能全部已存在或数据为空）</div>
+              )
+            )}
+            <div className="text-[10px] text-slate-400">导入自动按 Excel 中的场地方/品牌方名称匹配，不存在的会自动新建。</div>
+          </div>
+          <div className="mt-4 flex justify-end">
+            <Button variant="outline" onClick={() => setImportResult(null)}>关闭</Button>
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

@@ -7,3 +7,4 @@ export * from "./dividends";
 export * from "./approvals";
 export * from "./contracts";
 export * from "./overview";
+export * from "./alerts";

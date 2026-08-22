@@ -117,7 +117,7 @@ export default function Landlords() {
         </div>
         <input type="month" className={inputCls + " w-40"} value={selectedMonth} onChange={e => setSelectedMonth(e.target.value)} />
         <div className="ml-auto flex gap-2">
-          <Button variant="outline" onClick={doExport}><Download className="mr-1.5 h-4 w-4" />导出表格</Button>
+          <Button className="bg-blue-600 hover:bg-blue-700" onClick={doExport}><Download className="mr-1.5 h-4 w-4" />导出表格</Button>
         </div>
       </div>
 

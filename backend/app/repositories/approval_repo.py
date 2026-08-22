@@ -200,6 +200,15 @@ def apply_payment_links(cur, request: dict):
                         SET status = '已付款', pay_date = NOW()::date
                         WHERE id = %s
                     """, (row["id"],))
+                    # 同步合同付款状态：全部分期已付=已付款 / 部分已付=部分付款 / 否则未付款
+                    cur.execute("""
+                        UPDATE contracts SET pay_status = CASE
+                            WHEN NOT EXISTS (SELECT 1 FROM rent_payment_schedule s WHERE s.contract_id = %s AND s.status <> '已付款') THEN '已付款'
+                            WHEN EXISTS (SELECT 1 FROM rent_payment_schedule s WHERE s.contract_id = %s AND s.status = '已付款') THEN '部分付款'
+                            ELSE '未付款'
+                        END
+                        WHERE id = %s
+                    """, (c["id"], c["id"], c["id"]))
 
     # ── 电费付款 → 联动电费台账付款状态（v3：台账挂 landlord_id，按 场地×月 更新）──
     if "电费" in biz and landlord_id and period:

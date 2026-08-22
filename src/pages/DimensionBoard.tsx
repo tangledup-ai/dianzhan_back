@@ -88,7 +88,7 @@ export default function DimensionBoard({ kind }: { kind: Kind }) {
       </div>
 
       <div className="flex justify-end">
-        <Button variant="outline" onClick={doExport}><Download className="mr-1.5 h-4 w-4" />导出表格</Button>
+        <Button className="bg-blue-600 hover:bg-blue-700" onClick={doExport}><Download className="mr-1.5 h-4 w-4" />导出表格</Button>
       </div>
 
       <div className="overflow-x-auto rounded-xl border bg-white shadow-sm">

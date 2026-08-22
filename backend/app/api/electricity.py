@@ -639,7 +639,11 @@ async def monthly_ledger(period: str, dim: str = "landlord"):
                        COALESCE(SUM(e.pay_amount), 0) AS pay_amount,
                        COALESCE(SUM(e.collect_amount), 0) AS collect_amount,
                        COALESCE(SUM(e.collect_net), 0) AS collect_net,
-                       COALESCE(SUM(e.profit), 0) AS profit
+                       COALESCE(SUM(e.profit), 0) AS profit,
+                       CASE
+                         WHEN COUNT(*) > 0 AND COUNT(*) FILTER (WHERE e.pay_status = '已付款') = COUNT(*) THEN '已付款'
+                         ELSE '未付款'
+                       END AS pay_status
                 FROM electricity_records e
                 LEFT JOIN landlords l ON e.landlord_id = l.id
                 WHERE e.period = %s
@@ -683,6 +687,7 @@ async def monthly_ledger(period: str, dim: str = "landlord"):
             "collectNet": round(net, 2),
             "elecTax": round(collect - net, 2),
             "profit": round(float(r.get("profit") or (net - pay)), 2),
+            "payStatus": r.get("pay_status") or "未付款",
             "details": r["details"],
         }
         for k in ("kwh", "payAmount", "collectAmount", "collectNet", "elecTax", "profit"):

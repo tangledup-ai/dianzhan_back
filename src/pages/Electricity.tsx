@@ -1,11 +1,13 @@
 import { Fragment, useMemo, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { getElectricityMonthlyLedger, exportElectricityLedger } from "@/api/electricity";
+import { submitStationApproval } from "@/api/approvals";
 import { Button } from "@/components/ui/button";
-import { inputCls } from "@/components/fields";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Field, TextInput, inputCls } from "@/components/fields";
 import { fmtMoney, fmtNum } from "@/lib/format";
 import { toCompact, toDisplay } from "@/lib/period";
-import { Building2, Tag, ChevronDown, ChevronRight, Download } from "lucide-react";
+import { Building2, Tag, ChevronDown, ChevronRight, Download, Send, FileText } from "lucide-react";
 import * as XLSX from "xlsx";
 import { toast } from "sonner";
 
@@ -20,6 +22,190 @@ function StatCard({ label, value, suffix = "", tone = "slate" }: { label: string
       <div className="text-[11px] text-slate-400">{label}</div>
       <div className={`text-lg font-bold tabular-nums ${color}`}>{suffix === "kwh" ? fmtNum(value ?? 0) : fmtMoney(value ?? 0)}</div>
     </div>
+  );
+}
+
+// ─── 应付电费审批提交弹窗（电费付款：我方付给场地方）───
+function PayElectricityDialog({ open, onClose, landlordId, landlordName, period, g }: {
+  open: boolean; onClose: () => void;
+  landlordId: number; landlordName: string; period: string;
+  g: { kwh: number; payAmount: number; collectNet: number; profit: number; details?: any[] } | null;
+}) {
+  const [applicant, setApplicant] = useState("");
+  const [extraNote, setExtraNote] = useState("");
+  const queryClient = useQueryClient();
+  const periodDisplay = period.length === 6 ? `${period.slice(0, 4)}-${period.slice(4)}` : period;
+  // 当前系统月份（YYYYMM）；电费按月应付，只有当月台账在付款周期内
+  const nowYM = (() => {
+    const d = new Date();
+    return `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}`;
+  })();
+  // 电费按月应付：当月=付款周期内；历史月=已逾期可补提交；未来月（早于台账月）不可提交
+  const isCurrentMonth = period.length === 6 && nowYM === period;
+  const isOverdue = period.length === 6 && nowYM > period;
+  const canSubmit = period.length === 6 && nowYM >= period;
+
+  const payUnitPrice = g?.details?.[0]?.payUnitPrice;
+  const amount = g?.payAmount ?? 0;
+  const kwh = g?.kwh ?? 0;
+
+  const buildReason = () => {
+    const lines = [
+      `【电费付款审批】${landlordName} ${periodDisplay}`,
+      `应付金额（电费成本）：${amount} 元`,
+      "",
+      "【电费依据】",
+      `用电度数：${kwh} 度`,
+      `付款单价：${payUnitPrice ?? "—"} 元/度`,
+      payUnitPrice ? `勾稽：${Math.round(amount * 100) / 100} = ${kwh} 度 × ${payUnitPrice} 元/度` : "",
+      "",
+      `【经营佐证（${periodDisplay}）】`,
+      `电费收款（不含税）：${g?.collectNet ?? 0} 元`,
+      `电费利润：${g?.profit ?? 0} 元`,
+    ];
+    if (extraNote.trim()) lines.push("", `【补充说明】${extraNote.trim()}`);
+    return lines.join("\n");
+  };
+
+  const mut = useMutation({
+    mutationFn: () => {
+      if (!g) throw new Error("无电费数据");
+      // 付款周期校验：当月及历史月（逾期）可提交
+      if (!canSubmit) {
+        throw new Error(`当前月份（${toDisplay(nowYM)}）早于 ${periodDisplay}，该月电费尚未到期，请到付款周期内再提交`);
+      }
+      return submitStationApproval({
+        landlordId,
+        landlordName,
+        period: periodDisplay,
+        approvalType: "电费付款",
+        electricityAmount: amount,
+        totalAmount: amount,
+        applicant: applicant.trim() || "经办人",
+        title: `${landlordName} ${periodDisplay} 电费付款`,
+        reason: buildReason(),
+      });
+    },
+    onSuccess: () => {
+      toast.success("电费付款审批已提交");
+      queryClient.invalidateQueries({ queryKey: ["electricity-monthly"] });
+      onClose();
+      setApplicant("");
+      setExtraNote("");
+    },
+    onError: (e: any) => toast.error(e.response?.data?.detail || e.message || "提交失败"),
+  });
+
+  return (
+    <Dialog open={open} onOpenChange={(o) => !o && onClose()}>
+      <DialogContent className="max-w-xl">
+        <DialogHeader>
+          <DialogTitle>
+            <div className="flex items-center gap-2">
+              <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-gradient-to-br from-rose-500 to-rose-600 text-white">
+                <Send className="h-4 w-4" />
+              </span>
+              <div>
+                <div>提交应付电费审批</div>
+                <div className="mt-0.5 text-[11px] font-normal text-slate-400">电费付款 · 我方付给场地方</div>
+              </div>
+            </div>
+          </DialogTitle>
+        </DialogHeader>
+        {g && (
+          <div className="space-y-3">
+            {/* 付款周期提示 */}
+            <div className={`flex items-center gap-2 rounded-lg border px-3 py-2 text-[11px] ${canSubmit ? "border-emerald-100 bg-emerald-50 text-emerald-700" : "border-amber-100 bg-amber-50 text-amber-700"}`}>
+              <Send className="h-3.5 w-3.5 shrink-0" />
+              {isCurrentMonth && (
+                <>当前月份（{toDisplay(nowYM)}）为该月电费付款周期，可以提交审批</>
+              )}
+              {isOverdue && (
+                <>当前月份（{toDisplay(nowYM)}）已超过 {periodDisplay} 的付款周期，可补提交</>
+              )}
+              {!canSubmit && (
+                <>当前月份（{toDisplay(nowYM)}）早于 {periodDisplay}，该月电费尚未到期，暂不能提交</>
+              )}
+            </div>
+
+            {/* 审核依据 */}
+            <div className="overflow-hidden rounded-xl border border-slate-200">
+              <div className="flex items-center gap-1.5 border-b bg-rose-50/60 px-3 py-2">
+                <FileText className="h-3.5 w-3.5 text-rose-600" />
+                <span className="text-[11px] font-semibold text-rose-700">审核依据（将随审批单提交）</span>
+              </div>
+              <div className="space-y-3 p-3">
+                <div className="rounded-lg bg-slate-50 px-3 py-2.5">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <div className="text-xs font-semibold text-slate-700">{landlordName} · {toDisplay(period)}</div>
+                      <div className="mt-0.5 text-[10px] text-slate-400">电费付款（我方付给场地方）</div>
+                    </div>
+                    <div className="text-right">
+                      <div className="text-[10px] text-slate-400">应付金额</div>
+                      <div className="text-base font-bold tabular-nums text-rose-600">{fmtMoney(amount)}</div>
+                    </div>
+                  </div>
+                </div>
+
+                <div>
+                  <div className="mb-1.5 text-[10px] font-semibold text-slate-500">电费依据</div>
+                  <div className="grid grid-cols-2 gap-x-5 gap-y-1.5 text-[11px]">
+                    <div className="flex items-baseline justify-between gap-2">
+                      <span className="shrink-0 text-slate-400">用电度数</span>
+                      <span className="font-medium tabular-nums text-slate-700">{fmtNum(kwh)} 度</span>
+                    </div>
+                    <div className="flex items-baseline justify-between gap-2">
+                      <span className="shrink-0 text-slate-400">付款单价</span>
+                      <span className="font-medium tabular-nums text-slate-700">{payUnitPrice != null ? `${payUnitPrice} 元/度` : "—"}</span>
+                    </div>
+                    {payUnitPrice ? (
+                      <div className="col-span-2 flex items-baseline justify-between gap-2">
+                        <span className="shrink-0 text-slate-400">勾稽验证</span>
+                        <span className="font-medium tabular-nums text-slate-700">{Math.round(amount * 100) / 100} = {fmtNum(kwh)} 度 × {payUnitPrice} 元/度</span>
+                      </div>
+                    ) : null}
+                  </div>
+                </div>
+
+                <div>
+                  <div className="mb-1.5 text-[10px] font-semibold text-slate-500">经营佐证（{toDisplay(period)}）</div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <div className="rounded-lg border border-emerald-100 bg-emerald-50/40 px-2.5 py-2">
+                      <div className="text-[9px] text-emerald-600">电费收款（不含税）</div>
+                      <div className="mt-0.5 text-sm font-bold tabular-nums text-emerald-700">{fmtMoney(g.collectNet ?? 0)}</div>
+                    </div>
+                    <div className="rounded-lg border border-blue-100 bg-blue-50/40 px-2.5 py-2">
+                      <div className="text-[9px] text-blue-600">电费利润</div>
+                      <div className="mt-0.5 text-sm font-bold tabular-nums text-blue-700">{fmtMoney(g.profit ?? 0)}</div>
+                    </div>
+                  </div>
+                </div>
+
+                {extraNote.trim() && (
+                  <div className="rounded-lg border border-amber-100 bg-amber-50/50 px-3 py-2 text-[11px] text-amber-700">
+                    <span className="font-semibold">补充说明：</span>{extraNote.trim()}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <Field label="申请人 *">
+              <TextInput value={applicant} onChange={setApplicant} placeholder="经办人姓名" />
+            </Field>
+            <Field label="补充说明（可选）">
+              <textarea className={`${inputCls} w-full`} rows={2} value={extraNote} onChange={(e) => setExtraNote(e.target.value)} placeholder="如：发票情况、收款方账户等…" />
+            </Field>
+            <div className="flex justify-end gap-2">
+              <Button variant="outline" onClick={onClose}>取消</Button>
+              <Button className="bg-emerald-600 hover:bg-emerald-700" disabled={mut.isPending || !canSubmit} onClick={() => mut.mutate()}>
+                <Send className="mr-1.5 h-4 w-4" />{canSubmit ? "提交审批" : "未到付款周期"}
+              </Button>
+            </div>
+          </div>
+        )}
+      </DialogContent>
+    </Dialog>
   );
 }
 
@@ -209,6 +395,8 @@ export default function Electricity() {
   };
 
   const [exporting, setExporting] = useState(false);
+  // 应付电费审批弹窗（电费付款：我方付给场地方）
+  const [payElec, setPayElec] = useState<{ landlordId: number; landlordName: string; period: string; g: any } | null>(null);
 
   const doExport = async () => {
     if (monthRange.length === 0) { toast.error("请选择有效的月份区间"); return; }
@@ -342,6 +530,14 @@ export default function Electricity() {
                                   <span className="text-emerald-600 tabular-nums">收 {fmtMoney(g.collectNet)}</span>
                                   <span className="text-slate-400 tabular-nums">税 {fmtMoney(g.elecTax)}</span>
                                   <span className="ml-auto text-slate-700 tabular-nums">利 {fmtMoney(g.profit)}</span>
+                                  {dim === "landlord" && g.payStatus === "未付款" && g.payAmount > 0 && (
+                                    <button
+                                      onClick={(e) => { e.stopPropagation(); setPayElec({ landlordId: Number(g.key), landlordName: g.name, period: m.period, g }); }}
+                                      className="rounded-md border border-rose-200 bg-rose-50 px-2 py-1 text-[10px] font-medium text-rose-600 hover:border-rose-300 hover:bg-rose-100"
+                                    >
+                                      <Send className="mr-1 inline h-3 w-3" />提交应付电费审批
+                                    </button>
+                                  )}
                                 </div>
                                 {rOpen && (
                                   <div className="ml-6 overflow-x-auto rounded-lg border bg-white">
@@ -423,6 +619,16 @@ export default function Electricity() {
         口径：电费付款=实际度数×场地合同单价；电费收款=实际度数×品牌方合同单价（按电表品牌匹配）；
         税费=含税收款−不含税收款；利润=不含税收款−付款。台账由「电表归属/合同/读数」变更自动生成，无需手动操作。
       </p>
+
+      {/* 应付电费审批弹窗 */}
+      <PayElectricityDialog
+        open={payElec !== null}
+        onClose={() => setPayElec(null)}
+        landlordId={payElec?.landlordId ?? 0}
+        landlordName={payElec?.landlordName ?? ""}
+        period={payElec?.period ?? ""}
+        g={payElec?.g ?? null}
+      />
     </div>
   );
 }

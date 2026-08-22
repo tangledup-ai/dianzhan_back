@@ -14,7 +14,8 @@ import { Button } from "@/components/ui/button";
 import { inputCls } from "@/components/fields";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { exportXlsx } from "@/lib/export";
-import { Plus, Pencil, Trash2, Check, X, Search, Download, PlugZap } from "lucide-react";
+import { getAlertConfig, saveAlertConfig } from "@/api/alerts";
+import { Plus, Pencil, Trash2, Check, X, Search, Download, PlugZap, AlertTriangle } from "lucide-react";
 import { toast } from "sonner";
 
 type RowDef = { key: string; label: string; placeholder?: string }[];
@@ -88,7 +89,7 @@ function CrudTable(props: {
             <Search className="absolute left-2 top-2 h-3.5 w-3.5 text-slate-400" />
             <input className={`${inputCls} w-40 pl-7 text-xs`} placeholder="搜索…" value={keyword} onChange={(e) => setKeyword(e.target.value)} />
           </div>
-          <Button size="sm" variant="outline" onClick={doExport}><Download className="mr-1 h-3 w-3" />导出</Button>
+          <Button size="sm" className="bg-blue-600 hover:bg-blue-700" onClick={doExport}><Download className="mr-1 h-3 w-3" />导出</Button>
         </div>
       </div>
       <table className="w-full text-sm">
@@ -290,7 +291,7 @@ function PlatformUsersTable({ shareholders, landlords }: { shareholders: any[] |
             <Search className="absolute left-2 top-2 h-3.5 w-3.5 text-slate-400" />
             <input className={`${inputCls} w-40 pl-7 text-xs`} placeholder="搜索…" value={keyword} onChange={(e) => setKeyword(e.target.value)} />
           </div>
-          <Button size="sm" variant="outline" onClick={doExport}><Download className="mr-1 h-3 w-3" />导出</Button>
+          <Button size="sm" className="bg-blue-600 hover:bg-blue-700" onClick={doExport}><Download className="mr-1 h-3 w-3" />导出</Button>
         </div>
       </div>
       <table className="w-full text-sm">
@@ -547,6 +548,88 @@ function ThirdPartyConfigsTable() {
   );
 }
 
+// ─── 预警设置 ───
+function AlertSettingsTable() {
+  const queryClient = useQueryClient();
+  const cfg = useQuery({ queryKey: ["alertConfig"], queryFn: getAlertConfig });
+  const [draft, setDraft] = useState<{ elecYoyRatio: string; expireDaysVenue: string; expireDaysBrand: string }>({ elecYoyRatio: "", expireDaysVenue: "", expireDaysBrand: "" });
+
+  // 数据加载后回填表单
+  const loaded = useMemo(() => {
+    if (!cfg.data) return false;
+    setDraft({
+      elecYoyRatio: String(cfg.data.elecYoyRatio ?? 1.5),
+      expireDaysVenue: String(cfg.data.expireDaysVenue ?? 30),
+      expireDaysBrand: String(cfg.data.expireDaysBrand ?? 30),
+    });
+    return true;
+  }, [cfg.data]);
+
+  const save = async () => {
+    const ratio = Number(draft.elecYoyRatio);
+    const dv = Number(draft.expireDaysVenue);
+    const db = Number(draft.expireDaysBrand);
+    if (!(ratio >= 1) || !(dv >= 0) || !(db >= 0)) { toast.error("上涨比例 ≥1，提前天数 ≥0"); return; }
+    try {
+      await saveAlertConfig({ elecYoyRatio: ratio, expireDaysVenue: dv, expireDaysBrand: db });
+      toast.success("预警设置已保存");
+      queryClient.invalidateQueries({ queryKey: ["alertConfig"] });
+    } catch (e: any) { toast.error(e.message || "保存失败"); }
+  };
+
+  return (
+    <div className="rounded-xl border bg-white shadow-sm">
+      <div className="flex items-center justify-between border-b px-4 py-3">
+        <span className="flex items-center gap-2 text-sm font-semibold text-slate-700">
+          <AlertTriangle className="h-4 w-4 text-amber-500" />预警设置
+        </span>
+        <Button size="sm" className="bg-emerald-600 hover:bg-emerald-700" onClick={save}><Check className="mr-1 h-3.5 w-3.5" />保存</Button>
+      </div>
+      <div className="space-y-5 p-5">
+        {/* 电量异常 */}
+        <div>
+          <div className="mb-2 flex items-center gap-2">
+            <span className="rounded bg-amber-100 px-2 py-0.5 text-[10px] font-medium text-amber-700">电量异常</span>
+            <span className="text-sm font-medium text-slate-700">电量同比上涨预警阈值</span>
+          </div>
+          <div className="flex items-center gap-3">
+            <input type="number" step="0.1" min="1" className={`${inputCls} w-28`} value={draft.elecYoyRatio}
+              onChange={(e) => setDraft((p) => ({ ...p, elecYoyRatio: e.target.value }))} />
+            <span className="text-xs text-slate-500">倍（本月用电量 ÷ 去年同期 ≥ 该值预警；如 1.5 = 上涨 50%）</span>
+          </div>
+          <p className="mt-1.5 text-[11px] text-slate-400">预警页按「最近月份 vs 去年同月」对比各电表用电量。</p>
+        </div>
+
+        <div className="border-t" />
+
+        {/* 合同到期 */}
+        <div>
+          <div className="mb-2 flex items-center gap-2">
+            <span className="rounded bg-rose-100 px-2 py-0.5 text-[10px] font-medium text-rose-700">合同预警</span>
+            <span className="text-sm font-medium text-slate-700">合同到期提前提醒天数</span>
+          </div>
+          <div className="grid max-w-xl grid-cols-2 gap-4">
+            <div>
+              <label className="mb-1 block text-xs text-slate-500">场地合同（应付）提前天数</label>
+              <input type="number" min="0" className={`${inputCls} w-28`} value={draft.expireDaysVenue}
+                onChange={(e) => setDraft((p) => ({ ...p, expireDaysVenue: e.target.value }))} />
+            </div>
+            <div>
+              <label className="mb-1 block text-xs text-slate-500">品牌方合同（应收）提前天数</label>
+              <input type="number" min="0" className={`${inputCls} w-28`} value={draft.expireDaysBrand}
+                onChange={(e) => setDraft((p) => ({ ...p, expireDaysBrand: e.target.value }))} />
+            </div>
+          </div>
+          <p className="mt-1.5 text-[11px] text-slate-400">
+            剩余天数 ≤ 提前天数即提醒（含已到期）；同时会提醒「有逾期未收/付分期」的合同（分期结束日期已过仍未收/付）。
+          </p>
+        </div>
+      </div>
+      {!loaded && <div className="px-5 pb-5 text-[11px] text-slate-400">加载配置中…</div>}
+    </div>
+  );
+}
+
 export default function Directory() {
   const brands = useQuery({ queryKey: ["brands"], queryFn: listBrands });
   const entities = useQuery({ queryKey: ["entities"], queryFn: listEntities });
@@ -565,6 +648,7 @@ export default function Directory() {
         <TabsTrigger value="introducers">介绍人（{introducers.data?.length ?? 0}）</TabsTrigger>
         <TabsTrigger value="users">平台人员</TabsTrigger>
         <TabsTrigger value="third-party">第三方接口配置（{thirdPartyConfigs.data?.length ?? 0}）</TabsTrigger>
+        <TabsTrigger value="alerts">预警设置</TabsTrigger>
       </TabsList>
       <div className="mt-4">
         <TabsContent value="brands">
@@ -597,6 +681,9 @@ export default function Directory() {
         </TabsContent>
         <TabsContent value="third-party">
           <ThirdPartyConfigsTable />
+        </TabsContent>
+        <TabsContent value="alerts">
+          <AlertSettingsTable />
         </TabsContent>
       </div>
     </Tabs>

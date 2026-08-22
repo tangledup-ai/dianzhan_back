@@ -73,6 +73,16 @@ async function handleGetRequest(url: string, params?: any): Promise<any> {
     return mocks.mockMeters.find(m => m.id === id)
   }
 
+  // 预警（mock 备用：返回空结构，真实数据走后端）
+  if (path === '/api/alerts' || path === '/api/alerts/config') {
+    return {
+      config: { elecYoyRatio: 1.5, expireDaysVenue: 30, expireDaysBrand: 30 },
+      elecAnomalies: [],
+      contractPayments: [],
+      contractCollections: [],
+    }
+  }
+
   // 电费
   if (path === '/api/electricity') {
     return mocks.mockElectricity
@@ -455,6 +465,15 @@ async function handlePostRequest(url: string, data?: any): Promise<any> {
 async function handlePutRequest(url: string, data?: any): Promise<any> {
   // 移除开头的 /api
   const path = url.startsWith('/api') ? url : `/api${url}`
+
+  // 更新预警配置
+  if (path === '/api/alerts/config') {
+    return {
+      elecYoyRatio: data?.elecYoyRatio ?? 1.5,
+      expireDaysVenue: data?.expireDaysVenue ?? 30,
+      expireDaysBrand: data?.expireDaysBrand ?? 30,
+    }
+  }
 
   // 更新站点
   if (path.match(/^\/api\/stations\/\d+$/)) {

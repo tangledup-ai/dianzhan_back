@@ -15,3 +15,12 @@ export const updateMeter = (id: number, data: any) =>
 
 export const deleteMeter = (id: number) =>
   client.delete(`/meters/${id}`).then(r => r.data);
+
+// 电表读数导入（模板：电表编号/电表名称/场地方/品牌方/月份/实际用电量/本月读数/上月读数/备注）
+export const importMetersExcel = (file: File) => {
+  const formData = new FormData();
+  formData.append("file", file);
+  return client.post("/meters/import", formData, {
+    headers: { "Content-Type": "multipart/form-data" },
+  }).then(r => r.data);
+};

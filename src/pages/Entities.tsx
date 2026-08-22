@@ -439,7 +439,7 @@ export default function Entities() {
           <option value="电租">电租</option>
         </select>
         <div className="ml-auto flex gap-2">
-          <Button variant="outline" onClick={doExport}><Download className="mr-1.5 h-4 w-4" />导出表格</Button>
+          <Button className="bg-blue-600 hover:bg-blue-700" onClick={doExport}><Download className="mr-1.5 h-4 w-4" />导出表格</Button>
         </div>
       </div>
 

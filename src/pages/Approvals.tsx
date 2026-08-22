@@ -697,7 +697,7 @@ export default function Approvals() {
               {["审批中", "已通过", "已驳回"].map((s) => <option key={s} value={s}>{s}</option>)}
             </select>
             <input className={`${inputCls} w-32`} placeholder="申请人" value={filter.applicant} onChange={(e) => setFilter((p) => ({ ...p, applicant: e.target.value }))} />
-            <Button variant="outline" className="ml-auto" onClick={doExport}><Download className="mr-1.5 h-4 w-4" />导出 Excel</Button>
+            <Button className="ml-auto bg-blue-600 hover:bg-blue-700" onClick={doExport}><Download className="mr-1.5 h-4 w-4" />导出 Excel</Button>
           </div>
           <ReqTable rows={list.data ?? []} actionable={false} />
         </div>

@@ -12,6 +12,15 @@ export const updateContract = (id: number, data: any) =>
 export const deleteContract = (id: number) =>
   client.delete(`/contracts/${id}`).then(r => r.data);
 
+// 从 Excel 导入合同（参考"场地信息关联表"格式：sheet1 场地合同信息 + 品牌收款合同信息）
+export const importContractsExcel = (file: File) => {
+  const formData = new FormData();
+  formData.append("file", file);
+  return client.post("/contracts/import", formData, {
+    headers: { "Content-Type": "multipart/form-data" },
+  }).then(r => r.data);
+};
+
 // ─── 合同收付款分期 ───
 export const listPaymentSchedules = (contractId?: number) =>
   client.get("/contract-schedules/payment", { params: contractId ? { contractId } : {} }).then(r => r.data);

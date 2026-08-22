@@ -13,3 +13,7 @@ export const saveExpense = (data: any) =>
 
 export const deleteExpense = (id: number) =>
   client.delete(`/rent/expenses/${id}`).then(r => r.data);
+
+// 年度付款计划（Rent 页底部模块）
+export const getYearlyPaymentSchedule = (landlordId: number, year: string) =>
+  client.get("/rent/yearly-payment-schedule", { params: { landlordId, year } }).then(r => r.data);
