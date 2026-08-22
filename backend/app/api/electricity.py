@@ -619,12 +619,14 @@ async def monthly_ledger(period: str, dim: str = "landlord"):
                 cur.execute("""
                     SELECT m.meter_name AS station_name, m.meter_no, m.meter_name,
                            m.transformer_ratio,
+                           m.brand_id, b.name AS brand_name,
                            d.kwh, d.pay_unit_price, d.pay_amount, d.collect_unit_price,
                            d.collect_amount, d.collect_net,
                            e.pay_status, e.collect_status
                     FROM electricity_meter_details d
                     JOIN electricity_records e ON e.id = d.electricity_id
                     JOIN meters m ON d.meter_id = m.id
+                    LEFT JOIN brands b ON m.brand_id = b.id
                     WHERE e.period = %s AND m.brand_id = %s
                     ORDER BY m.meter_name, m.meter_no
                 """, (period, r["key"]))
@@ -650,12 +652,14 @@ async def monthly_ledger(period: str, dim: str = "landlord"):
                 cur.execute("""
                     SELECT m.meter_name, m.meter_no, m.meter_name AS station_name,
                            m.transformer_ratio,
+                           m.brand_id, b.name AS brand_name,
                            d.kwh, d.pay_unit_price, d.pay_amount, d.collect_unit_price,
                            d.collect_amount, d.collect_net,
                            e.pay_status, e.collect_status
                     FROM electricity_meter_details d
                     JOIN electricity_records e ON e.id = d.electricity_id
                     JOIN meters m ON d.meter_id = m.id
+                    LEFT JOIN brands b ON m.brand_id = b.id
                     WHERE e.period = %s AND m.landlord_id = %s
                     ORDER BY m.meter_name, m.meter_no
                 """, (period, r["key"]))
@@ -690,4 +694,149 @@ async def monthly_ledger(period: str, dim: str = "landlord"):
         "dim": dim,
         "rows": out_rows,
         "totals": {k: round(v, 2) for k, v in totals.items()},
+    }
+
+
+# ─── 电费收付明细导出（参考 Excel：每电表一行，按维度分组）────────
+
+@router.get("/export")
+async def export_ledger(request: Request, period: str, dim: str = "landlord"):
+    """电费收付明细台账导出（每电表一行）。
+
+    列结构对齐参考 Excel「八维通-电费收付明细台账.xlsx」：
+      序号/收款公司/站名/业主方/电表编号/互感器倍数/
+      上月抄表时间/起始度数/抄表时间/抄表度数/区间度数/   ← 付款侧
+      付款单价/付款金额/付款情况/
+      起始度数/抄表时间/抄表度数/区间度数/               ← 收款侧
+      收款单价/收款金额/不含税收入/到账情况/
+      利润/运营费用/运营费用后利润/公司占股/公司净利润/备注
+
+    返回 rows（每电表一行，含 group 分组键）+ 分组后的合计，供前端生成 Excel。
+    """
+    from ..infra.database import get_connection, get_dict_cursor
+    period = str(period).replace("-", "")
+    allowed = scope_landlord_ids(request)
+
+    conn = get_connection()
+    cur = get_dict_cursor(conn)
+    try:
+        # 每电表一行：台账明细 + 电表 + 抄表读数(meter_monthly) + 场地/品牌/实体 + 运营费用
+        cur.execute("""
+            SELECT
+                d.id AS detail_id,
+                m.id AS meter_id, m.meter_no, m.meter_name, m.transformer_ratio,
+                l.id AS landlord_id, l.name AS landlord_name, l.company_share,
+                b.id AS brand_id, b.name AS brand_name,
+                ent.name AS entity_name,
+                d.kwh, d.pay_unit_price, d.pay_amount,
+                d.collect_unit_price, d.collect_amount, d.collect_net,
+                e.pay_status, e.collect_status, e.remark,
+                mm.prev_reading_date, mm.prev_reading,
+                mm.curr_reading_date, mm.curr_reading,
+                op.amount AS op_expense
+            FROM electricity_meter_details d
+            JOIN electricity_records e ON e.id = d.electricity_id
+            JOIN meters m ON d.meter_id = m.id
+            LEFT JOIN landlords l ON m.landlord_id = l.id
+            LEFT JOIN brands b ON m.brand_id = b.id
+            LEFT JOIN entities ent ON m.entity_id = ent.id
+            LEFT JOIN meter_monthly mm
+                   ON mm.address = m.meter_no AND mm.month_period = %s
+            LEFT JOIN operating_expenses op
+                   ON op.landlord_id = m.landlord_id AND op.period = %s
+            WHERE e.period = %s
+            ORDER BY l.name, b.name, m.meter_name, m.meter_no
+        """, (period, period, period))
+        rows = cur.fetchall()
+    finally:
+        cur.close()
+        conn.close()
+
+    # 权限过滤（股东只看关联场地）
+    if allowed is not None:
+        rows = [r for r in rows if r.get("landlord_id") in allowed]
+
+    out = []
+    for r in rows:
+        pay = float(r.get("pay_amount") or 0)
+        collect = float(r.get("collect_amount") or 0)
+        net = float(r.get("collect_net") or 0)
+        profit = round(net - pay, 2)
+        op_expense = float(r.get("op_expense") or 0)
+        profit_after_op = round(profit - op_expense, 2)
+        share = r.get("company_share")
+        company_net = round(profit_after_op * float(share), 2) if share is not None else None
+
+        # 分组键：dim=brand 按品牌，否则按场地
+        if dim == "brand":
+            group = r.get("brand_name") or "未指定品牌"
+            group_key = f"brand-{r.get('brand_id') or 0}"
+            collect_company = r.get("entity_name") or group  # 收款公司：实体优先，兜底品牌
+        else:
+            group = r.get("landlord_name") or "未指定场地"
+            group_key = f"landlord-{r.get('landlord_id') or 0}"
+            collect_company = r.get("entity_name") or group
+
+        out.append({
+            "groupKey": group_key,
+            "group": group,
+            "collectCompany": collect_company,
+            "stationName": r.get("meter_name") or "",
+            "landlordName": r.get("landlord_name") or "",
+            "meterNo": r.get("meter_no") or "",
+            "transformerRatio": float(r.get("transformer_ratio") or 1),
+            "prevReadingDate": str(r.get("prev_reading_date") or "")[:10],
+            "startReading": float(r.get("prev_reading") or 0),
+            "readingDate": str(r.get("curr_reading_date") or "")[:10],
+            "endReading": float(r.get("curr_reading") or 0),
+            "kwh": round(float(r.get("kwh") or 0), 2),
+            "payUnitPrice": float(r.get("pay_unit_price") or 0),
+            "payAmount": round(pay, 2),
+            "payStatus": r.get("pay_status") or "",
+            "collectStartReading": float(r.get("prev_reading") or 0),
+            "collectReadingDate": str(r.get("curr_reading_date") or "")[:10],
+            "collectEndReading": float(r.get("curr_reading") or 0),
+            "collectKwh": round(float(r.get("kwh") or 0), 2),
+            "collectUnitPrice": float(r.get("collect_unit_price") or 0),
+            "collectAmount": round(collect, 2),
+            "collectNet": round(net, 2),
+            "collectStatus": r.get("collect_status") or "",
+            "profit": profit,
+            "opExpense": round(op_expense, 2),
+            "profitAfterOp": profit_after_op,
+            "companyShare": float(share) if share is not None else None,
+            "companyNetProfit": company_net,
+            "remark": r.get("remark") or "",
+        })
+
+    # 分组合计 + 总计
+    group_totals = {}
+    for row in out:
+        key = row["groupKey"]
+        t = group_totals.setdefault(key, {"group": row["group"], "kwh": 0.0, "payAmount": 0.0,
+                                           "collectAmount": 0.0, "collectNet": 0.0, "profit": 0.0,
+                                           "opExpense": 0.0, "profitAfterOp": 0.0, "companyNetProfit": 0.0})
+        for k in ("kwh", "payAmount", "collectAmount", "collectNet", "profit", "opExpense", "profitAfterOp"):
+            t[k] += row[k]
+        if row.get("companyNetProfit") is not None:
+            t["companyNetProfit"] += row["companyNetProfit"]
+    for t in group_totals.values():
+        for k in ("kwh", "payAmount", "collectAmount", "collectNet", "profit", "opExpense", "profitAfterOp", "companyNetProfit"):
+            t[k] = round(t[k], 2)
+
+    totals = {"kwh": 0.0, "payAmount": 0.0, "collectAmount": 0.0, "collectNet": 0.0,
+              "profit": 0.0, "opExpense": 0.0, "profitAfterOp": 0.0, "companyNetProfit": 0.0}
+    for row in out:
+        for k in ("kwh", "payAmount", "collectAmount", "collectNet", "profit", "opExpense", "profitAfterOp"):
+            totals[k] += row[k]
+        if row.get("companyNetProfit") is not None:
+            totals["companyNetProfit"] += row["companyNetProfit"]
+    totals = {k: round(v, 2) for k, v in totals.items()}
+
+    return {
+        "period": period,
+        "dim": dim,
+        "rows": out,
+        "groupTotals": list(group_totals.values()),
+        "totals": totals,
     }

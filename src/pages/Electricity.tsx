@@ -1,11 +1,13 @@
 import { Fragment, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { getElectricityMonthlyLedger } from "@/api/electricity";
+import { getElectricityMonthlyLedger, exportElectricityLedger } from "@/api/electricity";
 import { Button } from "@/components/ui/button";
 import { inputCls } from "@/components/fields";
 import { fmtMoney, fmtNum } from "@/lib/format";
 import { toCompact, toDisplay } from "@/lib/period";
-import { Building2, Tag, ChevronDown, ChevronRight } from "lucide-react";
+import { Building2, Tag, ChevronDown, ChevronRight, Download } from "lucide-react";
+import * as XLSX from "xlsx";
+import { toast } from "sonner";
 
 // 电费月台账（v2 重设计）：只显示电费经营信息
 // 参考 Rent 页风格：月份区间 + 按场地方/品牌方 + 区间总览 + 按月展开明细
@@ -29,6 +31,125 @@ function shift(period: string, offset: number): string {
   const m = parseInt(period.slice(4, 6), 10);
   const dt = new Date(y, m - 1 + offset, 1);
   return `${dt.getFullYear()}${String(dt.getMonth() + 1).padStart(2, "0")}`;
+}
+
+// ─── 电费收付明细台账导出（参考 Excel：28 列，按维度分组合并，冻结前3列+前2行）───
+const LEDGER_HEADERS = [
+  "序号", "收款公司", "站名", "业主方", "电表编号", "互感器倍数",
+  "上月抄表时间", "起始度数", "抄表时间", "抄表度数", "区间度数",
+  "付款单价", "付款金额", "付款情况",
+  "起始度数", "抄表时间", "抄表度数", "区间度数",
+  "收款单价", "收款金额", "不含税收入", "到账情况",
+  "利润", "运营费用", "运营费用后利润", "公司占股", "公司净利润", "备注",
+];
+// 参考 Excel 列宽
+const LEDGER_COLS = [5, 11, 16, 11.9, 14.2, 5.2, 7.4, 7, 9.1, 10.9, 11.7, 10, 11, 9, 11, 10, 9, 10, 13, 9, 11, 12, 10, 9, 11, 10, 11, 12];
+
+function toRow(r: any, seq: number): any[] {
+  return [
+    seq,
+    r.collectCompany ?? "",
+    r.stationName ?? "",
+    r.landlordName ?? "",
+    r.meterNo ?? "",
+    r.transformerRatio ?? 1,
+    r.prevReadingDate ?? "",
+    r.startReading ?? 0,
+    r.readingDate ?? "",
+    r.endReading ?? 0,
+    r.kwh ?? 0,
+    r.payUnitPrice ?? 0,
+    r.payAmount ?? 0,
+    r.payStatus ?? "",
+    r.collectStartReading ?? 0,
+    r.collectReadingDate ?? "",
+    r.collectEndReading ?? 0,
+    r.collectKwh ?? 0,
+    r.collectUnitPrice ?? 0,
+    r.collectAmount ?? 0,
+    r.collectNet ?? 0,
+    r.collectStatus ?? "",
+    r.profit ?? 0,
+    r.opExpense ?? 0,
+    r.profitAfterOp ?? 0,
+    r.companyShare ?? "",
+    r.companyNetProfit ?? "",
+    r.remark ?? "",
+  ];
+}
+
+function buildLedgerSheet(data: any): XLSX.WorkSheet {
+  const period = data.period ?? "";
+  const rows = data.rows ?? [];
+  // 按 groupKey 分组，保持顺序
+  const groups: { key: string; name: string; rows: any[] }[] = [];
+  const byKey = new Map<string, { key: string; name: string; rows: any[] }>();
+  for (const r of rows) {
+    let g = byKey.get(r.groupKey);
+    if (!g) {
+      g = { key: r.groupKey, name: r.group || r.collectCompany || "", rows: [] };
+      byKey.set(r.groupKey, g);
+      groups.push(g);
+    }
+    g.rows.push(r);
+  }
+
+  // 组装 aoa：标题 + 表头 + 数据（组内行 + 组合计）+ 总计
+  const aoa: any[][] = [
+    [`电费收付明细台账（${toDisplay(period)}）`],
+    LEDGER_HEADERS,
+  ];
+  const merges: XLSX.Range[] = [{ s: { r: 0, c: 0 }, e: { r: 0, c: LEDGER_HEADERS.length - 1 } }];
+  let seq = 0;
+
+  const groupTotals = data.groupTotals ?? [];
+  const totals = data.totals ?? {};
+
+  for (const g of groups) {
+    const startRow = aoa.length;
+    for (const r of g.rows) {
+      seq += 1;
+      aoa.push(toRow(r, seq));
+    }
+    const endRow = aoa.length - 1;
+    // 组内 B 列（收款公司）合并
+    if (endRow >= startRow) {
+      merges.push({ s: { r: startRow, c: 1 }, e: { r: endRow, c: 1 } });
+    }
+    // 组合计行（A:D 合并 + 金额合计）
+    const gt = groupTotals.find((t: any) => t.group === g.name) ?? {};
+    const sumRow = [
+      "合计", "", "", "",
+      "", "", "", "", "", "",
+      gt.kwh ?? 0,
+      "", gt.payAmount ?? 0, "",
+      "", "", "", "",
+      "", gt.collectAmount ?? 0, gt.collectNet ?? 0, "",
+      gt.profit ?? 0, gt.opExpense ?? 0, gt.profitAfterOp ?? 0, "", gt.companyNetProfit ?? "", "",
+    ];
+    aoa.push(sumRow);
+    merges.push({ s: { r: aoa.length - 1, c: 0 }, e: { r: aoa.length - 1, c: 3 } });
+  }
+
+  // 总计行
+  const totalRow = [
+    "总计", "", "", "",
+    "", "", "", "", "", "",
+    totals.kwh ?? 0,
+    "", totals.payAmount ?? 0, "",
+    "", "", "", "",
+    "", totals.collectAmount ?? 0, totals.collectNet ?? 0, "",
+    totals.profit ?? 0, totals.opExpense ?? 0, totals.profitAfterOp ?? 0, "", totals.companyNetProfit ?? "", "",
+  ];
+  aoa.push(totalRow);
+  merges.push({ s: { r: aoa.length - 1, c: 0 }, e: { r: aoa.length - 1, c: 3 } });
+
+  const ws = XLSX.utils.aoa_to_sheet(aoa);
+  ws["!merges"] = merges;
+  ws["!cols"] = LEDGER_COLS.map((w) => ({ wch: w }));
+  // 冻结前 3 列 + 前 2 行（参考 Excel：D3）
+  ws["!views"] = [{ state: "frozen", xSplit: 3, ySplit: 2, topLeftCell: "D3" }];
+  return ws;
 }
 
 export default function Electricity() {
@@ -87,6 +208,32 @@ export default function Electricity() {
     setStartPeriod(shift(CUR_MONTH, -(n - 1)));
   };
 
+  const [exporting, setExporting] = useState(false);
+
+  const doExport = async () => {
+    if (monthRange.length === 0) { toast.error("请选择有效的月份区间"); return; }
+    setExporting(true);
+    try {
+      const wb = XLSX.utils.book_new();
+      let sheetCount = 0;
+      for (const p of monthRange) {
+        const data = await exportElectricityLedger(p, dim);
+        if (!data || !data.rows || data.rows.length === 0) continue;
+        XLSX.utils.book_append_sheet(wb, buildLedgerSheet(data), toDisplay(p).replace("-", "").slice(0, 31) || "台账");
+        sheetCount++;
+      }
+      if (sheetCount === 0) { toast.error("所选区间没有可导出的电费数据"); return; }
+      const name = `电费收付明细台账_${toDisplay(startPeriod)}-${toDisplay(endPeriod)}`;
+      XLSX.writeFile(wb, `${name}.xlsx`);
+      toast.success(`已导出 ${sheetCount} 个月台账`);
+    } catch (e: any) {
+      console.error(e);
+      toast.error(e?.message || "导出失败，请稍后重试");
+    } finally {
+      setExporting(false);
+    }
+  };
+
   return (
     <div className="space-y-4">
       {/* ── 顶部：月份区间 + 维度切换 ── */}
@@ -119,6 +266,9 @@ export default function Electricity() {
           </Button>
         </div>
         <span className="text-xs text-slate-400">{toDisplay(startPeriod)} ~ {toDisplay(endPeriod)} · 电费经营信息</span>
+        <Button size="sm" className="ml-auto bg-blue-600 hover:bg-blue-700" disabled={exporting} onClick={doExport}>
+          <Download className="mr-1 h-3.5 w-3.5" />{exporting ? "导出中…" : "导出 Excel"}
+        </Button>
       </div>
 
       {/* ── 区间总览 ── */}
@@ -175,11 +325,13 @@ export default function Electricity() {
                       <td colSpan={8} className="px-6 py-3">
                         <div className="space-y-1">
                           <div className="text-[11px] font-medium text-slate-400">
-                            {toDisplay(m.period)} · 按{dim === "landlord" ? "场地方" : "品牌方"}明细（点击展开站点/电表）
+                            {toDisplay(m.period)} · 按{dim === "landlord" ? "场地方" : "品牌方"}明细（点击展开电表）
                           </div>
                           {(m.rows ?? []).map((g: any) => {
                             const rKey = `r-${m.period}-${dim}-${g.key}`;
                             const rOpen = expanded.has(rKey);
+                            const hasTransformerRatio = (g.details ?? []).some((d: any) => d.transformerRatio && d.transformerRatio !== 1);
+                            const hasBrandDimension = (g.details ?? []).some((d: any) => d.brandName);
                             return (
                               <Fragment key={rKey}>
                                 <div className="flex cursor-pointer items-center gap-x-4 rounded-md border bg-white px-3 py-1.5 text-xs hover:bg-slate-50" onClick={() => toggle(rKey)}>
@@ -196,8 +348,9 @@ export default function Electricity() {
                                     <table className="w-full min-w-[920px] text-[11px]">
                                       <thead>
                                         <tr className="border-b bg-slate-100 text-left text-[10px] text-slate-500">
-                                          <th className="px-2 py-1.5" rowSpan={2}>{dim === "landlord" ? "站点" : "电表"}</th>
-                                          <th className="px-2 py-1.5" rowSpan={2}>互感器倍数</th>
+                                          <th className="px-2 py-1.5" rowSpan={2}>{dim === "landlord" ? "电表" : "电表"}</th>
+                                          {hasBrandDimension && <th className="px-2 py-1.5" rowSpan={2}>品牌方</th>}
+                                          {hasTransformerRatio && <th className="px-2 py-1.5" rowSpan={2}>互感器倍数</th>}
                                           <th className="px-2 py-1.5" rowSpan={2}>度数(kWh)</th>
                                           <th className="border-x bg-rose-50/70 px-2 py-1.5 text-center" colSpan={3}>付款信息</th>
                                           <th className="border-x bg-emerald-50/70 px-2 py-1.5 text-center" colSpan={4}>收款信息</th>
@@ -217,11 +370,12 @@ export default function Electricity() {
                                         {(g.details ?? []).map((d: any, i: number) => (
                                           <tr key={i} className="border-b last:border-0 hover:bg-slate-50/50">
                                             <td className="px-2 py-1.5">
-                                              <div className="font-medium text-slate-700">{d.stationName ?? "—"}</div>
+                                              <div className="font-medium text-slate-700">{d.meterName ?? d.stationName ?? "—"}</div>
                                               <div className="font-mono text-[10px] text-slate-400">{d.meterNo}{d.meterName ? ` · ${d.meterName}` : ""}</div>
                                             </td>
-                                            <td className="px-2 py-1.5 text-right tabular-nums">{fmtNum(d.transformerRatio)}</td>
-                                            <td className="px-2 py-1.5 text-right tabular-nums">{fmtNum(d.kwh ?? d.payKwh)}</td>
+                                            {hasBrandDimension && <td className="px-2 py-1.5 tabular-nums">{d.brandName ?? "—"}</td>}
+                                            {hasTransformerRatio && <td className="px-2 py-1.5 tabular-nums">{fmtNum(d.transformerRatio)}</td>}
+                                            <td className="px-2 py-1.5 tabular-nums">{fmtNum(d.kwh ?? d.payKwh)}</td>
                                             <td className="border-x px-2 py-1.5 text-right tabular-nums">{d.payUnitPrice != null ? fmtNum(d.payUnitPrice) : "—"}</td>
                                             <td className="px-2 py-1.5 text-right tabular-nums text-rose-600">{fmtMoney(d.payAmount)}</td>
                                             <td className="px-2 py-1.5">{d.payStatus ?? "—"}</td>

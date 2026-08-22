@@ -19,8 +19,8 @@ export const saveIntroducerConfig = (data: any) =>
 export const deleteIntroducerConfig = (id: number) =>
   client.delete(`/dividends/configs/introducer/${id}`).then(r => r.data);
 
-// 分红计算（v3：按场地 landlordId + 可选品牌 brandId）
-export const calculateDividend = (data: { landlordId: number; brandId?: number | null; period: string }) =>
+// 分红计算（v3：按场地 landlordId + 可选品牌 brandId；estimate=true 返回本月预估 + 周期信息）
+export const calculateDividend = (data: { landlordId: number; brandId?: number | null; period: string; estimate?: boolean }) =>
   client.post("/dividends/calculate", data).then(r => r.data);
 
 // 分红记录

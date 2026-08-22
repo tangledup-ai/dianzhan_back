@@ -111,29 +111,30 @@ export default function Contracts() {
   }, [rows]);
 
   const doExport = () => {
-    // 只导出品牌方合同（品牌方付给公司），按品牌分组每个品牌一个 sheet
-    const brandContracts = rows.filter((c: any) => c.contractType === "品牌方合同");
-    if (brandContracts.length === 0) { toast.error("暂无品牌方合同可导出"); return; }
+    // 导出全部合同（按当前筛选），样式参考"共享合同监控表"：按合同类型分 sheet
+    if (rows.length === 0) { toast.error("暂无合同可导出"); return; }
 
-    // 按品牌分组
-    const groups = new Map<string, any[]>();
-    for (const c of brandContracts) {
-      const key = c.brandName || "未指定品牌";
-      if (!groups.has(key)) groups.set(key, []);
-      groups.get(key)!.push(c);
-    }
+    const headers = ["序号", "付款主体", "站点名称", "站点地址", "合作方", "合同类型", "开始日期", "结束日期", "剩余天数", "状态", "备注"];
+    const addrOf = new Map((landlords.data ?? []).map((l: any) => [l.id, l.address]));
+    const groups: { name: string; title: string; list: any[] }[] = [
+      { name: "场地合同", title: "场地合同监控表", list: rows.filter((c: any) => c.contractType === "场地合同") },
+      { name: "品牌方合同", title: "品牌方合同监控表", list: rows.filter((c: any) => c.contractType === "品牌方合同") },
+    ];
 
-    const headers = ["序号", "付款主体", "场地方", "开始日期", "结束日期", "剩余天数", "状态", "备注"];
     const wb = XLSX.utils.book_new();
-    for (const [brand, list] of groups) {
-      const aoa: unknown[][] = [[`${brand}业务合同监控表`], headers];
-      list.forEach((c: any, i: number) => {
+    for (const g of groups) {
+      if (g.list.length === 0) continue;
+      const aoa: unknown[][] = [[g.title], headers];
+      g.list.forEach((c: any, i: number) => {
         aoa.push([
           i + 1,
-          c.brandName || "",
+          c.payEntity ?? "",
           c.landlordName || "",
+          c.address || addrOf.get(c.landlordId) || "",
+          c.contractType === "品牌方合同" ? (c.brandName || "") : (c.partner || c.landlordName || ""),
+          c.contractType,
           fmtDate(c.startDate, ""),
-          fmtDate(c.endDate, ""),
+          fmtDate(c.earlyEndDate || c.endDate, ""),
           c.days_left ?? "",
           c.status,
           c.remark ?? "",
@@ -141,12 +142,10 @@ export default function Contracts() {
       });
       const ws = XLSX.utils.aoa_to_sheet(aoa);
       ws["!merges"] = [{ s: { r: 0, c: 0 }, e: { r: 0, c: headers.length - 1 } }];
-      // 数据从第3行起（0=标题, 1=表头, 2+=数据）
-      const dataRows = aoa.slice(2);
       ws["!cols"] = headers.map((h, ci) => ({
-        wch: Math.max(h.length * 2, ...dataRows.map((r) => String(r[ci] ?? "").length * 1.9), 8),
+        wch: Math.max(h.length * 2, ...aoa.slice(2).map((r) => String(r[ci] ?? "").length * 1.9), 8),
       }));
-      XLSX.utils.book_append_sheet(wb, ws, brand.slice(0, 31));
+      XLSX.utils.book_append_sheet(wb, ws, g.name.slice(0, 31));
     }
     XLSX.writeFile(wb, `合同监控表_${new Date().toISOString().slice(0, 10)}.xlsx`);
     toast.success("已导出 Excel");

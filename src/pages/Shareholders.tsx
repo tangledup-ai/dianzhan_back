@@ -1,20 +1,24 @@
-import { useState, useMemo, useCallback } from "react";
-import { useQuery, useMutation, useQueryClient, useQueries } from "@tanstack/react-query";
-import { listShareholders, listIntroducers, listPlatformUsers } from "@/api/directory";
+import { useState, useMemo, useEffect, useCallback, useRef } from "react";
+import { useQuery, useQueries, useMutation, useQueryClient } from "@tanstack/react-query";
+import { listShareholders, listIntroducers, createShareholder } from "@/api/directory";
 import { getStationBoard } from "@/api/overview";
-import { shareholderSummary, listDividends, listShareholderConfigs, listIntroducerConfigs, deleteShareholderConfig, deleteIntroducerConfig, calculateDividend, createDividend } from "@/api/dividends";
-import { submitDividendApproval } from "@/api/approvals";
+import { listDividends, listShareholderConfigs, listIntroducerConfigs, deleteShareholderConfig, deleteIntroducerConfig, calculateDividend, createDividend, shareholderSummary, saveShareholderConfig, saveIntroducerConfig, submitDividend } from "@/api/dividends";
 import { listExpenses, saveExpense, deleteExpense } from "@/api/rent";
-import { listContracts } from "@/api/contracts";
-import { listMeters } from "@/api/meters";
-import { getMonthlyKwh } from "@/api/meterEnergy";
+import { exportXlsxWithTitle, exportXlsxWithTitles } from "@/lib/export";
 import { MonthPicker } from "@/components/MonthPicker";
-import { fmtMoney, fmtNum } from "@/lib/format";
+import { fmtMoney } from "@/lib/format";
 import { toCompact, toDisplay } from "@/lib/period";
 import { inputCls } from "@/components/fields";
-import { Users, MapPin, X, Trash2, UserPlus, Settings, DollarSign, ChevronDown, ChevronRight, Download } from "lucide-react";
+import { Users, MapPin, X, Trash2, UserPlus, Wallet, Settings, Pencil } from "lucide-react";
 import { toast } from "sonner";
-import * as XLSX from "xlsx";
+
+// ════════════════════════════════════════════════════════════════
+// 分红管理（v3 重设计）：
+//   - 配置好分红比例/分红人（股东/介绍人）后，页面自动计算预估分红
+//   - 顶部月份切换：任意月份的分红预估
+//   - 左侧列表：按场地方 / 按股东 查看
+//   - 分红周期：月/季度/半年/年；未到结算月金额累加（周期内待结算），到结算月才生成记录
+// ════════════════════════════════════════════════════════════════
 
 // ─── 新增股东弹窗 ───
 function AddShareholderDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
@@ -26,13 +30,7 @@ function AddShareholderDialog({ open, onClose }: { open: boolean; onClose: () =>
   const mutation = useMutation({
     mutationFn: async () => {
       if (!name.trim()) throw new Error("股东名称不能为空");
-      const res = await fetch("/api/directory/shareholders", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: name.trim(), phone: phone.trim() || undefined, remark: remark.trim() || undefined }),
-      });
-      if (!res.ok) throw new Error("创建失败");
-      return res.json();
+      return createShareholder({ name: name.trim(), phone: phone.trim() || undefined, remark: remark.trim() || undefined });
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["shareholders"] });
@@ -40,7 +38,7 @@ function AddShareholderDialog({ open, onClose }: { open: boolean; onClose: () =>
       onClose();
       setName(""); setPhone(""); setRemark("");
     },
-    onError: (e: any) => toast.error(e.message || "添加失败"),
+    onError: (e: any) => toast.error(e.response?.data?.detail || e.message || "添加失败"),
   });
 
   if (!open) return null;
@@ -77,8 +75,8 @@ function AddShareholderDialog({ open, onClose }: { open: boolean; onClose: () =>
   );
 }
 
-// ─── 配置分红弹窗（v3：按场地 landlordId）───
-function ConfigDividendDialog({ open, onClose, type, landlordId, brands }: { open: boolean; onClose: () => void; type: "shareholder" | "introducer"; landlordId?: number; brands?: any[] }) {
+// ─── 配置分红弹窗（股东/介绍人；品牌范围 + 模式 + 周期 + 生效期；支持编辑已有配置）───
+function ConfigDividendDialog({ open, onClose, type, landlordId, brands, editingConfig }: { open: boolean; onClose: () => void; type: "shareholder" | "introducer"; landlordId?: number; brands?: any[]; editingConfig?: any | null }) {
   const qc = useQueryClient();
   const [targetId, setTargetId] = useState<number | null>(null);
   const [brandId, setBrandId] = useState<number | "">("");
@@ -89,6 +87,25 @@ function ConfigDividendDialog({ open, onClose, type, landlordId, brands }: { ope
   const [dividendPeriod, setDividendPeriod] = useState("月");
   const [startDate, setStartDate] = useState("");
   const [endDate, setEndDate] = useState("");
+
+  // 打开编辑时预填表单
+  useEffect(() => {
+    if (open && editingConfig) {
+      setTargetId(editingConfig.shareholderId ?? editingConfig.introducerId ?? null);
+      setBrandId(editingConfig.brandId ?? "");
+      setMode(editingConfig.mode || "利润分红");
+      setRatio(editingConfig.mode !== "固定金额" ? String(Math.round((editingConfig.ratio || 0) * 10000) / 100) : "");
+      setFixedAmount(editingConfig.mode === "固定金额" ? String(editingConfig.fixedAmount ?? "") : "");
+      setCountAsCost(!!editingConfig.countAsCost);
+      setDividendPeriod(editingConfig.settlementPeriod || "月");
+      setStartDate(editingConfig.startDate ? String(editingConfig.startDate).slice(0, 10) : "");
+      setEndDate(editingConfig.endDate ? String(editingConfig.endDate).slice(0, 10) : "");
+    } else if (open) {
+      setTargetId(null); setBrandId(""); setMode("利润分红"); setRatio("");
+      setFixedAmount(""); setCountAsCost(false); setDividendPeriod("月");
+      setStartDate(""); setEndDate("");
+    }
+  }, [open, editingConfig]);
 
   const { data: shareholders } = useQuery({ queryKey: ["shareholders"], queryFn: () => listShareholders(), enabled: type === "shareholder" });
   const { data: introducers } = useQuery({ queryKey: ["introducers"], queryFn: () => listIntroducers(), enabled: type === "introducer" });
@@ -101,23 +118,22 @@ function ConfigDividendDialog({ open, onClose, type, landlordId, brands }: { ope
       if (!targetId) throw new Error(type === "shareholder" ? "请选择股东" : "请选择介绍人");
       if (mode !== "固定金额" && !ratio) throw new Error("请输入比例");
       if (mode === "固定金额" && !fixedAmount) throw new Error("请输入固定金额");
-      const endpoint = type === "shareholder" ? "/api/dividends/configs/shareholder" : "/api/dividends/configs/introducer";
       const body: any = type === "shareholder"
         ? { landlordId, shareholderId: targetId, brandId: brandId || null, mode, ratio: mode !== "固定金额" ? Number(ratio) / 100 : null, fixedAmount: mode === "固定金额" ? Number(fixedAmount) : null, settlementPeriod: dividendPeriod, startDate: startDate || null, endDate: endDate || null }
         : { landlordId, introducerId: targetId, brandId: brandId || null, mode, ratio: mode !== "固定金额" ? Number(ratio) / 100 : null, fixedAmount: mode === "固定金额" ? Number(fixedAmount) : null, countAsCost, settlementPeriod: dividendPeriod, startDate: startDate || null, endDate: endDate || null };
-      const res = await fetch(endpoint, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-      if (!res.ok) throw new Error("配置失败");
-      return res.json();
+      if (editingConfig?.id) body.configId = editingConfig.id;
+      return type === "shareholder" ? saveShareholderConfig(body) : saveIntroducerConfig(body);
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["shareholderConfigs"] });
       qc.invalidateQueries({ queryKey: ["introducerConfigs"] });
+      qc.invalidateQueries({ queryKey: ["allShareholderConfigs"] });
       qc.invalidateQueries({ queryKey: ["dividendPreview"] });
       qc.invalidateQueries({ queryKey: ["stationBoard"] });
-      toast.success("配置成功");
+      toast.success(editingConfig ? "配置已更新" : "配置成功");
       onClose();
     },
-    onError: (e: any) => toast.error(e.message || "配置失败"),
+    onError: (e: any) => toast.error(e.response?.data?.detail || e.message || "配置失败"),
   });
 
   if (!open) return null;
@@ -126,7 +142,7 @@ function ConfigDividendDialog({ open, onClose, type, landlordId, brands }: { ope
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30">
       <div className="w-96 rounded-xl bg-white p-5 shadow-xl">
         <div className="flex items-center justify-between mb-4">
-          <h3 className="text-sm font-semibold text-slate-800">{type === "shareholder" ? "配置股东分红" : "配置商务分红"}</h3>
+          <h3 className="text-sm font-semibold text-slate-800">{editingConfig ? `编辑${type === "shareholder" ? "股东分红" : "商务分红"}` : `配置${type === "shareholder" ? "股东分红" : "商务分红"}`}</h3>
           <button onClick={onClose} className="text-slate-400 hover:text-slate-600"><X className="h-4 w-4" /></button>
         </div>
         <div className="space-y-3">
@@ -209,7 +225,7 @@ function ConfigDividendDialog({ open, onClose, type, landlordId, brands }: { ope
         <div className="mt-4 flex justify-end gap-2">
           <button onClick={onClose} className="rounded-lg px-3 py-1.5 text-xs text-slate-500 hover:bg-slate-100">取消</button>
           <button onClick={() => mutation.mutate()} disabled={mutation.isPending} className="rounded-lg bg-emerald-600 px-4 py-1.5 text-xs text-white hover:bg-emerald-700 disabled:opacity-50">
-            {mutation.isPending ? "配置中…" : "确认配置"}
+            {mutation.isPending ? "保存中…" : editingConfig ? "保存修改" : "确认配置"}
           </button>
         </div>
       </div>
@@ -217,37 +233,22 @@ function ConfigDividendDialog({ open, onClose, type, landlordId, brands }: { ope
   );
 }
 
-// ─── 新增分红月结弹窗（v3：按场地 landlordId）───
-function AddDividendDialog({ open, onClose, landlordId }: { open: boolean; onClose: () => void; landlordId?: number }) {
+// ─── 新增分红月结弹窗（到结算期才生成记录）───
+function AddDividendDialog({ open, onClose, landlordId, defaultPeriod, estimatePreview }: { open: boolean; onClose: () => void; landlordId?: number; defaultPeriod?: string; estimatePreview?: any }) {
   const qc = useQueryClient();
-  const [period, setPeriod] = useState(() => {
-    const now = new Date();
-    return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
-  });
+  const [period, setPeriod] = useState(defaultPeriod || new Date().toISOString().slice(0, 7));
   const [type, setType] = useState("股东分红");
-  const [preview, setPreview] = useState<any>(null);
-
-  const handlePreview = async () => {
-    if (!landlordId || !period) { toast.error("请先选择场地方和月份"); return; }
-    try {
-      const result = await calculateDividend({ landlordId, period });
-      setPreview(result);
-    } catch (e: any) { toast.error(e.message || "计算失败"); }
-  };
 
   const mutation = useMutation({
     mutationFn: async () => {
       if (!landlordId || !period) throw new Error("请先选择场地方和月份");
-      return createDividend({ landlordId, period, type });
+      return createDividend({ landlordId, period: toCompact(period), type });
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["dividends"] });
-      qc.invalidateQueries({ queryKey: ["stationDividends"] });
       qc.invalidateQueries({ queryKey: ["dividendPreview"] });
-      qc.invalidateQueries({ queryKey: ["shareholderSummary"] });
       toast.success("分红月结创建成功");
       onClose();
-      setPreview(null);
     },
     onError: (e: any) => toast.error(e.message || "创建失败"),
   });
@@ -264,7 +265,7 @@ function AddDividendDialog({ open, onClose, landlordId }: { open: boolean; onClo
         <div className="space-y-3">
           <div>
             <label className="mb-1 block text-xs text-slate-500">选择月份 <span className="text-rose-500">*</span></label>
-            <MonthPicker value={period} onChange={setPeriod} />
+            <input type="month" className={inputCls} value={period} onChange={e => e.target.value && setPeriod(e.target.value)} />
           </div>
           <div>
             <label className="mb-1 block text-xs text-slate-500">分红类型</label>
@@ -273,41 +274,17 @@ function AddDividendDialog({ open, onClose, landlordId }: { open: boolean; onClo
               <option value="商务分红">商务分红</option>
             </select>
           </div>
-          <button onClick={handlePreview} className="w-full rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-700 hover:bg-emerald-100">
-            预览分红计算
-          </button>
-          {preview && (
-            <div className="rounded-lg border bg-slate-50 p-3 space-y-2 text-xs">
-              <div className="font-semibold text-slate-700">分红预览</div>
-              <div className="grid grid-cols-2 gap-2">
-                <div><span className="text-slate-400">总收入：</span><span className="font-medium">{fmtMoney(preview.income?.totalIncome)}</span></div>
-                <div><span className="text-slate-400">总成本：</span><span className="font-medium">{fmtMoney(preview.cost?.totalCost)}</span></div>
-                <div><span className="text-slate-400">利润：</span><span className={`font-medium ${preview.profit >= 0 ? "text-emerald-600" : "text-rose-600"}`}>{fmtMoney(preview.profit)}</span></div>
-              </div>
-              {preview.shareholderDividends?.length > 0 && (
-                <div>
-                  <div className="font-semibold text-slate-600 mt-2">股东分红明细：</div>
-                  {preview.shareholderDividends.map((d: any, i: number) => (
-                    <div key={i} className="flex justify-between py-0.5">
-                      <span>{d.shareholderName}{d.brandName ? <span className="ml-1 rounded bg-amber-50 px-1 py-0.5 text-[9px] text-amber-600">{d.brandName}</span> : null}</span>
-                      <span className="font-medium">{fmtMoney(d.amount)}</span>
-                    </div>
-                  ))}
-                </div>
-              )}
-              {preview.bizDividends?.length > 0 && (
-                <div>
-                  <div className="font-semibold text-slate-600 mt-2">商务分红明细：</div>
-                  {preview.bizDividends.map((d: any, i: number) => (
-                    <div key={i} className="flex justify-between py-0.5">
-                      <span>{d.introducerName}{d.brandName ? <span className="ml-1 rounded bg-amber-50 px-1 py-0.5 text-[9px] text-amber-600">{d.brandName}</span> : null}</span>
-                      <span className="font-medium">{fmtMoney(d.amount)}</span>
-                    </div>
-                  ))}
-                </div>
-              )}
+          {estimatePreview && (
+            <div className="rounded-lg border bg-slate-50 p-3 space-y-1 text-xs">
+              <div className="font-semibold text-slate-700">该月分红预估</div>
+              <div className="flex justify-between"><span className="text-slate-500">利润</span><span className="font-medium tabular-nums">{fmtMoney(estimatePreview.profit)}</span></div>
+              <div className="flex justify-between"><span className="text-slate-500">股东分红</span><span className="font-medium tabular-nums text-emerald-600">{fmtMoney(estimatePreview.summary?.totalShareholderDividend)}</span></div>
+              <div className="flex justify-between"><span className="text-slate-500">商务分红</span><span className="font-medium tabular-nums text-emerald-600">{fmtMoney(estimatePreview.summary?.totalBusinessDividend)}</span></div>
             </div>
           )}
+          <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] text-amber-700">
+            仅在该分红类型的结算月份生成记录；非结算月请勿生成（金额会累计到结算月一并核算）。
+          </div>
         </div>
         <div className="mt-4 flex justify-end gap-2">
           <button onClick={onClose} className="rounded-lg px-3 py-1.5 text-xs text-slate-500 hover:bg-slate-100">取消</button>
@@ -320,187 +297,430 @@ function AddDividendDialog({ open, onClose, landlordId }: { open: boolean; onClo
   );
 }
 
-// ─── 提交审批弹窗 ───
-function SubmitApprovalDialog({ open, onClose, dividends, onSuccess }: { open: boolean; onClose: () => void; dividends: any[]; onSuccess: () => void }) {
-  const [applicant, setApplicant] = useState("");
-  const [supervisor, setSupervisor] = useState("");
-  const [boss, setBoss] = useState("");
+// ─── 分红核算明细弹窗（逐月构成 + 电表级明细，供分红人员核对）───
+// monthDatas[i] 对应 months[i] 的 calculate(estimate) 响应
+function DividendDetailDialog({ open, onClose, landlordName, personName, months, monthDatas, personKey, personId }: {
+  open: boolean; onClose: () => void;
+  landlordName?: string; personName?: string;
+  months: string[]; monthDatas: any[];
+  personKey: "shareholderId" | "introducerId"; personId?: number | null;
+}) {
+  const r2 = (n: number) => Math.round((n || 0) * 100) / 100;
+  const fmt = (n: number) => fmtMoney(r2(n));
 
-  const { data: platformUsers } = useQuery({
-    queryKey: ["platformUsers"],
-    queryFn: listPlatformUsers,
-    enabled: open,
-  });
+  // 该人的分红配置（可能多条：全场 + 品牌）
+  const configs = useMemo(() => {
+    const first = monthDatas.find((d) =>
+      d && (d.shareholderDividends ?? []).some((x: any) => x[personKey] === personId) ||
+      d && (d.bizDividends ?? []).some((x: any) => x[personKey] === personId)
+    );
+    if (!first) return [];
+    const list = personKey === "shareholderId" ? first.shareholderDividends ?? [] : first.bizDividends ?? [];
+    return list.filter((x: any) => x[personKey] === personId);
+  }, [monthDatas, personKey, personId]);
 
-  const supervisors = (platformUsers ?? []).filter((u: any) => u.role === "finance_supervisor");
-  const bosses = (platformUsers ?? []).filter((u: any) => u.role === "boss");
-
-  const mutation = useMutation({
-    mutationFn: async () => {
-      if (!applicant.trim()) throw new Error("请填写操作人");
-      if (!supervisor && !boss) throw new Error("请至少选择一位审批人");
-      if (!dividends?.length) throw new Error("请选择要审批的分红记录");
-      const first = dividends[0];
-      const landlordName = first.landlordName || `场地#${first.landlordId}`;
-      // 月份范围描述（如 202607 ~ 202608）
-      const periods = dividends.map((d: any) => d.period).sort();
-      const periodLabel = periods.length > 1 ? `${periods[0]} ~ ${periods[periods.length - 1]}` : (periods[0] || "");
-      const totalAmount = dividends.reduce((s: number, d: any) => s + (d.shares?.reduce((x: number, sh: any) => x + Number(sh.amount || 0), 0) || 0), 0);
-      return submitDividendApproval({
-        dividendRecordId: first.id,
-        dividendRecordIds: dividends.map((d: any) => d.id),
-        landlordName,
-        period: periodLabel,
-        amount: totalAmount,
-        applicant: applicant.trim(),
-        approvers: { finance_supervisor: supervisor || undefined, boss: boss || undefined },
+  // 逐月行（品牌股东用品牌 P&L，全场股东用整场地）
+  const rows = useMemo(() => {
+    const out: any[] = [];
+    months.forEach((m, i) => {
+      const est = monthDatas[i];
+      if (!est) return;
+      const list = personKey === "shareholderId" ? est.shareholderDividends ?? [] : est.bizDividends ?? [];
+      const mine = list.filter((x: any) => x[personKey] === personId);
+      if (mine.length === 0) return;
+      const cfg = mine[0];
+      const isBrand = cfg?.brandId != null;
+      const b = isBrand ? (est.brandBreakdown ?? []).find((x: any) => x.brandId === cfg.brandId) : null;
+      out.push({
+        month: m,
+        scope: isBrand ? (cfg.brandName || `品牌#${cfg.brandId}`) : "全场",
+        mode: cfg.mode,
+        ratio: cfg.ratio,
+        fixedAmount: cfg.fixedAmount,
+        settlementPeriod: cfg.settlementPeriod,
+        isSettlement: mine.some((x: any) => x.isSettlementMonth),
+        elecIncome: isBrand ? (b?.elecIncome ?? 0) : (est.income?.elecIncome?.total ?? 0),
+        rentIncome: isBrand ? (b?.rentIncome ?? 0) : (est.income?.rentIncome?.total ?? 0),
+        elecCost: isBrand ? (b?.elecCost ?? 0) : (est.cost?.elecCost ?? 0),
+        venueCost: isBrand ? (b?.venueCost ?? 0) : (est.cost?.rentCost ?? 0),
+        opExpense: isBrand ? (b?.opExpense ?? 0) : (est.cost?.opExpense ?? 0),
+        elecTax: isBrand ? (b?.elecTax ?? 0) : (est.cost?.elecTax ?? 0),
+        rentTax: isBrand ? (b?.rentTax ?? 0) : (est.cost?.rentTax ?? 0),
+        profit: isBrand ? (b?.profit ?? 0) : (est.profit ?? 0),
+        amount: r2(mine.reduce((s: number, x: any) => s + Number(x.amount || 0), 0)),
       });
-    },
-    onSuccess: () => { toast.success("已提交审批"); onSuccess(); onClose(); },
-    onError: (e: any) => toast.error(e.message || "提交失败"),
-  });
+    });
+    return out;
+  }, [months, monthDatas, personKey, personId, r2]);
 
-  if (!open || !dividends?.length) return null;
+  const totals = useMemo(() => {
+    const t: any = { elecIncome: 0, rentIncome: 0, elecCost: 0, venueCost: 0, opExpense: 0, elecTax: 0, rentTax: 0, profit: 0, amount: 0 };
+    for (const r of rows) for (const k of Object.keys(t)) t[k] += r[k] || 0;
+    for (const k of Object.keys(t)) t[k] = r2(t[k]);
+    return t;
+  }, [rows, r2]);
 
-  const first = dividends[0];
-  const landlordName = first.landlordName || `场地#${first.landlordId}`;
-  const periods = dividends.map((d: any) => d.period).sort();
-  const periodLabel = periods.length > 1 ? `${periods[0]} ~ ${periods[periods.length - 1]}` : (periods[0] || "");
-  const totalProfit = dividends.reduce((s: number, d: any) => s + Number(d.profit || 0), 0);
-  const totalAmount = dividends.reduce((s: number, d: any) => s + (d.shares?.reduce((x: number, sh: any) => x + Number(sh.amount || 0), 0) || 0), 0);
+  // 电费收入明细（表级，逐月）
+  const elecIncomeRows = useMemo(() => {
+    const out: any[] = [];
+    months.forEach((m, i) => {
+      const est = monthDatas[i];
+      if (!est) return;
+      const list = personKey === "shareholderId" ? est.shareholderDividends ?? [] : est.bizDividends ?? [];
+      const cfg = list.find((x: any) => x[personKey] === personId);
+      const isBrand = cfg?.brandId != null;
+      const taxMap = new Map<string, any>((est.cost?.details?.elecTax?.details ?? []).map((t: any) => [t.meterNo, t] as [string, any]));
+      for (const d of est.income?.elecIncome?.details ?? []) {
+        if (isBrand && d.brandName !== cfg.brandName) continue;
+        const gross = r2((d.kwh || 0) * (d.unitPrice || 0));
+        const tax = r2(taxMap.get(d.meterNo)?.amount ?? 0);
+        out.push({ month: m, meterNo: d.meterNo, brandName: d.brandName || "", kwh: d.kwh || 0, unitPrice: d.unitPrice || 0, gross, tax, net: r2(gross - tax) });
+      }
+    });
+    return out;
+  }, [months, monthDatas, personKey, personId, r2]);
 
-  // 构建审批流程预览
-  const flowSteps = [applicant || "提交人"];
-  if (supervisor) flowSteps.push(supervisor);
-  if (boss) flowSteps.push(boss);
+  // 租金收入明细（品牌级，逐月）
+  const rentIncomeRows = useMemo(() => {
+    const out: any[] = [];
+    months.forEach((m, i) => {
+      const est = monthDatas[i];
+      if (!est) return;
+      const list = personKey === "shareholderId" ? est.shareholderDividends ?? [] : est.bizDividends ?? [];
+      const cfg = list.find((x: any) => x[personKey] === personId);
+      const isBrand = cfg?.brandId != null;
+      for (const d of est.income?.rentIncome?.details ?? []) {
+        if (isBrand && d.brandId !== cfg?.brandId) continue;
+        out.push({ month: m, brandName: d.brandName || "未指定", cabinets: d.cabinets || 0, preTax: d.preTaxRent ?? 0, postTax: d.postTaxRent ?? d.amount ?? 0, amount: d.amount ?? 0 });
+      }
+    });
+    return out;
+  }, [months, monthDatas, personKey, personId]);
 
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30">
-      <div className="w-[420px] rounded-xl bg-white p-5 shadow-xl">
-        <div className="flex items-center justify-between mb-4">
-          <h3 className="text-sm font-semibold text-slate-800">提交分红审批</h3>
-          <button onClick={onClose} className="text-slate-400 hover:text-slate-600"><X className="h-4 w-4" /></button>
-        </div>
+  // 电费成本明细（表级，逐月；品牌模式按表号反查归属）
+  const elecCostRows = useMemo(() => {
+    const out: any[] = [];
+    months.forEach((m, i) => {
+      const est = monthDatas[i];
+      if (!est) return;
+      const list = personKey === "shareholderId" ? est.shareholderDividends ?? [] : est.bizDividends ?? [];
+      const cfg = list.find((x: any) => x[personKey] === personId);
+      const isBrand = cfg?.brandId != null;
+      for (const d of est.cost?.details?.electricity ?? []) {
+        if (isBrand) {
+          const inc = (est.income?.elecIncome?.details ?? []).find((x: any) => x.meterNo === d.meterNo);
+          if (!inc || inc.brandName !== cfg.brandName) continue;
+        }
+        out.push({ month: m, meterNo: d.meterNo, kwh: d.kwh || 0, unitPrice: d.unitPrice || 0, amount: d.amount || 0 });
+      }
+    });
+    return out;
+  }, [months, monthDatas, personKey, personId]);
 
-        {/* 分红信息（多记录） */}
-        <div className="rounded-lg border bg-slate-50 p-3 mb-4 space-y-1 text-xs">
-          <div className="flex justify-between"><span className="text-slate-500">场地</span><span className="font-medium text-slate-700">{landlordName}</span></div>
-          <div className="flex justify-between"><span className="text-slate-500">审批月份</span><span className="font-medium text-slate-700">{periodLabel}</span></div>
-          <div className="flex justify-between"><span className="text-slate-500">月份数</span><span className="font-medium text-slate-700">{dividends.length} 个月</span></div>
-          <div className="flex justify-between"><span className="text-slate-500">利润合计</span><span className={`font-semibold tabular-nums ${totalProfit >= 0 ? "text-emerald-600" : "text-rose-600"}`}>{fmtMoney(totalProfit)}</span></div>
-          <div className="flex justify-between border-t pt-1"><span className="text-slate-500">分红总额</span><span className="font-semibold tabular-nums text-blue-600">{fmtMoney(totalAmount)}</span></div>
-          {/* 各月明细 */}
-          {dividends.map((d: any) => (
-            <div key={d.id} className="border-t border-slate-200/60 pt-1 mt-1">
-              <div className="flex justify-between">
-                <span className="text-slate-500">{d.period} · {d.type}</span>
-                <span className="tabular-nums text-slate-600">{fmtMoney(d.shares?.reduce((x: number, sh: any) => x + Number(sh.amount || 0), 0) || 0)}</span>
-              </div>
-              {d.shares?.map((s: any, i: number) => (
-                <div key={i} className="flex justify-between pl-3">
-                  <span className="text-slate-400">{s.shareholderName || s.introducerName || "-"}{s.brandName ? <span className="ml-1 rounded bg-amber-50 px-1 py-0.5 text-[9px] text-amber-600">{s.brandName}</span> : null}</span>
-                  <span className="tabular-nums text-slate-600">{fmtMoney(s.amount)}</span>
-                </div>
-              ))}
-            </div>
-          ))}
-        </div>
+  // 场地成本（合同级）+ 运营费用（逐月）
+  const venueRows = useMemo(() => {
+    const out: any[] = [];
+    months.forEach((m, i) => {
+      const est = monthDatas[i];
+      if (!est) return;
+      for (const d of est.cost?.details?.rent ?? []) out.push({ month: m, name: d.landlordName || "场地合同", amount: d.monthlyRent || 0 });
+      const op = est.cost?.details?.operatingExpense;
+      if (op && Number(op.amount || 0) > 0) out.push({ month: m, name: `运营费用${op.remark ? `（${op.remark}）` : ""}`, amount: op.amount });
+    });
+    return out;
+  }, [months, monthDatas]);
 
-        {/* 审批人选择 */}
-        <div className="space-y-3">
-          <div>
-            <label className="mb-1 block text-xs text-slate-500">操作人（提交人）<span className="text-rose-500">*</span></label>
-            <input className={inputCls} value={applicant} onChange={(e) => setApplicant(e.target.value)} placeholder="您的姓名" />
-          </div>
-          <div>
-            <label className="mb-1 block text-xs text-slate-500">财务主管审核</label>
-            <select className={inputCls} value={supervisor} onChange={(e) => setSupervisor(e.target.value)}>
-              <option value="">不经过财务主管</option>
-              {supervisors.map((u: any) => <option key={u.id} value={u.name}>{u.name}{u.phone ? ` (${u.phone})` : ""}</option>)}
-            </select>
-            {supervisors.length === 0 && <div className="mt-1 text-[10px] text-slate-400">如需添加，请在「Directory → 平台人员」中设置</div>}
-          </div>
-          <div>
-            <label className="mb-1 block text-xs text-slate-500">老板审批</label>
-            <select className={inputCls} value={boss} onChange={(e) => setBoss(e.target.value)}>
-              <option value="">不经过老板</option>
-              {bosses.map((u: any) => <option key={u.id} value={u.name}>{u.name}{u.phone ? ` (${u.phone})` : ""}</option>)}
-            </select>
-            {bosses.length === 0 && <div className="mt-1 text-[10px] text-slate-400">如需添加，请在「Directory → 平台人员」中设置</div>}
-          </div>
-          {!supervisor && !boss && (
-            <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] text-amber-700">
-              请至少选择一位审批人
-            </div>
-          )}
-        </div>
+  // 税费明细
+  const taxRows = useMemo(() => {
+    const out: any[] = [];
+    months.forEach((m, i) => {
+      const est = monthDatas[i];
+      if (!est) return;
+      for (const t of est.cost?.details?.elecTax?.details ?? []) {
+        out.push({ month: m, kind: "电费税费", name: `${t.brandName} ${t.meterNo}`, rate: t.preTaxPrice && t.postTaxPrice ? `${((1 - Number(t.postTaxPrice) / Number(t.preTaxPrice)) * 100).toFixed(1)}%` : "", amount: t.amount });
+      }
+      for (const t of est.cost?.details?.rentTax?.details ?? []) {
+        out.push({ month: m, kind: "租金税费", name: t.brandName, rate: `${((t.taxRate || 0) * 100).toFixed(1)}%`, amount: t.amount });
+      }
+    });
+    return out;
+  }, [months, monthDatas]);
 
-        {/* 审批流程预览 */}
-        {(supervisor || boss) && (
-          <div className="mt-4 rounded-lg border bg-blue-50/50 p-3">
-            <div className="text-[10px] font-semibold text-blue-600 mb-2">审批流程预览</div>
-            <div className="flex items-center gap-1 text-[11px]">
-              {flowSteps.map((step, i) => (
-                <span key={i} className="flex items-center gap-1">
-                  {i > 0 && <span className="text-slate-400">→</span>}
-                  <span className={`rounded px-1.5 py-0.5 ${i === 0 ? "bg-blue-100 text-blue-700" : i === flowSteps.length - 1 ? "bg-emerald-100 text-emerald-700" : "bg-amber-100 text-amber-700"}`}>{step}</span>
-                </span>
-              ))}
-            </div>
-          </div>
-        )}
-
-        <div className="mt-4 flex justify-end gap-2">
-          <button onClick={onClose} className="rounded-lg px-3 py-1.5 text-xs text-slate-500 hover:bg-slate-100">取消</button>
-          <button onClick={() => mutation.mutate()} disabled={mutation.isPending || (!supervisor && !boss)} className="rounded-lg bg-blue-600 px-4 py-1.5 text-xs text-white hover:bg-blue-700 disabled:opacity-50">
-            {mutation.isPending ? "提交中…" : "确认提交审批"}
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ─── 导出日期范围弹窗 ───
-function ExportDateDialog({ open, onClose, onConfirm, hint }: { open: boolean; onClose: () => void; onConfirm: (start: string, end: string) => void; hint?: string }) {
-  const [start, setStart] = useState(() => {
-    const now = new Date();
-    return `${now.getFullYear()}-01`;
-  });
-  const [end, setEnd] = useState(() => {
-    const now = new Date();
-    return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
-  });
+  const copyText = () => {
+    const L: string[] = [];
+    L.push("【分红核算明细】");
+    L.push(`场地：${landlordName || "-"}    分红人：${personName || "-"}    区间：${toDisplay(months[0])} ~ ${toDisplay(months[months.length - 1])}`);
+    if (configs.length) {
+      const c = configs[0];
+      L.push(`参与范围：${c.brandName ? `仅 ${c.brandName}` : "全场"}    模式：${c.mode === "固定金额" ? `固定金额 ${fmtMoney(c.fixedAmount)}/月` : `${c.mode} ${((c.ratio || 0) * 100).toFixed(2)}%`}    周期：${c.settlementPeriod}分红`);
+    }
+    L.push("");
+    L.push("【区间合计】");
+    L.push(`总收入(不含税)：${fmt(totals.elecIncome + totals.rentIncome)}（电费收入 ${fmt(totals.elecIncome)} + 租金收入 ${fmt(totals.rentIncome)}）`);
+    L.push(`总成本：${fmt(totals.elecCost + totals.venueCost + totals.opExpense)}（电费成本 ${fmt(totals.elecCost)} + 场地成本 ${fmt(totals.venueCost)} + 运营费用 ${fmt(totals.opExpense)}）`);
+    L.push(`税费：${fmt(totals.elecTax + totals.rentTax)}（电费税费 ${fmt(totals.elecTax)} + 租金税费 ${fmt(totals.rentTax)}，税费不参与利润）`);
+    L.push(`净利润：${fmt(totals.profit)}`);
+    L.push(`分红金额：${fmt(totals.amount)}`);
+    L.push("");
+    L.push("【逐月构成】");
+    L.push("月份 | 电费收入 | 租金收入 | 电费成本 | 场地成本 | 运营费用 | 税费 | 净利润 | 分红");
+    for (const r of rows) {
+      L.push(`${r.month} | ${fmt(r.elecIncome)} | ${fmt(r.rentIncome)} | ${fmt(r.elecCost)} | ${fmt(r.venueCost)} | ${fmt(r.opExpense)} | ${fmt(r.elecTax + r.rentTax)} | ${fmt(r.profit)} | ${fmt(r.amount)}${r.isSettlement ? "（结算月）" : ""}`);
+    }
+    L.push("");
+    L.push("【电费收入明细（不含税）】");
+    L.push("月份 | 表号 | 品牌 | 度数 | 含税单价 | 含税金额 | 税费 | 不含税金额");
+    for (const r of elecIncomeRows) L.push(`${r.month} | ${r.meterNo} | ${r.brandName} | ${r.kwh} | ${r.unitPrice} | ${fmt(r.gross)} | ${fmt(r.tax)} | ${fmt(r.net)}`);
+    L.push("");
+    L.push("【租金收入明细（不含税）】");
+    L.push("月份 | 品牌 | 柜数 | 含税月租 | 税后月租 | 不含税金额");
+    for (const r of rentIncomeRows) L.push(`${r.month} | ${r.brandName} | ${r.cabinets} | ${fmt(r.preTax)} | ${fmt(r.postTax)} | ${fmt(r.amount)}`);
+    L.push("");
+    L.push("【电费成本明细】");
+    L.push("月份 | 表号 | 度数 | 成本单价 | 金额");
+    for (const r of elecCostRows) L.push(`${r.month} | ${r.meterNo} | ${r.kwh} | ${r.unitPrice} | ${fmt(r.amount)}`);
+    L.push("");
+    L.push("【场地成本 / 运营费用】");
+    L.push("月份 | 项目 | 金额");
+    for (const r of venueRows) L.push(`${r.month} | ${r.name} | ${fmt(r.amount)}`);
+    L.push("");
+    L.push("【税费明细】");
+    L.push("月份 | 类型 | 项目 | 税率 | 金额");
+    for (const r of taxRows) L.push(`${r.month} | ${r.kind} | ${r.name} | ${r.rate} | ${fmt(r.amount)}`);
+    navigator.clipboard.writeText(L.join("\n")).then(() => toast.success("明细已复制，可粘贴发给分红人员")).catch(() => toast.error("复制失败"));
+  };
 
   if (!open) return null;
 
+  const th = "px-2 py-1.5 text-left font-medium text-slate-500";
+  const thR = "px-2 py-1.5 text-right font-medium text-slate-500";
+  const td = "px-2 py-1.5 border-t border-slate-100";
+  const tdR = "px-2 py-1.5 border-t border-slate-100 text-right tabular-nums";
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30">
-      <div className="w-80 rounded-xl bg-white p-5 shadow-xl">
-        <div className="flex items-center justify-between mb-4">
-          <h3 className="text-sm font-semibold text-slate-800">选择导出日期范围</h3>
-          <button onClick={onClose} className="text-slate-400 hover:text-slate-600"><X className="h-4 w-4" /></button>
-        </div>
-        {hint && (
-          <div className="mb-3 rounded-lg border border-blue-200 bg-blue-50 px-3 py-2 text-[11px] text-blue-700">
-            {hint}
-          </div>
-        )}
-        <div className="space-y-3">
-          <div>
-            <label className="mb-1 block text-xs text-slate-500">起始月份</label>
-            <input type="month" className={inputCls} value={start} onChange={e => setStart(e.target.value)} />
-          </div>
-          <div>
-            <label className="mb-1 block text-xs text-slate-500">截止月份</label>
-            <input type="month" className={inputCls} value={end} onChange={e => setEnd(e.target.value)} />
+      <div className="w-[920px] max-w-[96vw] max-h-[88vh] overflow-y-auto rounded-xl bg-white p-5 shadow-xl">
+        <div className="flex items-center justify-between mb-3">
+          <h3 className="text-sm font-semibold text-slate-800">分红核算明细</h3>
+          <div className="flex items-center gap-2">
+            <button onClick={copyText} className="rounded-lg border border-emerald-300 bg-emerald-50 px-3 py-1.5 text-xs font-medium text-emerald-700 hover:bg-emerald-100">复制文本（发分红人员）</button>
+            <button onClick={onClose} className="text-slate-400 hover:text-slate-600"><X className="h-4 w-4" /></button>
           </div>
         </div>
-        <div className="mt-4 flex justify-end gap-2">
-          <button onClick={onClose} className="rounded-lg px-3 py-1.5 text-xs text-slate-500 hover:bg-slate-100">取消</button>
-          <button onClick={() => { if (start > end) { toast.error("起始月份不能大于截止月份"); return; } onConfirm(start, end); }} className="rounded-lg bg-emerald-600 px-4 py-1.5 text-xs text-white hover:bg-emerald-700">
-            确认导出
-          </button>
+
+        {/* 头部信息 */}
+        <div className="mb-3 flex flex-wrap items-center gap-2 text-xs">
+          <span className="rounded-lg bg-blue-50 px-2 py-1 font-medium text-blue-700">{landlordName || "-"}</span>
+          <span className="rounded-lg bg-emerald-50 px-2 py-1 font-medium text-emerald-700">{personName || "-"}</span>
+          {configs.length > 0 && (
+            <>
+              <span className={`rounded-full px-2 py-0.5 font-medium ${configs[0].brandName ? "bg-amber-100 text-amber-700" : "bg-slate-100 text-slate-600"}`}>
+                {configs[0].brandName ? `仅参与 ${configs[0].brandName}` : "参与全场"}
+              </span>
+              <span className="text-slate-500">{configs[0].mode === "固定金额" ? `固定 ${fmtMoney(configs[0].fixedAmount)}/月` : `${configs[0].mode} ${((configs[0].ratio || 0) * 100).toFixed(2)}%`}</span>
+              <span className="text-slate-500">{configs[0].settlementPeriod}分红</span>
+              {rows.some((r: any) => r.isSettlement) && <span className="rounded-full bg-emerald-100 px-2 py-0.5 font-medium text-emerald-700">区间内含结算月</span>}
+            </>
+          )}
+        </div>
+
+        {/* 区间合计 */}
+        <div className="mb-4 grid grid-cols-2 gap-2 lg:grid-cols-5">
+          <div className="rounded-lg border bg-emerald-50 px-3 py-2">
+            <div className="text-[10px] text-emerald-600">总收入（不含税）</div>
+            <div className="text-sm font-semibold tabular-nums text-emerald-700">{fmt(totals.elecIncome + totals.rentIncome)}</div>
+            <div className="text-[10px] text-slate-400">电费 {fmt(totals.elecIncome)} + 租金 {fmt(totals.rentIncome)}</div>
+          </div>
+          <div className="rounded-lg border bg-rose-50 px-3 py-2">
+            <div className="text-[10px] text-rose-600">总成本</div>
+            <div className="text-sm font-semibold tabular-nums text-rose-700">{fmt(totals.elecCost + totals.venueCost + totals.opExpense)}</div>
+            <div className="text-[10px] text-slate-400">电费 {fmt(totals.elecCost)} + 场地 {fmt(totals.venueCost)} + 运营 {fmt(totals.opExpense)}</div>
+          </div>
+          <div className="rounded-lg border bg-amber-50 px-3 py-2">
+            <div className="text-[10px] text-amber-600">税费（不含利润）</div>
+            <div className="text-sm font-semibold tabular-nums text-amber-700">{fmt(totals.elecTax + totals.rentTax)}</div>
+            <div className="text-[10px] text-slate-400">电费 {fmt(totals.elecTax)} + 租金 {fmt(totals.rentTax)}</div>
+          </div>
+          <div className="rounded-lg border bg-blue-50 px-3 py-2">
+            <div className="text-[10px] text-blue-600">净利润（分红基数）</div>
+            <div className="text-sm font-semibold tabular-nums text-blue-700">{fmt(totals.profit)}</div>
+            <div className="text-[10px] text-slate-400">{configs[0]?.mode === "收入分红" ? "收入分红按总收入计" : "利润分红按净利润计"}</div>
+          </div>
+          <div className="rounded-lg border-2 border-emerald-300 bg-emerald-50 px-3 py-2">
+            <div className="text-[10px] text-emerald-600">分红金额</div>
+            <div className="text-sm font-bold tabular-nums text-emerald-700">{fmt(totals.amount)}</div>
+            <div className="text-[10px] text-slate-400">预估口径（不乘周期倍数）</div>
+          </div>
+        </div>
+
+        {/* 逐月构成 */}
+        <div className="mb-4 rounded-lg border overflow-hidden">
+          <div className="border-b bg-slate-50 px-3 py-1.5 text-[11px] font-semibold text-slate-600">逐月构成（{rows.length} 个月 · 参与范围：{rows[0]?.scope ?? "-"}）</div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="bg-slate-50">
+                  <th className={th}>月份</th>
+                  <th className={thR}>电费收入</th>
+                  <th className={thR}>租金收入</th>
+                  <th className={thR}>电费成本</th>
+                  <th className={thR}>场地成本</th>
+                  <th className={thR}>运营费用</th>
+                  <th className={thR}>税费</th>
+                  <th className={thR}>净利润</th>
+                  <th className={thR}>分红</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((r: any) => (
+                  <tr key={r.month}>
+                    <td className={td}>{toDisplay(r.month)}{r.isSettlement ? <span className="ml-1 rounded-full bg-emerald-100 px-1.5 py-0.5 text-[10px] text-emerald-700">结算</span> : null}</td>
+                    <td className={tdR}>{fmt(r.elecIncome)}</td>
+                    <td className={tdR}>{fmt(r.rentIncome)}</td>
+                    <td className={tdR}>{fmt(r.elecCost)}</td>
+                    <td className={tdR}>{fmt(r.venueCost)}</td>
+                    <td className={tdR}>{fmt(r.opExpense)}</td>
+                    <td className={tdR}>{fmt(r.elecTax + r.rentTax)}</td>
+                    <td className={`${tdR} font-medium`}>{fmt(r.profit)}</td>
+                    <td className={`${tdR} font-semibold text-emerald-700`}>{fmt(r.amount)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        {/* 电费收入明细 */}
+        <div className="mb-4 rounded-lg border overflow-hidden">
+          <div className="border-b bg-slate-50 px-3 py-1.5 text-[11px] font-semibold text-slate-600">电费收入明细（{elecIncomeRows.length} 行 · 不含税）</div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="bg-slate-50">
+                  <th className={th}>月份</th><th className={th}>表号</th><th className={th}>品牌</th>
+                  <th className={thR}>度数</th><th className={thR}>含税单价</th><th className={thR}>含税金额</th>
+                  <th className={thR}>税费</th><th className={thR}>不含税金额</th>
+                </tr>
+              </thead>
+              <tbody>
+                {elecIncomeRows.map((r, idx) => (
+                  <tr key={idx}>
+                    <td className={td}>{toDisplay(r.month)}</td>
+                    <td className={`${td} font-mono text-[11px]`}>{r.meterNo}</td>
+                    <td className={td}>{r.brandName}</td>
+                    <td className={tdR}>{r.kwh}</td>
+                    <td className={tdR}>{r.unitPrice}</td>
+                    <td className={tdR}>{fmt(r.gross)}</td>
+                    <td className={tdR}>{fmt(r.tax)}</td>
+                    <td className={`${tdR} font-medium`}>{fmt(r.net)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        {/* 租金收入明细 */}
+        <div className="mb-4 rounded-lg border overflow-hidden">
+          <div className="border-b bg-slate-50 px-3 py-1.5 text-[11px] font-semibold text-slate-600">租金收入明细（{rentIncomeRows.length} 行 · 不含税）</div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="bg-slate-50">
+                  <th className={th}>月份</th><th className={th}>品牌</th><th className={thR}>柜数</th>
+                  <th className={thR}>含税月租</th><th className={thR}>税后月租</th><th className={thR}>不含税金额</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rentIncomeRows.map((r, idx) => (
+                  <tr key={idx}>
+                    <td className={td}>{toDisplay(r.month)}</td>
+                    <td className={td}>{r.brandName}</td>
+                    <td className={tdR}>{r.cabinets}</td>
+                    <td className={tdR}>{fmt(r.preTax)}</td>
+                    <td className={tdR}>{fmt(r.postTax)}</td>
+                    <td className={`${tdR} font-medium`}>{fmt(r.amount)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        {/* 电费成本明细 */}
+        <div className="mb-4 rounded-lg border overflow-hidden">
+          <div className="border-b bg-slate-50 px-3 py-1.5 text-[11px] font-semibold text-slate-600">电费成本明细（{elecCostRows.length} 行）</div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="bg-slate-50">
+                  <th className={th}>月份</th><th className={th}>表号</th>
+                  <th className={thR}>度数</th><th className={thR}>成本单价</th><th className={thR}>金额</th>
+                </tr>
+              </thead>
+              <tbody>
+                {elecCostRows.map((r, idx) => (
+                  <tr key={idx}>
+                    <td className={td}>{toDisplay(r.month)}</td>
+                    <td className={`${td} font-mono text-[11px]`}>{r.meterNo}</td>
+                    <td className={tdR}>{r.kwh}</td>
+                    <td className={tdR}>{r.unitPrice}</td>
+                    <td className={`${tdR} font-medium`}>{fmt(r.amount)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        {/* 场地成本 / 运营费用 + 税费 */}
+        <div className="grid grid-cols-2 gap-4">
+          <div className="rounded-lg border overflow-hidden">
+            <div className="border-b bg-slate-50 px-3 py-1.5 text-[11px] font-semibold text-slate-600">场地成本 / 运营费用（{venueRows.length} 行）</div>
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="bg-slate-50">
+                  <th className={th}>月份</th><th className={th}>项目</th><th className={thR}>金额</th>
+                </tr>
+              </thead>
+              <tbody>
+                {venueRows.map((r, idx) => (
+                  <tr key={idx}>
+                    <td className={td}>{toDisplay(r.month)}</td>
+                    <td className={td}>{r.name}</td>
+                    <td className={tdR}>{fmt(r.amount)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div className="rounded-lg border overflow-hidden">
+            <div className="border-b bg-slate-50 px-3 py-1.5 text-[11px] font-semibold text-slate-600">税费明细（{taxRows.length} 行）</div>
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="bg-slate-50">
+                  <th className={th}>月份</th><th className={th}>类型</th><th className={th}>项目</th>
+                  <th className={thR}>税率</th><th className={thR}>金额</th>
+                </tr>
+              </thead>
+              <tbody>
+                {taxRows.map((r, idx) => (
+                  <tr key={idx}>
+                    <td className={td}>{toDisplay(r.month)}</td>
+                    <td className={td}>{r.kind}</td>
+                    <td className={td}>{r.name}</td>
+                    <td className={tdR}>{r.rate}</td>
+                    <td className={tdR}>{fmt(r.amount)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div className="mt-3 text-[10px] text-slate-400">
+          * 口径说明：收入为不含税（电费按价内税拆分，租金用税后月租）；税费单独展示，不参与净利润；净利润 = 总收入 − 总成本。
+          品牌参与人只统计该品牌收入/成本（场地成本按柜数分摊）；分红金额为预估口径（每月基数 × 比例，结算月生成记录时按周期倍数核算累计金额）。
         </div>
       </div>
     </div>
@@ -510,1387 +730,532 @@ function ExportDateDialog({ open, onClose, onConfirm, hint }: { open: boolean; o
 // ─── 主页面 ───
 export default function Shareholders() {
   const qc = useQueryClient();
-  const [viewMode, setViewMode] = useState<"shareholder" | "station">("shareholder");
-  const [selectedMonth, setSelectedMonth] = useState(() => {
-    const now = new Date();
-    return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
-  });
-  // 场地汇总视图的日期粒度：月 / 季度 / 半年
-  const [stationGranularity, setStationGranularity] = useState<"month" | "quarter" | "halfYear">("month");
-  // 股东汇总视图的月份范围（起止月，场地汇总仍用 selectedMonth 单月）
-  const [summaryStartMonth, setSummaryStartMonth] = useState(() => {
-    const now = new Date();
-    return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
-  });
-  const [summaryEndMonth, setSummaryEndMonth] = useState(() => {
-    const now = new Date();
-    return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
-  });
-  const [selectedId, setSelectedId] = useState<number | null>(null);
-
-  // 股东汇总期间快捷范围：本月 / 本季度 / 本半年（自动设置起止月）
-  const setSummaryRange = (g: "month" | "quarter" | "halfYear") => {
-    const anchor = summaryEndMonth || new Date().toISOString().slice(0, 7);
-    const [y, m] = anchor.split("-").map(Number);
-    const pad = (n: number) => String(n).padStart(2, "0");
-    if (g === "month") {
-      setSummaryStartMonth(`${y}-${pad(m)}`);
-      setSummaryEndMonth(`${y}-${pad(m)}`);
-    } else if (g === "quarter") {
-      const qs = Math.floor((m - 1) / 3) * 3 + 1;
-      setSummaryStartMonth(`${y}-${pad(qs)}`);
-      setSummaryEndMonth(`${y}-${pad(qs + 2)}`);
-    } else {
-      const hs = m <= 6 ? 1 : 7;
-      setSummaryStartMonth(`${y}-${pad(hs)}`);
-      setSummaryEndMonth(`${y}-${pad(hs + 5)}`);
-    }
-  };
-  const summaryPresetActive = (g: "month" | "quarter" | "halfYear"): boolean => {
-    if (!summaryStartMonth || !summaryEndMonth) return false;
-    const anchor = summaryEndMonth;
-    const [y, m] = anchor.split("-").map(Number);
-    const pad = (n: number) => String(n).padStart(2, "0");
-    let s = "", e = "";
-    if (g === "month") { s = `${y}-${pad(m)}`; e = s; }
-    else if (g === "quarter") { const qs = Math.floor((m - 1) / 3) * 3 + 1; s = `${y}-${pad(qs)}`; e = `${y}-${pad(qs + 2)}`; }
-    else { const hs = m <= 6 ? 1 : 7; s = `${y}-${pad(hs)}`; e = `${y}-${pad(hs + 5)}`; }
-    return summaryStartMonth === s && summaryEndMonth === e;
-  };
-
-  // 弹窗状态
+  const now = new Date();
+  const initialMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+  const [periodStart, setPeriodStart] = useState(initialMonth);
+  const [periodEnd, setPeriodEnd] = useState(initialMonth);
+  // 结束月 = "当前选中月"（单月查看时 起始=结束）
+  const selectedMonth = periodEnd;
+  const isRange = periodStart !== periodEnd;
+  const periodLabel = isRange ? `${toDisplay(periodStart)} ~ ${toDisplay(periodEnd)}` : toDisplay(selectedMonth);
+  const [viewMode, setViewMode] = useState<"landlord" | "shareholder">("landlord");
+  const [selectedLandlordId, setSelectedLandlordId] = useState<number | null>(null);
+  const [selectedShareholderId, setSelectedShareholderId] = useState<number | null>(null);
   const [addShareholderOpen, setAddShareholderOpen] = useState(false);
-  const [configOpen, setConfigOpen] = useState<{ open: boolean; type: "shareholder" | "introducer"; landlordId?: number }>({ open: false, type: "shareholder" });
-  const [addDividendOpen, setAddDividendOpen] = useState<{ open: boolean; landlordId?: number }>({ open: false });
-  const [expandedShareholderId, setExpandedShareholderId] = useState<number | null>(null);
-  const [expandedBrandId, setExpandedBrandId] = useState<number | null>(null);
-  const [exportDateOpen, setExportDateOpen] = useState(false);
-  const [exportHint, setExportHint] = useState<string | undefined>();
+  const [configOpen, setConfigOpen] = useState<{ open: boolean; type: "shareholder" | "introducer"; config?: any | null }>({ open: false, type: "shareholder", config: null });
+  const [addDividendOpen, setAddDividendOpen] = useState(false);
+  const [detail, setDetail] = useState<{ open: boolean; personKey: "shareholderId" | "introducerId"; personId: number | null; personName: string; landlordName: string; months: string[]; monthDatas: any[] } | null>(null);
 
-  // ─── 数据查询 ───
-  const { data: shareholders } = useQuery({ queryKey: ["shareholders"], queryFn: () => listShareholders() });
+  // 快捷区间
+  const quickRange = (months: number) => {
+    const end = new Date(now.getFullYear(), now.getMonth(), 1);
+    const start = new Date(now.getFullYear(), now.getMonth() - (months - 1), 1);
+    setPeriodStart(`${start.getFullYear()}-${String(start.getMonth() + 1).padStart(2, "0")}`);
+    setPeriodEnd(`${end.getFullYear()}-${String(end.getMonth() + 1).padStart(2, "0")}`);
+  };
 
-  const { data: shareholderSummaryData, isLoading: shLoading } = useQuery({
-    queryKey: ["shareholderSummary", summaryStartMonth, summaryEndMonth],
-    queryFn: () => shareholderSummary({
-      periodStart: summaryStartMonth ? summaryStartMonth.replace("-", "") : undefined,
-      periodEnd: summaryEndMonth ? summaryEndMonth.replace("-", "") : undefined,
-    }),
-    enabled: viewMode === "shareholder",
+  // 区间内所有月份（YYYY-MM）
+  const monthsInRange = useMemo(() => {
+    const out: string[] = [];
+    if (!periodStart || !periodEnd) return out;
+    let [y, m] = [Number(periodStart.slice(0, 4)), Number(periodStart.slice(5))];
+    const [ey, em] = [Number(periodEnd.slice(0, 4)), Number(periodEnd.slice(5))];
+    let guard = 0;
+    while ((y < ey || (y === ey && m <= em)) && guard < 60) {
+      out.push(`${y}-${String(m).padStart(2, "0")}`);
+      m++; if (m > 12) { m = 1; y++; }
+      guard++;
+    }
+    return out;
+  }, [periodStart, periodEnd]);
+
+  // ── 场地看板（左侧列表 + 场地经营数据）──
+  const board = useQuery({
+    queryKey: ["stationBoard", selectedMonth],
+    queryFn: () => getStationBoard({ period: selectedMonth }),
+  });
+  const landlords = useMemo(() => board.data ?? [], [board.data]);
+
+  // 股东列表 + 汇总（区间）
+  const shareholders = useQuery({ queryKey: ["shareholders"], queryFn: () => listShareholders() });
+  const shSummary = useQuery({
+    queryKey: ["shareholderSummary", periodStart, periodEnd],
+    queryFn: () => shareholderSummary({ periodStart: toCompact(periodStart), periodEnd: toCompact(periodEnd) }),
   });
 
-  // 获取所有股东分红配置（用于显示股东关联的场地）
-  const { data: allShConfigs } = useQuery({
-    queryKey: ["shareholderConfigs"],
+  // ── 选中场地：逐月分红预估（estimate 模式）并聚合 ──
+  const selectedLandlord = useMemo(
+    () => landlords.find((r: any) => r.landlord.id === selectedLandlordId) || null,
+    [landlords, selectedLandlordId]
+  );
+  const landlordId = selectedLandlord?.landlord?.id ?? null;
+
+  const previewQueries = useQueries({
+    queries: monthsInRange.map((m) => ({
+      queryKey: ["dividendPreview", landlordId, m],
+      queryFn: () => calculateDividend({ landlordId: landlordId!, period: m, estimate: true }),
+      enabled: viewMode === "landlord" && landlordId != null && monthsInRange.length > 0,
+    })),
+  });
+  // 结束月（单月）的预估数据，供"生成分红记录"预览
+  const endMonthPreview = previewQueries[monthsInRange.length - 1]?.data ?? null;
+  // 区间聚合：收入/成本/税费/净利/分红合计 求和；受益人按人×品牌合并金额
+  const preview = useMemo(() => {
+    const datas = previewQueries.map((q) => q.data).filter(Boolean) as any[];
+    if (datas.length === 0) return null;
+    const r2 = (n: number) => Math.round((n || 0) * 100) / 100;
+    const sum = (f: (d: any) => number) => r2(datas.reduce((s, d) => s + (f(d) || 0), 0));
+    const merge = (kind: "shareholderDividends" | "bizDividends", idKey: string) => {
+      const map = new Map<string, any>();
+      for (const d of datas) {
+        for (const b of d[kind] ?? []) {
+          const k = `${b[idKey]}-${b.brandId ?? ""}`;
+          const prev = map.get(k);
+          if (!prev) map.set(k, { ...b, amount: r2(b.amount || 0) });
+          else {
+            prev.amount = r2(prev.amount + (b.amount || 0));
+            prev.isSettlementMonth = prev.isSettlementMonth || b.isSettlementMonth;
+          }
+        }
+      }
+      return [...map.values()];
+    };
+    return {
+      landlordId: datas[0].landlordId,
+      landlordName: datas[0].landlordName,
+      period: periodEnd.replace("-", ""),
+      income: { totalIncome: sum((d) => d.income?.totalIncome) },
+      cost: { totalCost: sum((d) => d.cost?.totalCost), elecTax: sum((d) => d.cost?.elecTax), rentTax: sum((d) => d.cost?.rentTax) },
+      profit: sum((d) => d.profit),
+      summary: {
+        totalShareholderDividend: sum((d) => d.summary?.totalShareholderDividend),
+        totalBusinessDividend: sum((d) => d.summary?.totalBusinessDividend),
+      },
+      shareholderDividends: merge("shareholderDividends", "shareholderId"),
+      bizDividends: merge("bizDividends", "introducerId"),
+    };
+  }, [previewQueries, periodEnd]);
+
+  const shConfigs = useQuery({
+    queryKey: ["shareholderConfigs", landlordId],
+    queryFn: () => listShareholderConfigs({ landlordId: landlordId! }),
+    enabled: viewMode === "landlord" && landlordId != null,
+  });
+  const intConfigs = useQuery({
+    queryKey: ["introducerConfigs", landlordId],
+    queryFn: () => listIntroducerConfigs({ landlordId: landlordId! }),
+    enabled: viewMode === "landlord" && landlordId != null,
+  });
+
+  const dividends = useQuery({
+    queryKey: ["dividends", landlordId],
+    queryFn: () => listDividends({ landlordId: landlordId! }),
+    enabled: viewMode === "landlord" && landlordId != null,
+  });
+  // 按区间过滤记录（period 为 YYYYMM）
+  const filteredDividends = useMemo(() => {
+    const s = toCompact(periodStart), e = toCompact(periodEnd);
+    return (dividends.data ?? []).filter((r: any) => r.period >= s && r.period <= e);
+  }, [dividends.data, periodStart, periodEnd]);
+
+  // 品牌列表（场地下的品牌，用于配置弹窗）
+  const brandsOfLandlord = useCallback((lid: number) => {
+    const r = landlords.find((x: any) => x.landlord.id === lid);
+    const seen = new Map<number, string>();
+    for (const cb of r?.contractBreakdown ?? []) {
+      if (cb.type === "品牌方合同" && cb.brandId) seen.set(cb.brandId, cb.brandName || `品牌#${cb.brandId}`);
+    }
+    return Array.from(seen.entries()).map(([id, name]) => ({ id, name }));
+  }, [landlords]);
+  const landlordBrands = useMemo(() => (landlordId != null ? brandsOfLandlord(landlordId) : []), [landlordId, brandsOfLandlord]);
+
+  // ── 选中股东：所有场地配置 + 各场地预估 ──
+  const allShConfigs = useQuery({
+    queryKey: ["allShareholderConfigs"],
     queryFn: () => listShareholderConfigs(),
     enabled: viewMode === "shareholder",
   });
-
-  // 场地汇总数据（用于股东汇总中显示各场地经营数据）
-  const { data: stationBoardForSH } = useQuery({
-    queryKey: ["stationBoard", selectedMonth],
-    queryFn: () => getStationBoard({ period: selectedMonth }),
-    enabled: viewMode === "shareholder",
-  });
-
-  // ─── 场地汇总：日期粒度（月/季度/半年）────────────────────
-  // 由锚点月份推导出所选粒度覆盖的月份列表（季度=该季度3个月，半年=上半年/下半年6个月）
-  const stationPeriodMonths = useMemo(() => {
-    if (viewMode !== "station") return [];
-    // 未选月份时保持原行为：拉取一次不带 period 的全场看板
-    if (!selectedMonth) return [""];
-    const [y, m] = selectedMonth.split("-").map(Number);
-    if (!y || !m) return [];
-    if (stationGranularity === "quarter") {
-      const qStart = Math.floor((m - 1) / 3) * 3 + 1;
-      return [0, 1, 2].map((i) => `${y}-${String(qStart + i).padStart(2, "0")}`);
-    }
-    if (stationGranularity === "halfYear") {
-      const hStart = m <= 6 ? 1 : 7;
-      return Array.from({ length: 6 }, (_, i) => `${y}-${String(hStart + i).padStart(2, "0")}`);
-    }
-    return [selectedMonth];
-  }, [viewMode, stationGranularity, selectedMonth]);
-
-  // 场地汇总期间展示标签（如 2026年8月 / 2026年第3季度 / 2026年上半年）
-  const stationPeriodLabel = useMemo(() => {
-    if (viewMode !== "station" || !selectedMonth) return selectedMonth || "";
-    const [y, m] = selectedMonth.split("-").map(Number);
-    if (!y || !m) return selectedMonth;
-    if (stationGranularity === "quarter") return `${y}年第${Math.floor((m - 1) / 3) + 1}季度`;
-    if (stationGranularity === "halfYear") return `${y}年${m <= 6 ? "上" : "下"}半年`;
-    return `${y}年${m}月`;
-  }, [viewMode, stationGranularity, selectedMonth]);
-
-  // 场地汇总：按所选粒度（月/季度/半年）逐月拉取场地看板，再按场地方聚合
-  const stationBoardQueries = useQueries({
-    queries: stationPeriodMonths.map((month) => ({
-      queryKey: ["stationBoard", month],
-      queryFn: () => getStationBoard({ period: month }),
-      enabled: viewMode === "station",
-    })),
-  });
-  const stLoading = stationBoardQueries.some((q) => q.isPending);
-  const stationBoard = useMemo(() => {
-    if (viewMode !== "station") return [];
-    const boards = stationBoardQueries.map((q) => q.data ?? []).filter(Array.isArray);
-    if (boards.length === 0) return [];
-    // 数值科目按月累加；静态信息（电表/场地/合同）取首个可用月份
-    const NUMERIC = ["totalKwh", "elecPay", "elecCollect", "elecProfit", "rentCost", "rentIncome", "rentProfit", "opExpense", "totalProfit"] as const;
-    const map = new Map<number, any>();
-    for (const board of boards) {
-      for (const row of board) {
-        const lid = row?.landlord?.id;
-        if (lid == null) continue;
-        if (!map.has(lid)) map.set(lid, { ...row });
-        const cur = map.get(lid);
-        for (const k of NUMERIC) cur[k] = Math.round(((cur[k] || 0) + (row[k] || 0)) * 100) / 100;
-      }
-    }
-    return [...map.values()];
-  }, [viewMode, stationBoardQueries]);
-
-  // ─── 股东汇总：合并所有股东（含没有分红记录的）───
-  const allShareholders = useMemo(() => {
-    const map = new Map<number, any>();
-    if (shareholders) {
-      for (const sh of shareholders) {
-        map.set(sh.id, { id: sh.id, name: sh.name, phone: sh.phone, totalAmount: 0, settledAmount: 0, pendingAmount: 0, details: [], hasRecords: false });
-      }
-    }
-    if (shareholderSummaryData) {
-      for (const s of shareholderSummaryData) {
-        const existing = map.get(s.shareholderId);
-        if (existing) {
-          existing.totalAmount = s.totalAmount;
-          existing.settledAmount = s.settledAmount;
-          existing.pendingAmount = s.pendingAmount;
-          existing.details = s.details;
-          existing.hasRecords = true;
-        } else {
-          map.set(s.shareholderId, { id: s.shareholderId, name: s.shareholderName, totalAmount: s.totalAmount, settledAmount: s.settledAmount, pendingAmount: s.pendingAmount, details: s.details, hasRecords: true });
-        }
-      }
-    }
-    return Array.from(map.values());
-  }, [shareholders, shareholderSummaryData]);
-
-  // 分红配置是否在所选月份生效（start_date/end_date 为空视为长期有效）
-  const isConfigActiveForMonth = useCallback((cfg: any, month: string) => {
-    if (!month) return true;
-    const start = cfg?.startDate ? String(cfg.startDate).slice(0, 7) : "";
-    const end = cfg?.endDate ? String(cfg.endDate).slice(0, 7) : "";
-    if (start && start > month) return false;
-    if (end && end < month) return false;
-    return true;
-  }, []);
-
-  // 分红配置是否在所选范围内任一月份生效（起止月范围内有交集）
-  const isConfigActiveForRange = useCallback((cfg: any, startMonth: string, endMonth: string) => {
-    const start = cfg?.startDate ? String(cfg.startDate).slice(0, 7) : "";
-    const end = cfg?.endDate ? String(cfg.endDate).slice(0, 7) : "";
-    // 配置生效期 [start,end] 与查询范围 [startMonth,endMonth] 有交集
-    const cfgStart = start || "0000-00";
-    const cfgEnd = end || "9999-12";
-    const queryStart = startMonth || "0000-00";
-    const queryEnd = endMonth || "9999-12";
-    return cfgStart <= queryEnd && cfgEnd >= queryStart;
-  }, []);
-
   const selectedShareholder = useMemo(() => {
-    if (viewMode !== "shareholder" || !selectedId) return null;
-    return allShareholders.find(s => s.id === selectedId) || null;
-  }, [viewMode, selectedId, allShareholders]);
+    if (viewMode !== "shareholder" || !selectedShareholderId) return null;
+    return (shareholders.data ?? []).find((s: any) => s.id === selectedShareholderId) || null;
+  }, [viewMode, selectedShareholderId, shareholders.data]);
 
-  // 选中股东的分红配置（仅显示所选月份生效的）
-  const shareholderConfigs = useMemo(() => {
-    if (!selectedId || !allShConfigs) return [];
-    return allShConfigs.filter((c: any) => c.shareholderId === selectedId && isConfigActiveForRange(c, summaryStartMonth, summaryEndMonth));
-  }, [selectedId, allShConfigs, summaryStartMonth, summaryEndMonth, isConfigActiveForRange]);
-
-  // 股东涉及场地的完整分红记录（用于新增月结/提交审批；v3：配置已挂 landlord_id）
+  // 该股东涉及的所有场地（去重）
   const shareholderLandlordIds = useMemo(() => {
-    const ids = shareholderConfigs.map((c: any) => c.landlordId).filter(Boolean);
+    if (!selectedShareholderId) return [];
+    const ids = (allShConfigs.data ?? [])
+      .filter((c: any) => c.shareholderId === selectedShareholderId)
+      .map((c: any) => c.landlordId)
+      .filter(Boolean);
     return [...new Set(ids)] as number[];
-  }, [shareholderConfigs]);
+  }, [allShConfigs.data, selectedShareholderId]);
 
-  const shareholderLandlordDividends = useQueries({
-    queries: shareholderLandlordIds.map((lid: number) => ({
-      queryKey: ["landlordDividends", lid],
-      queryFn: () => listDividends({ landlordId: lid }),
-      enabled: viewMode === "shareholder",
-    })),
+  // 各场地的名称（从 board 匹配）
+  const shareholderLandlords = useMemo(
+    () => shareholderLandlordIds.map((lid) => landlords.find((r: any) => r.landlord.id === lid) || null).filter(Boolean),
+    [shareholderLandlordIds, landlords]
+  );
+
+  // 该股东在各场地的区间预估（estimate 模式，按股东过滤；逐场地 × 逐月）
+  const shareholderEstimateQueries = useQueries({
+    queries: shareholderLandlordIds.flatMap((lid) => monthsInRange.map((m) => ({
+      queryKey: ["dividendPreview", lid, m],
+      queryFn: () => calculateDividend({ landlordId: lid, period: m, estimate: true }),
+      enabled: viewMode === "shareholder" && shareholderLandlordIds.length > 0 && monthsInRange.length > 0,
+    }))),
   });
-  const landlordDividendsMap = useMemo(() => {
-    const map = new Map<number, any[]>();
-    shareholderLandlordDividends.forEach((q, i) => {
-      const lid = shareholderLandlordIds[i];
-      if (lid && q.data) map.set(lid, q.data);
+  const shareholderEstimateByLandlord = useMemo(() => {
+    const map: Record<number, number> = {};
+    shareholderLandlordIds.forEach((lid, li) => {
+      monthsInRange.forEach((_m, mi) => {
+        const est = shareholderEstimateQueries[li * monthsInRange.length + mi]?.data;
+        if (!est) return;
+        const mine = (est.shareholderDividends ?? []).filter((d: any) => d.shareholderId === selectedShareholderId);
+        map[lid] = Math.round(((map[lid] || 0) + mine.reduce((s: number, d: any) => s + Number(d.amount || 0), 0)) * 100) / 100;
+      });
     });
     return map;
-  }, [shareholderLandlordDividends, shareholderLandlordIds]);
+  }, [shareholderLandlordIds, monthsInRange, shareholderEstimateQueries, selectedShareholderId]);
 
-  // ─── 场地汇总：复用场地看板数据（按场地方分组）───
-  const stationRows = useMemo(() => stationBoard ?? [], [stationBoard]);
-
-  const selectedLandlord = useMemo(() => {
-    if (viewMode !== "station" || !selectedId) return null;
-    return stationRows.find((r: any) => r.landlord.id === selectedId) || null;
-  }, [viewMode, selectedId, stationRows]);
-
-  // 选中场地 ID（v3：直接以 landlord.id 作为分红维度）
-  const landlordId = useMemo(() => selectedLandlord?.landlord?.id ?? null, [selectedLandlord]);
-
-  // 该场地下的品牌列表：从 contracts 品牌方合同提取（品牌 = 公司租给哪些品牌放柜）
-  const landlordBrands = useMemo(() => {
-    if (!selectedLandlord?.contractBreakdown) return [];
-    const seen = new Map<number, string>();
-    for (const cb of selectedLandlord.contractBreakdown ?? []) {
-      if (cb.type === "品牌方合同" && cb.brandId) {
-        seen.set(cb.brandId, cb.brandName || `品牌#${cb.brandId}`);
-      }
-    }
-    return Array.from(seen.entries()).map(([id, name]) => ({ id, name }));
-  }, [selectedLandlord]);
-
-  const { data: shConfigs } = useQuery({
-    queryKey: ["shareholderConfigs", landlordId],
-    queryFn: () => listShareholderConfigs({ landlordId: landlordId! }),
-    enabled: viewMode === "station" && landlordId !== null,
-  });
-  // 场地汇总：仅显示所选期间生效的股东分红配置（月=单月生效；季度/半年=期间有交集）
-  const activeShConfigs = useMemo(() => {
-    const configs = shConfigs ?? [];
-    if (stationGranularity === "month") {
-      return configs.filter((c: any) => isConfigActiveForMonth(c, selectedMonth));
-    }
-    const start = stationPeriodMonths[0];
-    const end = stationPeriodMonths[stationPeriodMonths.length - 1];
-    if (!start || !end) return configs;
-    return configs.filter((c: any) => isConfigActiveForRange(c, start, end));
-  }, [shConfigs, stationGranularity, selectedMonth, stationPeriodMonths, isConfigActiveForMonth, isConfigActiveForRange]);
-
-  const { data: intConfigs } = useQuery({
-    queryKey: ["introducerConfigs", landlordId],
-    queryFn: () => listIntroducerConfigs({ landlordId: landlordId! }),
-    enabled: viewMode === "station" && landlordId !== null,
-  });
-
-  // 选中场地方的分红记录（月=单月；季度/半年=合并期间各月记录）
-  const stationDividendQueries = useQueries({
-    queries: stationPeriodMonths.map((month) => ({
-      queryKey: ["stationDividends", landlordId, month],
-      queryFn: () => listDividends({ landlordId: landlordId!, period: month || undefined }),
-      enabled: viewMode === "station" && landlordId !== null,
-    })),
-  });
-  const stationDividends = useMemo(() => {
-    const merged: any[] = [];
-    for (const q of stationDividendQueries) {
-      if (q.data) merged.push(...q.data);
-    }
-    return merged;
-  }, [stationDividendQueries]);
-
-  // 期间分红汇总（季度/半年时）：按类型合计 + 按股东/介绍人聚合整期金额
-  const stationDividendSummary = useMemo(() => {
-    if (stationGranularity === "month") return null;
-    const byType = { 股东分红: 0, 商务分红: 0 } as Record<string, number>;
-    const byPerson = new Map<string, { name: string; brandName?: string; amount: number }>();
-    for (const r of stationDividends) {
-      const typeSum = (r.shares ?? []).reduce((s: number, sh: any) => s + Number(sh.amount || 0), 0);
-      if (typeSum) byType[r.type === "商务分红" ? "商务分红" : "股东分红"] = (byType[r.type === "商务分红" ? "商务分红" : "股东分红"] || 0) + typeSum;
-      for (const sh of r.shares ?? []) {
-        const name = sh.shareholderName || sh.introducerName || "-";
-        const key = `${name}|${sh.brandName || ""}`;
-        const cur = byPerson.get(key) || { name, brandName: sh.brandName, amount: 0 };
-        cur.amount += Number(sh.amount || 0);
-        byPerson.set(key, cur);
-      }
-    }
-    return {
-      total: byType["股东分红"] + byType["商务分红"],
-      byType,
-      persons: [...byPerson.values()].sort((a, b) => b.amount - a.amount),
-    };
-  }, [stationDividends, stationGranularity]);
-
-  // 分红预估计算（月=单月；季度/半年=逐月计算后按股东/品牌/收支科目加总）
-  const stationPreviewQueries = useQueries({
-    queries: stationPeriodMonths.map((month) => ({
-      queryKey: ["dividendPreview", landlordId, month],
-      queryFn: async () => {
-        try {
-          return await calculateDividend({ landlordId: landlordId!, period: month });
-        } catch {
-          return null;
-        }
-      },
-      enabled: viewMode === "station" && landlordId !== null && !!month,
-    })),
-  });
-  const dividendPreview = useMemo(() => {
-    const items = stationPreviewQueries.map((q) => q.data).filter(Boolean);
-    if (items.length === 0) return null;
-    // 单月：直接返回原始结果（保留电表/合同等明细）
-    if (items.length === 1) return items[0];
-    const agg: any = {
-      income: { totalIncome: 0, elecIncome: { total: 0 }, rentIncome: { total: 0 } },
-      cost: { totalCost: 0, elecCost: 0, rentCost: 0, opExpense: 0, elecTax: 0, rentTax: 0, rentRefund: 0, bizDividendCost: 0 },
-      profit: 0,
-      brandBreakdown: [],
-      shareholderDividends: [],
-      bizDividends: [],
-    };
-    const brandMap = new Map<number, any>();
-    const shMap = new Map<number, any>();
-    const bizMap = new Map<number, any>();
-    const round2 = (n: number) => Math.round((n || 0) * 100) / 100;
-    for (const d of items) {
-      agg.income.totalIncome += d.income?.totalIncome || 0;
-      agg.income.elecIncome.total += d.income?.elecIncome?.total || 0;
-      agg.income.rentIncome.total += d.income?.rentIncome?.total || 0;
-      agg.cost.totalCost += d.cost?.totalCost || 0;
-      agg.cost.elecCost += d.cost?.elecCost || 0;
-      agg.cost.rentCost += d.cost?.rentCost || 0;
-      agg.cost.opExpense += d.cost?.opExpense || 0;
-      agg.cost.elecTax += d.cost?.elecTax || 0;
-      agg.cost.rentTax += d.cost?.rentTax || 0;
-      agg.cost.rentRefund += d.cost?.rentRefund || 0;
-      agg.cost.bizDividendCost += d.cost?.bizDividendCost || 0;
-      agg.profit += d.profit || 0;
-      // 品牌收支按品牌加总
-      for (const b of d.brandBreakdown ?? []) {
-        const cur = brandMap.get(b.brandId) || { brandId: b.brandId, brandName: b.brandName, income: 0, rentIncome: 0, elecIncome: 0, venueCost: 0, elecCost: 0, elecTax: 0, rentTax: 0, profit: 0 };
-        cur.income += b.income || 0; cur.rentIncome += b.rentIncome || 0; cur.elecIncome += b.elecIncome || 0;
-        cur.venueCost += b.venueCost || 0; cur.elecCost += b.elecCost || 0; cur.elecTax += b.elecTax || 0; cur.rentTax += b.rentTax || 0;
-        cur.profit += b.profit || 0;
-        brandMap.set(b.brandId, cur);
-      }
-      // 股东分红按股东加总（元数据保留首月）
-      for (const sh of d.shareholderDividends ?? []) {
-        const cur = shMap.get(sh.shareholderId) || { ...sh, amount: 0, baseAmount: 0 };
-        cur.amount += sh.amount || 0;
-        cur.baseAmount = (cur.baseAmount || 0) + (sh.baseAmount || 0);
-        shMap.set(sh.shareholderId, cur);
-      }
-      // 商务分红按介绍人加总
-      for (const bz of d.bizDividends ?? []) {
-        const cur = bizMap.get(bz.introducerId) || { ...bz, amount: 0, baseAmount: 0 };
-        cur.amount += bz.amount || 0;
-        cur.baseAmount = (cur.baseAmount || 0) + (bz.baseAmount || 0);
-        bizMap.set(bz.introducerId, cur);
-      }
-    }
-    agg.income.totalIncome = round2(agg.income.totalIncome);
-    agg.income.elecIncome.total = round2(agg.income.elecIncome.total);
-    agg.income.rentIncome.total = round2(agg.income.rentIncome.total);
-    agg.cost.totalCost = round2(agg.cost.totalCost);
-    agg.cost.elecCost = round2(agg.cost.elecCost);
-    agg.cost.rentCost = round2(agg.cost.rentCost);
-    agg.cost.opExpense = round2(agg.cost.opExpense);
-    agg.cost.elecTax = round2(agg.cost.elecTax);
-    agg.cost.rentTax = round2(agg.cost.rentTax);
-    agg.cost.rentRefund = round2(agg.cost.rentRefund);
-    agg.cost.bizDividendCost = round2(agg.cost.bizDividendCost);
-    agg.profit = round2(agg.profit);
-    for (const b of brandMap.values()) {
-      for (const k of ["income", "rentIncome", "elecIncome", "venueCost", "elecCost", "elecTax", "rentTax", "profit"]) b[k] = round2(b[k]);
-    }
-    for (const sh of shMap.values()) sh.amount = round2(sh.amount);
-    for (const bz of bizMap.values()) bz.amount = round2(bz.amount);
-    agg.brandBreakdown = [...brandMap.values()];
-    agg.shareholderDividends = [...shMap.values()];
-    agg.bizDividends = [...bizMap.values()];
-    return agg;
-  }, [stationPreviewQueries]);
-
-  // 股东汇总：为「品牌范围」配置的场地拉取各自的分红预估（按品牌口径计算）
-  const shareholderPreviewLandlords = useMemo(() => {
-    if (viewMode !== "shareholder") return [];
-    const ids = shareholderConfigs.map((c: any) => c.landlordId).filter(Boolean);
-    return [...new Set(ids)] as number[];
-  }, [viewMode, shareholderConfigs]);
-
-  // 股东汇总范围内月份列表（如 2026-07 ~ 2026-08 → ['2026-07','2026-08']）
-  const summaryMonths = useMemo(() => {
-    if (!summaryStartMonth || !summaryEndMonth) return [summaryEndMonth || summaryStartMonth].filter(Boolean);
-    if (summaryStartMonth > summaryEndMonth) return [summaryStartMonth];
-    const months: string[] = [];
-    let [y, m] = summaryStartMonth.split("-").map(Number);
-    const [ey, em] = summaryEndMonth.split("-").map(Number);
-    while (y < ey || (y === ey && m <= em)) {
-      months.push(`${y}-${String(m).padStart(2, "0")}`);
-      m++;
-      if (m > 12) { m = 1; y++; }
-    }
-    return months;
-  }, [summaryStartMonth, summaryEndMonth]);
-
-  // 股东汇总的期间展示标签（起止相同则显示单月）
-  const summaryRangeLabel = useMemo(() => {
-    if (!summaryStartMonth || !summaryEndMonth) return summaryEndMonth || summaryStartMonth || "";
-    return summaryStartMonth === summaryEndMonth ? summaryStartMonth : `${summaryStartMonth} ~ ${summaryEndMonth}`;
-  }, [summaryStartMonth, summaryEndMonth]);
-
-  // 对每个场地 × 范围内每月拉 calculateDividend，按场地加总
-  const shareholderPreviewPairs = useMemo(() => {
-    const pairs: { lid: number; month: string }[] = [];
-    for (const lid of shareholderPreviewLandlords) {
-      for (const month of summaryMonths) {
-        pairs.push({ lid, month });
-      }
-    }
-    return pairs;
-  }, [shareholderPreviewLandlords, summaryMonths]);
-
-  const shareholderPreviews = useQueries({
-    queries: shareholderPreviewPairs.map(({ lid, month }: { lid: number; month: string }) => ({
-      queryKey: ["dividendPreview", lid, month],
-      queryFn: async () => {
-        try {
-          return { lid, month, data: await calculateDividend({ landlordId: lid, period: month }) };
-        } catch {
-          return null;
-        }
-      },
-      enabled: viewMode === "shareholder" && !!month,
-    })),
-  });
-
-  // 按场地聚合范围内各月分红（收入/成本/净利润/品牌明细加总）
-  const shareholderPreviewMap = useMemo(() => {
-    const map = new Map<number, any>();
-    for (const q of shareholderPreviews) {
-      const item = q.data as { lid?: number; month?: string; data?: any } | null | undefined;
-      if (!item || !item.lid || !item.data) continue;
-      const lid = item.lid;
-      const d = item.data;
-      const cur = map.get(lid) || { income: { totalIncome: 0, elecIncome: { total: 0 }, rentIncome: { total: 0 } }, cost: { totalCost: 0, elecCost: 0, rentCost: 0, opExpense: 0, elecTax: 0, rentTax: 0, rentRefund: 0, bizDividendCost: 0 }, profit: 0, brandBreakdown: new Map() };
-      cur.income.totalIncome += d.income?.totalIncome || 0;
-      cur.income.elecIncome.total += d.income?.elecIncome?.total || 0;
-      cur.income.rentIncome.total += d.income?.rentIncome?.total || 0;
-      cur.cost.totalCost += d.cost?.totalCost || 0;
-      cur.cost.elecCost += d.cost?.elecCost || 0;
-      cur.cost.rentCost += d.cost?.rentCost || 0;
-      cur.cost.opExpense += d.cost?.opExpense || 0;
-      cur.cost.elecTax += d.cost?.elecTax || 0;
-      cur.cost.rentTax += d.cost?.rentTax || 0;
-      cur.cost.rentRefund += d.cost?.rentRefund || 0;
-      cur.cost.bizDividendCost += d.cost?.bizDividendCost || 0;
-      cur.profit += d.profit || 0;
-      // 品牌明细加总（按 brandId 累加收入/利润）
-      for (const b of d.brandBreakdown ?? []) {
-        const bcur = cur.brandBreakdown.get(b.brandId) || { brandId: b.brandId, brandName: b.brandName, income: 0, profit: 0 };
-        bcur.income += b.income || 0;
-        bcur.profit += b.profit || 0;
-        cur.brandBreakdown.set(b.brandId, bcur);
-      }
-      map.set(lid, cur);
-    }
-    // 把 Map 转回数组（便于前端 .find）
-    for (const [, v] of map) {
-      v.brandBreakdown = [...v.brandBreakdown.values()];
-    }
-    return map;
-  }, [shareholderPreviews]);
-
-  // 运营费用（月=单月；季度/半年=合并期间各月；v3：按场地 landlordId）
-  const expenseQueries = useQueries({
-    queries: stationPeriodMonths.map((month) => ({
-      queryKey: ["expenses", landlordId, month],
-      queryFn: () => listExpenses({ landlordId: landlordId!, period: month }),
-      enabled: viewMode === "station" && landlordId !== null && !!month,
-    })),
-  });
-  const expenses = useMemo(() => {
-    const merged: any[] = [];
-    for (const q of expenseQueries) {
-      if (q.data) merged.push(...q.data);
-    }
-    return merged;
-  }, [expenseQueries]);
-
-  // 长周期（季度/半年）下：由已拉取的各月数据组成「按月明细」，供下钻查看
-  const stationMonthlyRows = useMemo(() => {
-    if (viewMode !== "station" || stationGranularity === "month") return [];
-    const lid = selectedLandlord?.landlord?.id;
-    return stationPeriodMonths.map((month, i) => {
-      const board = stationBoardQueries[i]?.data ?? [];
-      const row = (Array.isArray(board) ? board : []).find((r: any) => r.landlord?.id === lid);
-      const records = stationDividendQueries[i]?.data ?? [];
-      const preview = stationPreviewQueries[i]?.data ?? null;
-      const shAmount = (preview?.shareholderDividends ?? []).reduce((s: number, d: any) => s + (d.amount || 0), 0);
-      const bizAmount = (preview?.bizDividends ?? []).reduce((s: number, d: any) => s + (d.amount || 0), 0);
-      const recordedAmount = (Array.isArray(records) ? records : []).reduce(
-        (s: number, r: any) => s + (r.shares?.reduce((x: number, sh: any) => x + Number(sh.amount || 0), 0) || 0),
-        0
-      );
-      return {
-        month,
-        totalKwh: row?.totalKwh || 0,
-        elecCollect: row?.elecCollect || 0,
-        elecPay: row?.elecPay || 0,
-        rentIncome: row?.rentIncome || 0,
-        rentCost: row?.rentCost || 0,
-        opExpense: row?.opExpense || 0,
-        totalProfit: row?.totalProfit || 0,
-        shAmount,
-        bizAmount,
-        recordedAmount,
-      };
-    });
-  }, [viewMode, stationGranularity, stationPeriodMonths, selectedLandlord, stationBoardQueries, stationDividendQueries, stationPreviewQueries]);
-
-  const [expenseDraft, setExpenseDraft] = useState({ amount: "", remark: "" });
-  const [editExpenseId, setEditExpenseId] = useState<number | null>(null);
-  const [editExpenseDraft, setEditExpenseDraft] = useState({ amount: "", remark: "" });
-
-  const saveExpenseMut = useMutation({
-    mutationFn: (data: any) => saveExpense(data),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["expenses"] });
-      qc.invalidateQueries({ queryKey: ["dividendPreview"] });
-      qc.invalidateQueries({ queryKey: ["stationBoard"] });
-      setExpenseDraft({ amount: "", remark: "" });
-      toast.success("已保存");
-    },
-    onError: (e: any) => toast.error(e.message || "保存失败"),
-  });
-
-  const deleteExpenseMut = useMutation({
-    mutationFn: (id: number) => deleteExpense(id),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["expenses"] });
-      qc.invalidateQueries({ queryKey: ["dividendPreview"] });
-      qc.invalidateQueries({ queryKey: ["stationBoard"] });
-      toast.success("已删除");
-    },
-    onError: () => toast.error("删除失败"),
-  });
-
-  // 审批相关
-  const [submitApprovalDiv, setSubmitApprovalDiv] = useState<any>(null);
-  // 股东汇总分红记录的多选（待批量提交审批的未结算记录 id）
-  const [selectedApprovalIds, setSelectedApprovalIds] = useState<number[]>([]);
-  const toggleApprovalSelect = useCallback((id: number) => {
-    setSelectedApprovalIds(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
-  }, []);
-  const openBatchApproval = useCallback((dividends: any[]) => {
-    setSubmitApprovalDiv(dividends);
-  }, []);
-
-  const deleteConfigMut = useMutation({
-    mutationFn: async ({ type, id }: { type: "shareholder" | "introducer"; id: number }) => {
-      if (type === "shareholder") return deleteShareholderConfig(id);
-      return deleteIntroducerConfig(id);
-    },
+  const configMutations = useMutation({
+    mutationFn: ({ type, id }: { type: "shareholder" | "introducer"; id: number }) =>
+      type === "shareholder" ? deleteShareholderConfig(id) : deleteIntroducerConfig(id),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["shareholderConfigs"] });
       qc.invalidateQueries({ queryKey: ["introducerConfigs"] });
+      qc.invalidateQueries({ queryKey: ["allShareholderConfigs"] });
       qc.invalidateQueries({ queryKey: ["dividendPreview"] });
-      qc.invalidateQueries({ queryKey: ["stationBoard"] });
       toast.success("配置已删除");
     },
     onError: () => toast.error("删除失败"),
   });
 
-  const isLoading = viewMode === "shareholder" ? shLoading : stLoading;
+  // 提交分红审核
+  const submitMutation = useMutation({
+    mutationFn: (recordId: number) => submitDividend(recordId, {}),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["dividends"] });
+      toast.success("已提交审批，可在「审批」页查看处理进度");
+    },
+    onError: (e: any) => toast.error(e.response?.data?.detail || e.message || "提交失败"),
+  });
 
-  // ─── 导出表格 ───
-  const doExport = useCallback(async () => {
-    if (viewMode === "shareholder") {
-      if (!selectedShareholder) { toast.error("请先选择股东"); return; }
-      const configs = shareholderConfigs;
-      if (!configs || configs.length === 0) { toast.error("该股东暂无分红配置"); return; }
-      // 从配置中提取分红周期作为提示
-      const periods = [...new Set(configs.map((c: any) => c.settlementPeriod || "月"))];
-      const periodText = periods.length === 1
-        ? periods[0] === "月" ? "每月" : periods[0] === "季度" ? "每季度" : periods[0] === "半年" ? "每半年" : "每年"
-        : periods.join("、");
-      setExportHint(`该股东的分红周期为${periodText}，请选择对应的时间段导出`);
-      setExportDateOpen(true);
-    } else {
-      // ── 场地汇总导出：弹窗选择日期范围 ──
-      if (!selectedLandlord) { toast.error("请先选择场地方"); return; }
-      setExportHint(undefined);
-      setExportDateOpen(true);
+  // ── 运营费用（当前选中月 = periodEnd）──
+  const expenses = useQuery({
+    queryKey: ["opExpenses", landlordId, periodEnd],
+    queryFn: () => listExpenses({ landlordId: landlordId!, period: toCompact(periodEnd) }),
+    enabled: viewMode === "landlord" && landlordId != null,
+  });
+  const currentExpense = useMemo(
+    () => (expenses.data ?? []).find((x: any) => x.period === toCompact(periodEnd)) || null,
+    [expenses.data, periodEnd]
+  );
+  const [expenseAmount, setExpenseAmount] = useState("");
+  const [expenseRemark, setExpenseRemark] = useState("");
+  const expenseKeyRef = useRef("");
+  useEffect(() => {
+    const key = `${landlordId}-${periodEnd}`;
+    if (expenseKeyRef.current !== key) {
+      expenseKeyRef.current = key;
+      setExpenseAmount(currentExpense ? String(currentExpense.amount ?? "") : "");
+      setExpenseRemark(currentExpense?.remark ?? "");
     }
-  }, [viewMode, selectedShareholder, shareholderConfigs, selectedLandlord]);
+  }, [landlordId, periodEnd, currentExpense]);
+  const invalidateOpExpense = () => {
+    qc.invalidateQueries({ queryKey: ["opExpenses"] });
+    qc.invalidateQueries({ queryKey: ["dividendPreview"] });
+    qc.invalidateQueries({ queryKey: ["stationBoard"] });
+  };
+  const saveExpenseMutation = useMutation({
+    mutationFn: async () => {
+      if (!landlordId) throw new Error("请先选择场地方");
+      const amount = Number(expenseAmount);
+      if (expenseAmount === "" || isNaN(amount) || amount < 0) throw new Error("请输入有效的运营费用金额");
+      return saveExpense({ landlordId, period: toCompact(periodEnd), amount, remark: expenseRemark.trim() || null });
+    },
+    onSuccess: () => {
+      invalidateOpExpense();
+      toast.success(`已保存 ${toDisplay(periodEnd)} 运营费用`);
+    },
+    onError: (e: any) => toast.error(e.response?.data?.detail || e.message || "保存失败"),
+  });
+  const deleteExpenseMutation = useMutation({
+    mutationFn: (id: number) => deleteExpense(id),
+    onSuccess: () => {
+      invalidateOpExpense();
+      toast.success("运营费用已删除");
+    },
+    onError: (e: any) => toast.error(e.response?.data?.detail || e.message || "删除失败"),
+  });
 
-  // 股东汇总导出（日期范围确认后）
-  const doShareholderExport = useCallback(async (startMonth: string, endMonth: string) => {
-    if (!selectedShareholder) return;
-    setExportDateOpen(false);
-
-    const configs = shareholderConfigs;
-
-    const [startY, startM] = startMonth.split("-").map(Number);
-    const [endY, endM] = endMonth.split("-").map(Number);
-    const numMonths = (endY - startY) * 12 + (endM - startM) + 1;
-
-    // 生成时间段标签
-    let periodLabel: string;
-    if (numMonths === 1) {
-      periodLabel = `${startY}年${startM}月`;
-    } else if (numMonths === 3 && startM % 3 === 1) {
-      const quarter = Math.floor((startM - 1) / 3) + 1;
-      periodLabel = `${startY}年第${quarter}季度`;
-    } else if (numMonths === 6 && (startM === 1 || startM === 7)) {
-      periodLabel = `${startY}年${startM === 1 ? "上" : "下"}半年`;
-    } else if (numMonths === 12 && startM === 1 && endM === 12) {
-      periodLabel = `${startY}年`;
-    } else {
-      periodLabel = `${startMonth}至${endMonth}`;
-    }
-
-    // 生成月份列表
-    const months: string[] = [];
-    let y = startY, m = startM;
-    while (y < endY || (y === endY && m <= endM)) {
-      months.push(`${y}-${String(m).padStart(2, "0")}`);
-      m++;
-      if (m > 12) { m = 1; y++; }
-    }
-
+  // ── 导出 Excel ──
+  const r2x = (n: any) => (n == null || isNaN(Number(n)) ? "" : Math.round(Number(n) * 100) / 100);
+  // 按场地方导出：每个场地一个 sheet，月份为行（参考"XX超级换电站分红"格式）
+  const doExportByLandlord = async () => {
+    if (landlords.length === 0) { toast.error("暂无场地数据"); return; }
+    const tid = toast.loading("正在生成导出数据…");
     try {
-      // 按月查询场地看板数据
-      const monthlyBoards = await Promise.all(
-        months.map(period => getStationBoard({ period }).catch(() => []))
-      );
-
-      // 找到股东的占股比例
-      const shRatio = configs[0]?.ratio ?? 0;
-
-      const header1 = [
-        "项目", "场地名称", "收付款情况", "", "", "", "", "", "",
-        "分红明细", "",
-      ];
-      const header2 = [
-        "", "", "柜子\n数量", "收款周期", "单柜月收入", "年租金\n收入", "月租金", `${numMonths}个月租金`, "商务分红（流水10%）",
-        "应分红金额", selectedShareholder.name,
-      ];
-
-      const allRows: any[][] = [];
-
-      for (const cfg of configs) {
-        // 从任意一个月的 board 中取场地基本信息（这些跨月不变；v3：board 已按场地方分组）
-        let stationData: any = null;
-        for (const board of monthlyBoards) {
-          stationData = (board ?? []).find((r: any) => r.landlord?.id === cfg.landlordId);
-          if (stationData) break;
+      const sheets: { name: string; title: string; headers: string[]; rows: unknown[][] }[] = [];
+      for (const r of landlords) {
+        const lid = r.landlord.id;
+        const datas: any[] = [];
+        for (const m of monthsInRange) {
+          datas.push(await calculateDividend({ landlordId: lid, period: m, estimate: true }));
         }
-        const stationName = cfg.landlordName || stationData?.landlord?.name || `场地#${cfg.landlordId}`;
-        const brandContract = stationData?.contractBreakdown?.find((c: any) => c.type === "品牌方合同");
-        const partner = brandContract?.partner || stationData?.landlord?.name || "";
-        const cabinets = brandContract?.cabinetsCount || stationData?.meterCount || 0;
-        const monthlyRent = brandContract?.monthlyRent || stationData?.rentIncome || 0;
-
-
-        // 汇总所选月数的租金
-        const periodRent = monthlyRent * numMonths;
-        const annualRent = monthlyRent * 12;
-        const bizDividend = Math.round(periodRent * 0.1 * 100) / 100;
-        const netDividend = Math.round((periodRent - bizDividend) * 100) / 100;
-        const shAmount = Math.round(netDividend * shRatio * 100) / 100;
-
-        allRows.push([
-          partner,
-          cfg.brandName ? `${stationName}（${cfg.brandName}）` : stationName,
-          cabinets, "", monthlyRent, annualRent, monthlyRent, periodRent, bizDividend,
-          netDividend, shAmount,
-        ]);
+        // 分红人列（股东 + 商务，跨月并集）
+        const personCols: string[] = [];
+        const personMap = new Map<string, "shareholderId" | "introducerId">();
+        for (const d of datas) {
+          for (const x of d?.shareholderDividends ?? []) if (!personMap.has(x.shareholderName)) { personMap.set(x.shareholderName, "shareholderId"); }
+          for (const x of d?.bizDividends ?? []) if (!personMap.has(x.introducerName)) { personMap.set(x.introducerName, "introducerId"); }
+        }
+        personCols.push(...personMap.keys());
+        const headers = ["分红月份", "电量", "付款单价", "付款金额", "收款电费含税", "电费不含税", "收款租金含税", "租金不含税", "电费租金收款合计", "利润", ...personCols, "备注"];
+        const rows: unknown[][] = [];
+        const totals: Record<string, number> = { 电量: 0, 付款金额: 0, 收款电费含税: 0, 电费不含税: 0, 收款租金含税: 0, 租金不含税: 0, 电费租金收款合计: 0, 利润: 0 };
+        monthsInRange.forEach((m, i) => {
+          const d = datas[i];
+          if (!d) return;
+          const kwh = (d.income?.elecIncome?.details ?? []).reduce((s: number, x: any) => s + (x.kwh || 0), 0);
+          const elecGross = (d.income?.elecIncome?.details ?? []).reduce((s: number, x: any) => s + (x.kwh || 0) * (x.unitPrice || 0), 0);
+          const rentGross = (d.income?.rentIncome?.details ?? []).reduce((s: number, x: any) => s + (x.preTaxRent || 0), 0);
+          const payPrice = d.cost?.details?.electricity?.[0]?.unitPrice;
+          const row: unknown[] = [
+            toDisplay(m),
+            r2x(kwh),
+            r2x(payPrice),
+            r2x(d.cost?.elecCost),
+            r2x(elecGross),
+            r2x(d.income?.elecIncome?.total),
+            r2x(rentGross),
+            r2x(d.income?.rentIncome?.total),
+            r2x(d.income?.totalIncome),
+            r2x(d.profit),
+          ];
+          personCols.forEach((name) => {
+            const kind = personMap.get(name)!;
+            const list = kind === "shareholderId" ? d.shareholderDividends ?? [] : d.bizDividends ?? [];
+            const amt = list.filter((x: any) => (kind === "shareholderId" ? x.shareholderName : x.introducerName) === name)
+              .reduce((s: number, x: any) => s + (x.amount || 0), 0);
+            row.push(r2x(amt));
+            totals[name] = (totals[name] || 0) + (amt || 0);
+          });
+          row.push("");
+          rows.push(row);
+          totals.电量 += kwh; totals.付款金额 += (d.cost?.elecCost || 0);
+          totals.收款电费含税 += elecGross; totals.电费不含税 += (d.income?.elecIncome?.total || 0);
+          totals.收款租金含税 += rentGross; totals.租金不含税 += (d.income?.rentIncome?.total || 0);
+          totals.电费租金收款合计 += (d.income?.totalIncome || 0); totals.利润 += (d.profit || 0);
+        });
+        // 合计行
+        const sumRow: unknown[] = ["合计", r2x(totals.电量), "", r2x(totals.付款金额), r2x(totals.收款电费含税), r2x(totals.电费不含税), r2x(totals.收款租金含税), r2x(totals.租金不含税), r2x(totals.电费租金收款合计), r2x(totals.利润)];
+        personCols.forEach((name) => sumRow.push(r2x(totals[name])));
+        sumRow.push("");
+        rows.push(sumRow);
+        // 无数据检测：除首列（月份/合计）外所有数值全为 0/空 → 该场地该区间无台账数据
+        const hasData = rows.some((r) => r.slice(1, 10).some((v) => typeof v === "number" && v !== 0));
+        if (!hasData) {
+          toast.dismiss(tid);
+          toast.warning(`${r.landlord.name}：所选月份区间（${periodLabel}）无台账数据，导出已跳过该场地`);
+          continue;
+        }
+        sheets.push({ name: r.landlord.name, title: `${periodLabel} ${r.landlord.name} 分红明细表`, headers, rows });
       }
-
-      // 合计行
-      const sumCabinets = allRows.reduce((s, r) => s + (Number(r[2]) || 0), 0);
-      const sumMonthly = allRows.reduce((s, r) => s + (Number(r[4]) || 0), 0);
-      const sumAnnual = allRows.reduce((s, r) => s + (Number(r[5]) || 0), 0);
-      const sumPeriodRent = allRows.reduce((s, r) => s + (Number(r[7]) || 0), 0);
-      const sumBiz = allRows.reduce((s, r) => s + (Number(r[8]) || 0), 0);
-      const sumNet = allRows.reduce((s, r) => s + (Number(r[9]) || 0), 0);
-      const sumSH = allRows.reduce((s, r) => s + (Number(r[10]) || 0), 0);
-      allRows.push(["合计", "", sumCabinets, "", sumMonthly, sumAnnual, sumMonthly, sumPeriodRent, sumBiz, sumNet, sumSH]);
-
-      // 备注和签名行
-      allRows.push(["备注："]);
-      allRows.push(["集冠科技负责人：", "", "", "", "", "", "", "", "", "", "来换电负责人："]);
-
-      const aoa = [
-        [`集冠科技&来换电合作场地${periodLabel}租金分红表`],
-        header1,
-        header2,
-        ...allRows,
-      ];
-
-      const ws = XLSX.utils.aoa_to_sheet(aoa);
-      ws["!merges"] = [
-        { s: { r: 0, c: 0 }, e: { r: 0, c: 10 } }, // 标题
-        { s: { r: 1, c: 0 }, e: { r: 2, c: 0 } }, // 项目
-        { s: { r: 1, c: 1 }, e: { r: 2, c: 1 } }, // 场地名称
-        { s: { r: 1, c: 2 }, e: { r: 1, c: 8 } }, // 收付款情况
-        { s: { r: 1, c: 9 }, e: { r: 1, c: 10 } }, // 分红明细
-        { s: { r: 3 + allRows.length - 3, c: 0 }, e: { r: 3 + allRows.length - 3, c: 1 } }, // 合计
-        { s: { r: 3 + allRows.length - 1, c: 0 }, e: { r: 3 + allRows.length - 1, c: 8 } }, // 备注
-      ];
-      ws["!cols"] = [
-        { wch: 14 }, { wch: 18 }, { wch: 8 }, { wch: 14 }, { wch: 12 },
-        { wch: 12 }, { wch: 10 }, { wch: 14 }, { wch: 18 }, { wch: 14 }, { wch: 12 },
-      ];
-
-      const wb = XLSX.utils.book_new();
-      XLSX.utils.book_append_sheet(wb, ws, "分红表");
-      XLSX.writeFile(wb, `${periodLabel}${selectedShareholder.name}分红表.xlsx`);
-      toast.success("导出成功");
+      if (sheets.length === 0) {
+        toast.dismiss(tid);
+        toast.error("所选月份区间无任何台账数据，请调整月份后重试");
+        return;
+      }
+      exportXlsxWithTitles(`分红明细_${periodLabel.replace(/[~年]/g, "")}`, sheets);
+      toast.dismiss(tid);
+      toast.success("已导出 Excel");
     } catch (e: any) {
-      toast.error("导出失败：" + (e.message || "未知错误"));
+      toast.dismiss(tid);
+      toast.error(`导出失败：${e?.response?.data?.detail || e?.message || "未知错误"}`);
     }
-  }, [selectedShareholder, shareholderConfigs]);
-
-  // 场地汇总导出（日期范围确认后）
-  const doStationExport = useCallback(async (startMonth: string, endMonth: string) => {
-    if (!selectedLandlord) return;
-    setExportDateOpen(false);
-
-    const [startY, startM] = startMonth.split("-").map(Number);
-    const [endY, endM] = endMonth.split("-").map(Number);
-
-    // 生成月份列表
-    const months: string[] = [];
-    let y = startY, m = startM;
-    while (y < endY || (y === endY && m <= endM)) {
-      months.push(`${y}-${String(m).padStart(2, "0")}`);
-      m++;
-      if (m > 12) { m = 1; y++; }
-    }
-
-    // 获取所有股东（从 configs 中提取）
-    const lid = landlordId;
-    if (!lid) { toast.error("请先选择场地方"); return; }
-
-    const configs = shConfigs ?? [];
-    const shareholders = configs.map((c: any) => ({
-      id: c.shareholderId,
-      name: c.shareholderName,
-      ratio: c.ratio || 0,
-      brandName: c.brandName || "",
-    }));
-
-    if (shareholders.length === 0) { toast.error("暂无股东分红配置"); return; }
-
+  };
+  // 按股东导出：该股东涉及场地为列，指标为行（参考"刘洋分红表"格式）
+  const doExportByShareholder = async () => {
+    const lids = shareholderLandlordIds;
+    if (!selectedShareholder || lids.length === 0) { toast.error("该股东暂无分红配置"); return; }
+    const tid = toast.loading("正在生成导出数据…");
     try {
-      // 获取合同信息
-      const contracts = await listContracts({ landlordId: selectedLandlord.landlord.id });
-      // 场地合同（付款方）
-      const siteContract = contracts.find((c: any) => c.contractType === "场地合同");
-      const payUnitPrice = siteContract ? Number(siteContract.electricityPrice || 0) : 0;
-      // 品牌方合同（收款方）
-      const brandContracts = contracts.filter((c: any) => c.contractType === "品牌方合同");
-      const collectUnitPrice = brandContracts.length > 0 ? Number(brandContracts[0].electricityPrice || 0) : 0;
-
-      // 获取场地下所有电表的 meter_no（v3：按 landlordId 查电表）
-      const meters = await listMeters({ landlordId: lid });
-      const meterNos = (Array.isArray(meters) ? meters : meters?.meters || []).map((m: any) => m.meterNo || m.meter_no).filter(Boolean);
-
-      // 并行获取所有月份的分红数据、场地看板数据和电表读数
-      const [monthlyResults, monthlyBoardResults, ...meterReadings] = await Promise.all([
-        Promise.all(months.map(period => listDividends({ landlordId: lid, period }))),
-        Promise.all(months.map(period => getStationBoard({ period }))),
-        // 每个电表的月度读数
-        ...meterNos.map((meterNo: string) => getMonthlyKwh({ meterNo, startMonth: toCompact(months[0]), endMonth: toCompact(months[months.length - 1]) })),
-      ]);
-
-      // 处理每月数据
-      const monthlyData = months.map((period, idx) => {
-        const records = monthlyResults[idx] || [];
-        const boardData = monthlyBoardResults[idx] || [];
-        const shAmounts: Record<number, number> = {};
-
-        // 从电表读数获取该月总度数
-        const monthPeriod = toCompact(period); // YYYY-MM -> YYYYMM
-        let totalKwh = 0;
-        for (const readings of meterReadings) {
-          if (Array.isArray(readings)) {
-            const monthReading = readings.find((r: any) => r.monthPeriod === monthPeriod);
-            if (monthReading) {
-              totalKwh += Number(monthReading.kwh || 0);
-            }
-          }
+      const aggRows: { name: string; agg: any }[] = [];
+      const totals = { kwh: 0, pay: 0, collectNet: 0, profit: 0, biz: 0, mine: 0 };
+      for (const lid of lids) {
+        const agg = { kwh: 0, pay: 0, collectNet: 0, profit: 0, biz: 0, mine: 0 };
+        for (const m of monthsInRange) {
+          const d = await calculateDividend({ landlordId: lid, period: m, estimate: true });
+          agg.kwh += (d.income?.elecIncome?.details ?? []).reduce((s: number, x: any) => s + (x.kwh || 0), 0);
+          agg.pay += d.cost?.elecCost || 0;
+          agg.collectNet += d.income?.totalIncome || 0;
+          agg.profit += d.profit || 0;
+          agg.biz += (d.bizDividends ?? []).reduce((s: number, x: any) => s + (x.amount || 0), 0);
+          agg.mine += (d.shareholderDividends ?? []).filter((x: any) => x.shareholderId === selectedShareholder.id)
+            .reduce((s: number, x: any) => s + (x.amount || 0), 0);
         }
-
-        // 付款金额 = 度数 × 场地合同电费单价
-        const payAmount = Math.round(totalKwh * payUnitPrice * 100) / 100;
-
-        // 收款电费含税金额 = 度数 × 品牌方合同电费单价
-        const collectAmount = Math.round(totalKwh * collectUnitPrice * 100) / 100;
-        // 电费不含税金额 = 收款电费含税 / 1.01
-        const collectNet = Math.round(collectAmount / 1.01 * 100) / 100;
-
-        // 从分红记录获取股东分红金额
-        for (const r of records) {
-          for (const s of r.shares || []) {
-            if (s.shareholderId) {
-              shAmounts[s.shareholderId] = (shAmounts[s.shareholderId] || 0) + Number(s.amount || 0);
-            }
-          }
-        }
-
-        // 租金数据从每月的 stationBoard 获取（按场地方匹配）
-        let rentAmount = 0, rentNet = 0;
-        const landlordBoard = boardData.find((b: any) => b.landlord?.id === selectedLandlord.landlord.id);
-        if (landlordBoard && records.length > 0) {
-          rentAmount = landlordBoard.rentIncome || 0;
-          rentNet = Math.round(rentAmount / 1.01 * 100) / 100;
-        }
-
-        // 电费租金收款合计 = 电费不含税 + 租金不含税 - 500（陈俊文垫付）
-        const totalCollect = Math.round((collectNet + rentNet - 500) * 100) / 100;
-        const profit = Math.round((totalCollect - payAmount) * 100) / 100;
-
-        return { totalKwh, payUnitPrice, payAmount, collectAmount, collectNet, rentAmount, rentNet, totalCollect, profit, shAmounts };
+        aggRows.push({ name: landlords.find((x: any) => x.landlord.id === lid)?.landlord?.name || `场地#${lid}`, agg });
+        for (const k of Object.keys(totals) as (keyof typeof totals)[]) totals[k] += agg[k];
+      }
+      const headers = ["指标", ...aggRows.map((x) => x.name), "合计"];
+      const mkRow = (label: string, pick: (a: any) => number) => [
+        label, ...aggRows.map((x) => r2x(pick(x.agg))), r2x(pick(totals)),
+      ];
+      const rows: unknown[][] = [
+        mkRow("用电度数", (a) => a.kwh),
+        mkRow("付款金额（电费成本）", (a) => a.pay),
+        mkRow("收款金额（不含税）", (a) => a.collectNet),
+        mkRow("利润", (a) => a.profit),
+        mkRow("商务分红（介绍人）", (a) => a.biz),
+        mkRow(`${selectedShareholder.name} 应分红金额`, (a) => a.mine),
+      ];
+      const hasData = aggRows.some((x) => Object.values(x.agg).some((v) => Number(v) !== 0));
+      if (!hasData) {
+        toast.dismiss(tid);
+        toast.warning(`所选月份区间（${periodLabel}）无台账数据，请调整月份后重试`);
+        return;
+      }
+      exportXlsxWithTitle(`分红表_${selectedShareholder.name}_${periodLabel.replace(/[~年]/g, "")}`, {
+        sheetName: "分红明细",
+        title: `${periodLabel} ${selectedShareholder.name} 分红表（按股东）`,
+        headers,
+        rows,
       });
-
-      // 构建 Excel - 参照参考文件格式
-      const title = `${months[0].split("-")[0]}年${selectedLandlord.landlord.name}项目分红明细表`;
-      const numSH = shareholders.length;
-      // 第1行：标题
-      const titleRow = [title];
-      // 第2行：分组标题
-      const header1 = [
-        "分红月份", "付款情况", "", "", "收款情况", "", "", "", "", "利润", "分红明细",
-        ...shareholders.map(() => ""), "备注",
-      ];
-      // 第3行：细分列标题
-      const header2 = [
-        "", "电量", "付款单价（元/度）", "付款金额（元）",
-        "收款电费含税金额（元）", "电费不含税金额1%（元）", "收款租金含税金额（元）", "收款租金不含税金额1%（元）", "电费租金收款合计",
-        "", "",
-        ...shareholders.map((s: any) => (s.brandName ? `${s.name}（${s.brandName}）` : s.name)), "",
-      ];
-      // 第4行：分红比例
-      const header3 = [
-        "", "", "", "", "", "", "", "", "",
-        "", "",
-        ...shareholders.map((s: any) => s.ratio), "",
-      ];
-
-      const allRows: any[][] = [];
-      let sumKwh = 0, sumPay = 0, sumCollect = 0, sumCollectNet = 0, sumRent = 0, sumRentNet = 0, sumTotal = 0;
-      const sumSH: Record<number, number> = {};
-
-      for (let i = 0; i < months.length; i++) {
-        const d = monthlyData[i];
-        const monthLabel = `${months[i].split("-")[1]}月`;
-        allRows.push([
-          monthLabel, d.totalKwh || "", d.payUnitPrice || "", d.payAmount || "",
-          d.collectAmount || "", d.collectNet || "", d.rentAmount || "", d.rentNet || "", d.totalCollect || "",
-          d.profit || "",
-          "", // 分红明细空列（K列）
-          ...shareholders.map((s: any) => d.shAmounts[s.id] || ""), "",
-        ]);
-        sumKwh += d.totalKwh; sumPay += d.payAmount; sumCollect += d.collectAmount;
-        sumCollectNet += d.collectNet; sumRent += d.rentAmount; sumRentNet += d.rentNet; sumTotal += d.totalCollect;
-        for (const s of shareholders) {
-          sumSH[s.id] = (sumSH[s.id] || 0) + (d.shAmounts[s.id] || 0);
-        }
-      }
-
-      // 合计行
-      allRows.push([
-        "合计", sumKwh || "", "", sumPay || "",
-        sumCollect || "", sumCollectNet || "", sumRent || "", sumRentNet || "", sumTotal || "",
-        "", "",
-        ...shareholders.map((s: any) => sumSH[s.id] || ""), "",
-      ]);
-
-      // 构建 aoa：标题行 + 3行表头 + 数据行
-      const aoa = [titleRow, header1, header2, header3, ...allRows];
-      const ws = XLSX.utils.aoa_to_sheet(aoa);
-      // 列索引：A=0,B=1,...,J=9,K=10,L=11,...,P=11+numSH
-      const lastSHCol = 10 + numSH; // 最后一个股东列
-      const remarkCol = lastSHCol + 1; // 备注列
-      ws["!merges"] = [
-        { s: { r: 0, c: 0 }, e: { r: 0, c: remarkCol } }, // 标题合并整行
-        { s: { r: 1, c: 0 }, e: { r: 3, c: 0 } }, // 分红月份（A2:A4）
-        { s: { r: 1, c: 1 }, e: { r: 1, c: 3 } }, // 付款情况（B2:D2）
-        { s: { r: 1, c: 4 }, e: { r: 1, c: 8 } }, // 收款情况（E2:I2）
-        { s: { r: 1, c: 9 }, e: { r: 3, c: 9 } }, // 利润（J2:J4）
-        { s: { r: 1, c: 10 }, e: { r: 3, c: 10 } }, // 分红明细空列（K2:K4）
-        { s: { r: 1, c: 11 }, e: { r: 1, c: lastSHCol } }, // 分红明细（L2:O2）
-        { s: { r: 1, c: remarkCol }, e: { r: 3, c: remarkCol } }, // 备注（P2:P4）
-        { s: { r: 2, c: 1 }, e: { r: 3, c: 1 } }, // 电量（B3:B4）
-        { s: { r: 2, c: 2 }, e: { r: 3, c: 2 } }, // 付款单价（C3:C4）
-        { s: { r: 2, c: 3 }, e: { r: 3, c: 3 } }, // 付款金额（D3:D4）
-        { s: { r: 2, c: 4 }, e: { r: 3, c: 4 } }, // 收款电费含税（E3:E4）
-        { s: { r: 2, c: 5 }, e: { r: 3, c: 5 } }, // 电费不含税（F3:F4）
-        { s: { r: 2, c: 6 }, e: { r: 3, c: 6 } }, // 收款租金含税（G3:G4）
-        { s: { r: 2, c: 7 }, e: { r: 3, c: 7 } }, // 收款租金不含税（H3:H4）
-        { s: { r: 2, c: 8 }, e: { r: 3, c: 8 } }, // 电费租金收款合计（I3:I4）
-      ];
-      // 每个股东名字列单独不合并（第3行是名字，第4行是比例）
-      ws["!cols"] = [
-        { wch: 10 }, { wch: 12 }, { wch: 16 }, { wch: 14 },
-        { wch: 20 }, { wch: 20 }, { wch: 18 }, { wch: 20 }, { wch: 18 },
-        { wch: 12 }, { wch: 10 },
-        ...shareholders.map(() => ({ wch: 14 })), { wch: 30 },
-      ];
-
-      const wb = XLSX.utils.book_new();
-      XLSX.utils.book_append_sheet(wb, ws, "分红明细汇总");
-      XLSX.writeFile(wb, `${months[0].split("-")[0]}年${selectedLandlord.landlord.name}分红明细表.xlsx`);
-      toast.success("导出成功");
+      toast.dismiss(tid);
+      toast.success("已导出 Excel");
     } catch (e: any) {
-      toast.error("导出失败：" + (e.message || "未知错误"));
+      toast.dismiss(tid);
+      toast.error(`导出失败：${e?.response?.data?.detail || e?.message || "未知错误"}`);
     }
-  }, [selectedLandlord, landlordId, shConfigs]);
+  };
+
+  // 渲染：受益人预估行
+  const openBeneficiaryDetail = (d: any, kind: "股东" | "介绍人") => {
+    setDetail({
+      open: true,
+      personKey: kind === "股东" ? "shareholderId" : "introducerId",
+      personId: kind === "股东" ? (d.shareholderId ?? null) : (d.introducerId ?? null),
+      personName: d.shareholderName || d.introducerName || "",
+      landlordName: selectedLandlord?.landlord?.name || "",
+      months: monthsInRange,
+      monthDatas: previewQueries.map((q) => q.data),
+    });
+  };
+  const renderBeneficiary = (d: any, kind: "股东" | "介绍人") => {
+    const isSettlement = d.isSettlementMonth;
+    return (
+      <div key={`${kind}-${d.shareholderId ?? d.introducerId}-${d.brandId ?? "all"}`}
+        className="flex items-center justify-between border-b last:border-0 px-3 py-2 text-xs">
+        <div className="flex items-center gap-2">
+          <span className="font-medium text-slate-700">{d.shareholderName || d.introducerName}</span>
+          {d.brandName && <span className="rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] text-amber-700">{d.brandName}</span>}
+          {!d.brandName && <span className="rounded-full bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-500">全场</span>}
+          <span className="text-slate-400">{d.mode === "固定金额" ? `固定 ${fmtMoney(d.fixedAmount)}/月` : `${d.mode} ${(d.ratio * 100).toFixed(1)}%`}</span>
+          <span className="text-slate-400">{d.settlementPeriod}分红</span>
+          {d.countAsCost && <span className="rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] text-amber-700">计入成本</span>}
+        </div>
+        <div className="flex items-center gap-3">
+          <span className="text-slate-500">{isRange ? "区间预估" : "本月预估"} <b className="tabular-nums text-slate-700">{fmtMoney(d.amount)}</b></span>
+          {isSettlement ? (
+            <span className="rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] text-emerald-700">{isRange ? "含结算月" : "结算月"}</span>
+          ) : (
+            <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] text-amber-700">{isRange ? "未到结算月" : "累计中"}</span>
+          )}
+          <button onClick={() => openBeneficiaryDetail(d, kind)} className="rounded-md border border-blue-200 bg-blue-50 px-2 py-1 text-[10px] text-blue-700 hover:bg-blue-100">核算明细</button>
+        </div>
+      </div>
+    );
+  };
 
   return (
     <div className="flex h-[calc(100vh-120px)] gap-0">
       {/* ─── 左侧面板 ─── */}
-      <div className="w-64 shrink-0 flex flex-col border-r bg-white rounded-l-xl overflow-hidden">
-        {/* 顶部操作栏 */}
+      <div className="w-64 shrink-0 flex flex-col border-r bg-white rounded-l-xl overflow-visible relative z-20">
         <div className="border-b p-3 space-y-2">
           <div className="flex items-center justify-between">
             <select
               className="text-xs font-semibold text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-md px-2 py-1 focus:outline-none"
               value={viewMode}
-              onChange={(e) => { setViewMode(e.target.value as any); setSelectedId(null); }}
+              onChange={(e) => { setViewMode(e.target.value as any); setSelectedLandlordId(null); setSelectedShareholderId(null); }}
             >
-              <option value="shareholder">股东汇总</option>
-              <option value="station">场地汇总</option>
+              <option value="landlord">按场地方</option>
+              <option value="shareholder">按股东</option>
             </select>
             {viewMode === "shareholder" && (
               <button onClick={() => setAddShareholderOpen(true)} className="flex items-center gap-1 rounded-md bg-emerald-600 px-2 py-1 text-[11px] text-white hover:bg-emerald-700">
-                <UserPlus className="h-3 w-3" />
-                新增
+                <UserPlus className="h-3 w-3" />新增
               </button>
             )}
           </div>
-          {viewMode === "shareholder" ? (
-            <div className="space-y-1.5">
-              <div className="text-[10px] font-medium text-slate-400">分红期间（起~止）</div>
-              {/* 快捷范围：本月/本季度/本半年 */}
-              <div className="flex gap-1 rounded-md bg-slate-100 p-0.5">
-                {(["month", "quarter", "halfYear"] as const).map((g) => (
-                  <button
-                    key={g}
-                    onClick={() => setSummaryRange(g)}
-                    className={`flex-1 rounded px-1 py-0.5 text-[10px] font-medium transition-colors ${summaryPresetActive(g) ? "bg-white text-emerald-700 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}
-                  >
-                    {g === "month" ? "本月" : g === "quarter" ? "本季度" : "本半年"}
-                  </button>
-                ))}
-              </div>
-              <div className="space-y-1">
-                <MonthPicker value={summaryStartMonth} onChange={setSummaryStartMonth} className="w-full" />
-                <MonthPicker value={summaryEndMonth} onChange={setSummaryEndMonth} className="w-full" />
-              </div>
+          <div className="space-y-1.5">
+            <div className="flex items-center gap-2">
+              <span className="w-11 shrink-0 text-[10px] text-slate-400">起始月</span>
+              <MonthPicker value={periodStart} onChange={setPeriodStart} className="flex-1" align="right" />
             </div>
-          ) : (
-            <div className="space-y-1.5">
-              <div className="flex gap-1 rounded-md bg-slate-100 p-0.5">
-                {(["month", "quarter", "halfYear"] as const).map((g) => (
-                  <button
-                    key={g}
-                    onClick={() => setStationGranularity(g)}
-                    className={`flex-1 rounded px-1 py-0.5 text-[10px] font-medium transition-colors ${stationGranularity === g ? "bg-white text-emerald-700 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}
-                  >
-                    {g === "month" ? "月" : g === "quarter" ? "季度" : "半年"}
-                  </button>
-                ))}
-              </div>
-              <MonthPicker value={selectedMonth} onChange={setSelectedMonth} className="w-full" />
-              {stationGranularity !== "month" && selectedMonth && (
-                <div className="text-[10px] font-medium text-slate-400">
-                  {stationPeriodLabel}（{stationPeriodMonths[0]} ~ {stationPeriodMonths[stationPeriodMonths.length - 1]}）
-                </div>
-              )}
+            <div className="flex items-center gap-2">
+              <span className="w-11 shrink-0 text-[10px] text-slate-400">结束月</span>
+              <MonthPicker value={periodEnd} onChange={setPeriodEnd} className="flex-1" align="right" />
             </div>
-          )}
+            <div className="flex gap-1 pt-1">
+              <button onClick={() => quickRange(1)} className="rounded-md border border-slate-200 px-2 py-1 text-[10px] text-slate-500 hover:border-emerald-400 hover:text-emerald-600">本月</button>
+              <button onClick={() => quickRange(3)} className="rounded-md border border-slate-200 px-2 py-1 text-[10px] text-slate-500 hover:border-emerald-400 hover:text-emerald-600">近3月</button>
+              <button onClick={() => quickRange(6)} className="rounded-md border border-slate-200 px-2 py-1 text-[10px] text-slate-500 hover:border-emerald-400 hover:text-emerald-600">近6月</button>
+              {isRange && <span className="ml-auto self-center rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] text-emerald-600">区间 {monthsInRange.length} 个月</span>}
+            </div>
+          </div>
         </div>
 
-        {/* 列表 */}
         <div className="flex-1 overflow-y-auto">
-          {viewMode === "shareholder" ? (
-            allShareholders.length === 0 ? (
-              <div className="p-4 text-center text-xs text-slate-400">暂无股东</div>
-            ) : (
-              allShareholders.map((sh) => (
-                <button
-                  key={sh.id}
-                  onClick={() => setSelectedId(sh.id)}
-                  className={`flex w-full items-center gap-2 border-b px-3 py-2.5 text-left text-xs transition-colors ${selectedId === sh.id ? "bg-emerald-50 border-l-2 border-l-emerald-500" : "hover:bg-slate-50"}`}
-                >
-                  <Users className="h-4 w-4 shrink-0 text-slate-400" />
-                  <div className="min-w-0 flex-1">
-                    <div className="font-medium text-slate-800 truncate">{sh.name}</div>
-                    {sh.hasRecords ? (
-                      <div className="text-[11px] text-slate-400">{fmtMoney(sh.totalAmount)} · {sh.details?.length || 0} 条记录</div>
-                    ) : (
-                      <div className="text-[11px] text-slate-300">暂无分红</div>
-                    )}
-                  </div>
-                </button>
-              ))
-            )
-          ) : (
-            stationRows.length === 0 ? (
+          {viewMode === "landlord" ? (
+            landlords.length === 0 ? (
               <div className="p-4 text-center text-xs text-slate-400">暂无场地</div>
             ) : (
-              stationRows.map((r: any) => (
+              landlords.map((r: any) => (
                 <button
                   key={r.landlord.id}
-                  onClick={() => setSelectedId(r.landlord.id)}
-                  className={`flex w-full items-center gap-2 border-b px-3 py-2.5 text-left text-xs transition-colors ${selectedId === r.landlord.id ? "bg-emerald-50 border-l-2 border-l-emerald-500" : "hover:bg-slate-50"}`}
+                  onClick={() => setSelectedLandlordId(r.landlord.id)}
+                  className={`flex w-full items-center gap-2 border-b px-3 py-2.5 text-left text-xs transition-colors ${selectedLandlordId === r.landlord.id ? "bg-emerald-50 border-l-2 border-l-emerald-500" : "hover:bg-slate-50"}`}
                 >
                   <MapPin className="h-4 w-4 shrink-0 text-slate-400" />
                   <div className="min-w-0 flex-1">
                     <div className="font-medium text-slate-800 truncate">{r.landlord.name}</div>
                     <div className="text-[11px] text-slate-400">
-                      {r.meterCount > 0 ? (
-                        <>电表 {r.meterCount} · 总利润 <span className={r.totalProfit >= 0 ? "text-emerald-600" : "text-rose-600"}>{fmtMoney(r.totalProfit)}</span></>
-                      ) : (
-                        <span className="text-slate-300">暂无数据</span>
-                      )}
+                      {isRange ? "末月利润" : "总利润"} <span className={r.totalProfit >= 0 ? "text-emerald-600" : "text-rose-600"}>{fmtMoney(r.totalProfit)}</span>
                     </div>
                   </div>
                 </button>
               ))
             )
+          ) : (
+            (shareholders.data ?? []).length === 0 ? (
+              <div className="p-4 text-center text-xs text-slate-400">暂无股东</div>
+            ) : (
+              (shareholders.data ?? []).map((sh: any) => {
+                const sum = (shSummary.data ?? []).find((s: any) => s.shareholderId === sh.id);
+                return (
+                  <button
+                    key={sh.id}
+                    onClick={() => setSelectedShareholderId(sh.id)}
+                    className={`flex w-full items-center gap-2 border-b px-3 py-2.5 text-left text-xs transition-colors ${selectedShareholderId === sh.id ? "bg-emerald-50 border-l-2 border-l-emerald-500" : "hover:bg-slate-50"}`}
+                  >
+                    <Users className="h-4 w-4 shrink-0 text-slate-400" />
+                    <div className="min-w-0 flex-1">
+                      <div className="font-medium text-slate-800 truncate">{sh.name}</div>
+                      <div className="text-[11px] text-slate-400">
+                        {sum ? `${isRange ? "区间分红" : "本月分红"} ${fmtMoney(sum.totalAmount)}` : "暂无分红"}
+                      </div>
+                    </div>
+                  </button>
+                );
+              })
+            )
           )}
         </div>
       </div>
 
-      {/* ─── 右侧详情面板 ─── */}
+      {/* ─── 右侧详情 ─── */}
       <div className="flex-1 overflow-y-auto rounded-r-xl bg-slate-50 p-4">
-        {isLoading ? (
-          <div className="flex h-full items-center justify-center text-sm text-slate-400">加载中…</div>
-        ) : viewMode === "shareholder" ? (
-          // ─── 股东汇总详情 ───
-          !selectedShareholder ? (
-            <div className="flex h-full flex-col items-center justify-center text-slate-400">
-              <Users className="h-10 w-10 mb-2 text-slate-300" />
-              <div className="text-sm">请从左侧选择股东</div>
-            </div>
-          ) : (
-            <div className="space-y-4">
-              {/* 导出按钮 */}
-              <div className="flex justify-end">
-                <button onClick={doExport} className="flex items-center gap-1.5 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-1.5 text-xs text-emerald-700 hover:bg-emerald-100 transition-colors">
-                  <Download className="h-3.5 w-3.5" />
-                  导出表格
-                </button>
-              </div>
-              {/* 股东信息卡片 */}
-              <div className="rounded-xl border bg-white p-4">
-                <div className="flex items-center gap-3 mb-3">
-                  <div className="flex h-10 w-10 items-center justify-center rounded-full bg-emerald-100 text-emerald-600">
-                    <Users className="h-5 w-5" />
-                  </div>
-                  <div>
-                    <div className="text-sm font-semibold text-slate-800">{selectedShareholder.name}</div>
-                    {selectedShareholder.phone && <div className="text-xs text-slate-400">{selectedShareholder.phone}</div>}
-                  </div>
-                </div>
-                <div className="grid grid-cols-3 gap-3">
-                  <div className="rounded-lg bg-blue-50 border border-blue-100 px-3 py-2">
-                    <div className="text-[10px] text-blue-600">总分红</div>
-                    <div className="text-sm font-semibold tabular-nums text-blue-700">{fmtMoney(selectedShareholder.totalAmount)}</div>
-                  </div>
-                  <div className="rounded-lg bg-emerald-50 border border-emerald-100 px-3 py-2">
-                    <div className="text-[10px] text-emerald-600">已结算</div>
-                    <div className="text-sm font-semibold tabular-nums text-emerald-700">{fmtMoney(selectedShareholder.settledAmount)}</div>
-                  </div>
-                  <div className="rounded-lg bg-amber-50 border border-amber-100 px-3 py-2">
-                    <div className="text-[10px] text-amber-600">待结算</div>
-                    <div className="text-sm font-semibold tabular-nums text-amber-700">{fmtMoney(selectedShareholder.pendingAmount)}</div>
-                  </div>
-                </div>
-              </div>
-
-              {/* 各场地分红详情 */}
-              {shareholderConfigs.length > 0 && (
-                <div className="space-y-3">
-                  {shareholderConfigs.map((c: any) => {
-                    const isStationExpanded = expandedShareholderId === c.landlordId;
-                    // 从stationBoard中找到该场地的经营数据（v3：board 已按场地方分组）
-                    const stationData = (stationBoardForSH ?? []).find((r: any) =>
-                      r.landlord?.id === c.landlordId
-                    );
-                    // 该场地的历史分红记录
-                    const stationRecords = (selectedShareholder.details ?? []).filter((d: any) => d.landlordId === c.landlordId);
-                    // 分红口径经营数据（calculate 结果：含税费/退款/商务分红）
-                    const preview = shareholderPreviewMap.get(c.landlordId);
-                    // 该配置若指定品牌，取该品牌的分红预估基数（按品牌口径）
-                    const brandBreakdown = c.brandId
-                      ? (preview?.brandBreakdown ?? []).find((b: any) => b.brandId === c.brandId)
-                      : null;
-                    const estIncomeBase = brandBreakdown ? brandBreakdown.income : (preview?.income?.totalIncome || 0);
-                    const estProfitBase = brandBreakdown ? brandBreakdown.profit : (preview?.profit || 0);
-
-                    return (
-                      <div key={c.id} className="rounded-xl border bg-white overflow-hidden">
-                        {/* 场地头部 */}
-                        <div
-                          className={`flex items-center justify-between px-4 py-3 cursor-pointer hover:bg-slate-50/60 ${isStationExpanded ? "bg-blue-50/30" : ""}`}
-                          onClick={() => setExpandedShareholderId(isStationExpanded ? null : c.landlordId)}
-                        >
-                          <div className="flex items-center gap-2">
-                            {isStationExpanded ? <ChevronDown className="h-4 w-4 text-slate-400" /> : <ChevronRight className="h-4 w-4 text-slate-300" />}
-                            <MapPin className="h-4 w-4 text-emerald-500" />
-                            <span className="text-sm font-semibold text-slate-800">{c.landlordName || `场地#${c.landlordId}`}</span>
-                            {c.brandName && (
-                              <span className="rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700">{c.brandName}</span>
-                            )}
-                            {!c.brandName && (
-                              <span className="rounded-full bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-500">全场</span>
-                            )}
-                          </div>
-                          <div className="flex items-center gap-3 text-xs">
-                            <span className="text-slate-500">
-                              {c.mode === "固定金额" ? `固定 ${fmtMoney(c.fixedAmount)}` : `${c.mode} ${(c.ratio * 100).toFixed(1)}%`}
-                            </span>
-                            {stationRecords.length > 0 && (
-                              <span className="rounded-full bg-blue-100 px-1.5 py-0.5 text-[10px] text-blue-600">{stationRecords.length} 条记录</span>
-                            )}
-                          </div>
-                        </div>
-
-                        {/* 展开内容 */}
-                        {isStationExpanded && (
-                          <div className="border-t px-4 py-3 space-y-3 bg-slate-50/30">
-                            {/* 分红配置 */}
-                            <div className="rounded-lg border bg-white p-3">
-                              <div className="text-[11px] font-semibold text-slate-600 mb-2">分红配置</div>
-                              <div className="grid grid-cols-2 gap-2 text-xs">
-                                <div><span className="text-slate-400">分红模式：</span><span className="font-medium text-slate-700">{c.mode}</span></div>
-                                {c.mode !== "固定金额" && (
-                                  <div><span className="text-slate-400">分红比例：</span><span className="font-medium text-slate-700">{(c.ratio * 100).toFixed(1)}%</span></div>
-                                )}
-                                {c.mode === "固定金额" && (
-                                  <div><span className="text-slate-400">固定金额：</span><span className="font-medium text-slate-700">{fmtMoney(c.fixedAmount)}/月</span></div>
-                                )}
-                                <div><span className="text-slate-400">品牌范围：</span><span className="font-medium text-slate-700">{c.brandName || "整个场地"}</span></div>
-                              </div>
-                            </div>
-
-                            {/* 场地经营数据 */}
-                            {stationData && (
-                              <div className="rounded-lg border bg-white overflow-hidden">
-                                <div className="px-3 py-1.5 text-[11px] font-semibold text-slate-600 bg-slate-50 border-b">
-                                  场地经营数据（{summaryRangeLabel}）
-                                </div>
-                                <div className="p-3 space-y-3">
-                                  {/* 收入构成 */}
-                                  <div>
-                                    <div className="text-[11px] font-semibold text-emerald-600 mb-1.5">收入构成</div>
-                                    <div className="space-y-1 text-xs">
-                                      <div className="flex justify-between">
-                                        <span className="text-slate-500">电费收入</span>
-                                        <span className="tabular-nums text-slate-700">{fmtMoney(preview?.income?.elecIncome?.total || 0)}</span>
-                                      </div>
-                                      <div className="flex justify-between">
-                                        <span className="text-slate-500">租金收入（品牌方合同）</span>
-                                        <span className="tabular-nums text-slate-700">{fmtMoney(preview?.income?.rentIncome?.total || 0)}</span>
-                                      </div>
-                                      <div className="flex justify-between font-semibold border-t pt-1">
-                                        <span className="text-slate-700">总收入</span>
-                                        <span className="tabular-nums text-emerald-600">{fmtMoney(preview?.income?.totalIncome || 0)}</span>
-                                      </div>
-                                    </div>
-                                  </div>
-
-                                  {/* 成本构成 */}
-                                  <div>
-                                    <div className="text-[11px] font-semibold text-rose-600 mb-1.5">成本构成</div>
-                                    <div className="space-y-1 text-xs">
-                                      <div className="flex justify-between">
-                                        <span className="text-slate-500">电费成本</span>
-                                        <span className="tabular-nums text-slate-700">{fmtMoney(preview?.cost?.elecCost || 0)}</span>
-                                      </div>
-                                      <div className="flex justify-between">
-                                        <span className="text-slate-500">场地租金</span>
-                                        <span className="tabular-nums text-slate-700">{fmtMoney(preview?.cost?.rentCost || 0)}</span>
-                                      </div>
-                                      <div className="flex justify-between">
-                                        <span className="text-slate-500">运营费用</span>
-                                        <span className="tabular-nums text-slate-700">{fmtMoney(preview?.cost?.opExpense || 0)}</span>
-                                      </div>
-                                      {preview?.cost?.elecTax > 0 && (
-                                        <div className="flex justify-between">
-                                          <span className="text-slate-500">电费税费</span>
-                                          <span className="tabular-nums text-amber-600">{fmtMoney(preview.cost.elecTax)}</span>
-                                        </div>
-                                      )}
-                                      {preview?.cost?.rentTax > 0 && (
-                                        <div className="flex justify-between">
-                                          <span className="text-slate-500">场地税费</span>
-                                          <span className="tabular-nums text-amber-600">{fmtMoney(preview.cost.rentTax)}</span>
-                                        </div>
-                                      )}
-                                      {preview?.cost?.rentRefund > 0 && (
-                                        <div className="flex justify-between">
-                                          <span className="text-slate-500">场地费退款</span>
-                                          <span className="tabular-nums text-rose-600">{fmtMoney(preview.cost.rentRefund)}</span>
-                                        </div>
-                                      )}
-                                      {preview?.cost?.bizDividendCost > 0 && (
-                                        <div className="flex justify-between">
-                                          <span className="text-slate-500">商务分红（计入成本）</span>
-                                          <span className="tabular-nums text-slate-700">{fmtMoney(preview.cost.bizDividendCost)}</span>
-                                        </div>
-                                      )}
-                                      <div className="flex justify-between font-semibold border-t pt-1">
-                                        <span className="text-slate-700">总成本</span>
-                                        <span className="tabular-nums text-rose-600">{fmtMoney(preview?.cost?.totalCost || 0)}</span>
-                                      </div>
-                                    </div>
-                                  </div>
-
-                                  {/* 利润和分红计算 */}
-                                  <div className="rounded-lg bg-slate-50 p-2.5 space-y-1.5">
-                                    <div className="flex justify-between text-xs">
-                                      <span className="text-slate-500">净利润</span>
-                                      <span className={`font-semibold tabular-nums ${(preview?.profit || 0) >= 0 ? "text-emerald-600" : "text-rose-600"}`}>{fmtMoney(preview?.profit || 0)}</span>
-                                    </div>
-                                    {/* 净利润公式 */}
-                                    <div className="rounded bg-white/60 border border-slate-100 px-2 py-1.5 text-[10px] text-slate-500 leading-relaxed">
-                                      <div>净利润 = 总收入 − 总成本</div>
-                                      <div>
-                                        {fmtMoney(preview?.income?.elecIncome?.total || 0)}（电费）+ {fmtMoney(preview?.income?.rentIncome?.total || 0)}（场地费）
-                                        − {fmtMoney(preview?.cost?.elecCost || 0)}（电费成本）− {fmtMoney(preview?.cost?.rentCost || 0)}（场地租金）− {fmtMoney(preview?.cost?.opExpense || 0)}（运营费）− {fmtMoney(preview?.cost?.elecTax || 0)}（电费税）− {fmtMoney(preview?.cost?.rentTax || 0)}（场地税）− {fmtMoney(preview?.cost?.rentRefund || 0)}（退款）− {fmtMoney(preview?.cost?.bizDividendCost || 0)}（商务分红）
-                                      </div>
-                                    </div>
-                                    <div className="border-t pt-1.5">
-                                      <div className="flex justify-between text-xs">
-                                        <span className="text-slate-500">分红模式</span>
-                                        <span className="font-medium text-slate-700">{c.mode}</span>
-                                      </div>
-                                      {c.mode === "收入分红" && (
-                                        <div className="flex justify-between text-xs">
-                                          <span className="text-slate-500">计算公式</span>
-                                          <span className="text-slate-600">总收入 {fmtMoney(preview?.income?.totalIncome || 0)} × {(c.ratio * 100).toFixed(1)}%</span>
-                                        </div>
-                                      )}
-                                      {c.mode === "利润分红" && (
-                                        <div className="flex justify-between text-xs">
-                                          <span className="text-slate-500">计算公式</span>
-                                          <span className="text-slate-600">净利润 {fmtMoney(preview?.profit || 0)} × {(c.ratio * 100).toFixed(1)}%</span>
-                                        </div>
-                                      )}
-                                      {c.mode === "固定金额" && (
-                                        <div className="flex justify-between text-xs">
-                                          <span className="text-slate-500">计算公式</span>
-                                          <span className="text-slate-600">固定金额 {fmtMoney(c.fixedAmount)}/月</span>
-                                        </div>
-                                      )}
-                                    </div>
-                                    <div className="border-t pt-1.5">
-                                      <div className="flex justify-between text-sm font-semibold">
-                                        <span className="text-slate-700">期间预估分红</span>
-                                        <span className="tabular-nums text-emerald-600">
-                                          {fmtMoney(
-                                            c.mode === "收入分红" ? estIncomeBase * c.ratio :
-                                            c.mode === "利润分红" ? estProfitBase * c.ratio :
-                                            Number(c.fixedAmount || 0)
-                                          )}
-                                        </span>
-                                      </div>
-                                    </div>
-                                  </div>
-                                </div>
-                              </div>
-                            )}
-
-                            {/* 分红记录 + 新增月结 + 提交审批 */}
-                            <div className="rounded-lg border bg-white overflow-hidden">
-                              <div className="flex items-center justify-between border-b bg-slate-50 px-3 py-1.5">
-                                <span className="text-[11px] font-semibold text-slate-600">分红记录</span>
-                                <button
-                                  onClick={() => setAddDividendOpen({ open: true, landlordId: c.landlordId })}
-                                  className="rounded-md bg-emerald-600 px-2 py-1 text-[10px] text-white hover:bg-emerald-700"
-                                >
-                                  新增月结
-                                </button>
-                              </div>
-                              {(() => {
-                                const fullRecords = landlordDividendsMap.get(c.landlordId) ?? [];
-                                if (fullRecords.length === 0) {
-                                  return <div className="py-4 text-center text-xs text-slate-400">该场地暂无分红记录</div>;
-                                }
-                                // 可选中的未结算记录
-                                const selectable = fullRecords.filter((r: any) => r.status === "未结算");
-                                const selectedInStation = fullRecords.filter((r: any) => selectedApprovalIds.includes(r.id));
-                                return (
-                                  <>
-                                    {selectable.length > 0 && (
-                                      <div className="flex items-center justify-between border-b bg-blue-50/40 px-3 py-1.5">
-                                        <span className="text-[10px] text-slate-500">已选 {selectedApprovalIds.length} 条</span>
-                                        <button
-                                          onClick={() => openBatchApproval(selectedInStation)}
-                                          disabled={selectedInStation.length === 0}
-                                          className="rounded-md bg-blue-600 px-2 py-0.5 text-[10px] text-white hover:bg-blue-700 disabled:opacity-40"
-                                        >
-                                          批量提交审批（{selectedInStation.length}）
-                                        </button>
-                                      </div>
-                                    )}
-                                    <table className="w-full text-xs">
-                                      <thead>
-                                        <tr className="border-b bg-slate-50/50 text-left text-slate-500">
-                                          <th className="w-8 px-2 py-1.5"></th>
-                                          <th className="px-2.5 py-1.5 font-medium">月份</th>
-                                          <th className="px-2.5 py-1.5 font-medium">类型</th>
-                                          <th className="px-2.5 py-1.5 text-right font-medium">利润</th>
-                                          <th className="px-2.5 py-1.5 font-medium">状态</th>
-                                        </tr>
-                                      </thead>
-                                      <tbody>
-                                        {fullRecords.map((r: any) => (
-                                          <tr key={r.id} className="border-b last:border-0">
-                                            <td className="px-2 py-1.5 text-center">
-                                              {r.status === "未结算" && (
-                                                <input
-                                                  type="checkbox"
-                                                  className="rounded border-slate-300"
-                                                  checked={selectedApprovalIds.includes(r.id)}
-                                                  onChange={() => toggleApprovalSelect(r.id)}
-                                                />
-                                              )}
-                                            </td>
-                                            <td className="px-2.5 py-1.5 text-slate-600">{r.period}</td>
-                                            <td className="px-2.5 py-1.5">
-                                              <span className={`rounded-full px-2 py-0.5 text-[10px] ${r.type === "股东分红" ? "bg-blue-100 text-blue-700" : "bg-purple-100 text-purple-700"}`}>{r.type}</span>
-                                            </td>
-                                            <td className="px-2.5 py-1.5 text-right tabular-nums text-slate-700">{fmtMoney(r.profit)}</td>
-                                            <td className="px-2.5 py-1.5">
-                                              <span className={`rounded-full px-2 py-0.5 text-[10px] ${r.status === "已结算" ? "bg-emerald-100 text-emerald-700" : r.status === "已通过" ? "bg-blue-100 text-blue-700" : "bg-slate-100 text-slate-600"}`}>{r.status}</span>
-                                            </td>
-                                          </tr>
-                                        ))}
-                                      </tbody>
-                                    </table>
-                                  </>
-                                );
-                              })()}
-                            </div>
-                          </div>
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-
-              {shareholderConfigs.length === 0 && (
-                <div className="rounded-xl border border-dashed bg-white py-12 text-center text-sm text-slate-400">
-                  该股东暂无分红配置，请在「场地汇总」中配置
-                </div>
-              )}
-            </div>
-          )
-        ) : (
-          // ─── 场地汇总详情 ───
+        {viewMode === "landlord" ? (
           !selectedLandlord ? (
             <div className="flex h-full flex-col items-center justify-center text-slate-400">
               <MapPin className="h-10 w-10 mb-2 text-slate-300" />
@@ -1898,14 +1263,7 @@ export default function Shareholders() {
             </div>
           ) : (
             <div className="space-y-4">
-              {/* 导出按钮 */}
-              <div className="flex justify-end">
-                <button onClick={doExport} className="flex items-center gap-1.5 rounded-lg border border-blue-200 bg-blue-50 px-3 py-1.5 text-xs text-blue-700 hover:bg-blue-100 transition-colors">
-                  <Download className="h-3.5 w-3.5" />
-                  导出表格
-                </button>
-              </div>
-              {/* 场地方信息卡片 */}
+              {/* 场地方信息 + 经营汇总 */}
               <div className="rounded-xl border bg-white p-4">
                 <div className="flex items-center gap-3 mb-3">
                   <div className="flex h-10 w-10 items-center justify-center rounded-full bg-blue-100 text-blue-600">
@@ -1919,916 +1277,381 @@ export default function Shareholders() {
                       {landlordBrands.length > 0 && ` · ${landlordBrands.length} 个品牌`}
                     </div>
                   </div>
+                  <div className="ml-auto text-xs text-slate-400">{periodLabel} 经营</div>
                 </div>
                 <div className="grid grid-cols-2 gap-2 lg:grid-cols-4">
-                  <div className="rounded-lg border bg-slate-50 px-3 py-2">
-                    <div className="text-[10px] text-slate-400">电表数</div>
-                    <div className="text-sm font-semibold tabular-nums">{selectedLandlord.meterCount}</div>
-                  </div>
-                  <div className="rounded-lg border bg-slate-50 px-3 py-2">
-                    <div className="text-[10px] text-slate-400">总度数</div>
-                    <div className="text-sm font-semibold tabular-nums">{fmtNum(selectedLandlord.totalKwh)} <span className="text-[10px] font-normal text-slate-400">度</span></div>
-                  </div>
-                  <div className="rounded-lg border bg-rose-50 px-3 py-2">
-                    <div className="text-[10px] text-rose-500">电费成本</div>
-                    <div className="text-sm font-semibold tabular-nums text-rose-600">{fmtMoney(selectedLandlord.elecPay)}</div>
-                  </div>
-                  <div className="rounded-lg border bg-emerald-50 px-3 py-2">
-                    <div className="text-[10px] text-emerald-500">电费收入</div>
-                    <div className="text-sm font-semibold tabular-nums text-emerald-600">{fmtMoney(selectedLandlord.elecCollect)}</div>
-                  </div>
                   <div className="rounded-lg border bg-slate-50 px-3 py-2">
                     <div className="text-[10px] text-slate-400">电费利润</div>
                     <div className={`text-sm font-semibold tabular-nums ${selectedLandlord.elecProfit >= 0 ? "text-emerald-600" : "text-rose-600"}`}>{fmtMoney(selectedLandlord.elecProfit)}</div>
                   </div>
-                  <div className="rounded-lg border bg-rose-50 px-3 py-2">
-                    <div className="text-[10px] text-rose-500">租金成本</div>
-                    <div className="text-sm font-semibold tabular-nums text-rose-600">{fmtMoney(selectedLandlord.rentCost)}</div>
+                  <div className="rounded-lg border bg-slate-50 px-3 py-2">
+                    <div className="text-[10px] text-slate-400">场地利润</div>
+                    <div className={`text-sm font-semibold tabular-nums ${selectedLandlord.rentProfit >= 0 ? "text-emerald-600" : "text-rose-600"}`}>{fmtMoney(selectedLandlord.rentProfit)}</div>
                   </div>
-                  <div className="rounded-lg border bg-emerald-50 px-3 py-2">
-                    <div className="text-[10px] text-emerald-500">租金收入</div>
-                    <div className="text-sm font-semibold tabular-nums text-emerald-600">{fmtMoney(selectedLandlord.rentIncome)}</div>
+                  <div className="rounded-lg border bg-slate-50 px-3 py-2">
+                    <div className="text-[10px] text-slate-400">运营费用</div>
+                    <div className="text-sm font-semibold tabular-nums text-amber-600">{fmtMoney(selectedLandlord.opExpense)}</div>
                   </div>
-                  <div className="rounded-lg border bg-blue-50 px-3 py-2">
-                    <div className="text-[10px] text-blue-500">总利润</div>
-                    <div className={`text-sm font-semibold tabular-nums ${selectedLandlord.totalProfit >= 0 ? "text-emerald-600" : "text-rose-600"}`}>{fmtMoney(selectedLandlord.totalProfit)}</div>
+                  <div className="rounded-lg border-2 border-emerald-300 bg-emerald-50 px-3 py-2">
+                    <div className="text-[10px] text-emerald-600 font-medium">总利润（分红基数）</div>
+                    <div className={`text-sm font-bold tabular-nums ${selectedLandlord.totalProfit >= 0 ? "text-emerald-700" : "text-rose-700"}`}>{fmtMoney(selectedLandlord.totalProfit)}</div>
                   </div>
                 </div>
               </div>
 
-              {/* 按月明细：长周期（季度/半年）下展示构成该周期的各月数据，点击可下钻 */}
-              {stationGranularity !== "month" && stationMonthlyRows.length > 0 && (
-                <div className="rounded-xl border bg-white overflow-hidden">
-                  <div className="flex items-center justify-between border-b bg-slate-50 px-4 py-2">
-                    <div className="text-xs font-semibold text-slate-600">按月明细（{stationPeriodLabel}）</div>
-                    <span className="text-[10px] text-slate-400">点击月份行可下钻查看该月详情</span>
+              {/* 运营费用（当前选中月） */}
+              <div className="rounded-xl border bg-white p-4">
+                <div className="flex items-center justify-between mb-2">
+                  <div className="flex items-center gap-1.5 text-xs font-semibold text-slate-600">
+                    <Wallet className="h-3.5 w-3.5 text-amber-600" />
+                    运营费用（{toDisplay(periodEnd)}）
                   </div>
-                  <div className="overflow-x-auto">
-                    <table className="w-full text-xs whitespace-nowrap">
-                      <thead>
-                        <tr className="border-b bg-slate-50/50 text-left text-slate-500">
-                          <th className="px-2.5 py-1.5 font-medium">月份</th>
-                          <th className="px-2.5 py-1.5 text-right font-medium">总度数</th>
-                          <th className="px-2.5 py-1.5 text-right font-medium">电费收入</th>
-                          <th className="px-2.5 py-1.5 text-right font-medium">电费成本</th>
-                          <th className="px-2.5 py-1.5 text-right font-medium">租金收入</th>
-                          <th className="px-2.5 py-1.5 text-right font-medium">租金成本</th>
-                          <th className="px-2.5 py-1.5 text-right font-medium">运营费</th>
-                          <th className="px-2.5 py-1.5 text-right font-medium">总利润</th>
-                          <th className="px-2.5 py-1.5 text-right font-medium">预估分红</th>
-                          <th className="px-2.5 py-1.5 text-right font-medium">已记录分红</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {stationMonthlyRows.map((r) => (
-                          <tr
-                            key={r.month}
-                            onClick={() => { setSelectedMonth(r.month); setStationGranularity("month"); }}
-                            className="border-b last:border-0 cursor-pointer hover:bg-emerald-50/40 transition-colors"
-                            title={`查看 ${r.month} 明细`}
-                          >
-                            <td className="px-2.5 py-1.5 font-medium text-slate-700">{r.month}</td>
-                            <td className="px-2.5 py-1.5 text-right tabular-nums">{fmtNum(r.totalKwh)}</td>
-                            <td className="px-2.5 py-1.5 text-right tabular-nums text-emerald-600">{fmtMoney(r.elecCollect)}</td>
-                            <td className="px-2.5 py-1.5 text-right tabular-nums text-rose-600">{fmtMoney(r.elecPay)}</td>
-                            <td className="px-2.5 py-1.5 text-right tabular-nums text-emerald-600">{fmtMoney(r.rentIncome)}</td>
-                            <td className="px-2.5 py-1.5 text-right tabular-nums text-rose-600">{fmtMoney(r.rentCost)}</td>
-                            <td className="px-2.5 py-1.5 text-right tabular-nums text-rose-600">{fmtMoney(r.opExpense)}</td>
-                            <td className={`px-2.5 py-1.5 text-right tabular-nums font-medium ${r.totalProfit >= 0 ? "text-emerald-600" : "text-rose-600"}`}>{fmtMoney(r.totalProfit)}</td>
-                            <td className="px-2.5 py-1.5 text-right tabular-nums text-blue-600">{fmtMoney(r.shAmount + r.bizAmount)}</td>
-                            <td className="px-2.5 py-1.5 text-right tabular-nums text-slate-600">{fmtMoney(r.recordedAmount)}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                      <tfoot>
-                        <tr className="border-t bg-slate-50 font-medium">
-                          <td className="px-2.5 py-1.5">合计</td>
-                          <td className="px-2.5 py-1.5 text-right tabular-nums">{fmtNum(stationMonthlyRows.reduce((s, r) => s + r.totalKwh, 0))}</td>
-                          <td className="px-2.5 py-1.5 text-right tabular-nums text-emerald-600">{fmtMoney(stationMonthlyRows.reduce((s, r) => s + r.elecCollect, 0))}</td>
-                          <td className="px-2.5 py-1.5 text-right tabular-nums text-rose-600">{fmtMoney(stationMonthlyRows.reduce((s, r) => s + r.elecPay, 0))}</td>
-                          <td className="px-2.5 py-1.5 text-right tabular-nums text-emerald-600">{fmtMoney(stationMonthlyRows.reduce((s, r) => s + r.rentIncome, 0))}</td>
-                          <td className="px-2.5 py-1.5 text-right tabular-nums text-rose-600">{fmtMoney(stationMonthlyRows.reduce((s, r) => s + r.rentCost, 0))}</td>
-                          <td className="px-2.5 py-1.5 text-right tabular-nums text-rose-600">{fmtMoney(stationMonthlyRows.reduce((s, r) => s + r.opExpense, 0))}</td>
-                          <td className={`px-2.5 py-1.5 text-right tabular-nums ${stationMonthlyRows.reduce((s, r) => s + r.totalProfit, 0) >= 0 ? "text-emerald-600" : "text-rose-600"}`}>{fmtMoney(stationMonthlyRows.reduce((s, r) => s + r.totalProfit, 0))}</td>
-                          <td className="px-2.5 py-1.5 text-right tabular-nums text-blue-600">{fmtMoney(stationMonthlyRows.reduce((s, r) => s + r.shAmount + r.bizAmount, 0))}</td>
-                          <td className="px-2.5 py-1.5 text-right tabular-nums text-slate-600">{fmtMoney(stationMonthlyRows.reduce((s, r) => s + r.recordedAmount, 0))}</td>
-                        </tr>
-                      </tfoot>
-                    </table>
+                  {currentExpense && (
+                    <span className="rounded-full bg-amber-50 px-2 py-0.5 text-[10px] text-amber-700">
+                      该月已录入 ¥{fmtMoney(currentExpense.amount)}{currentExpense.remark ? `（${currentExpense.remark}）` : ""}
+                    </span>
+                  )}
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <input
+                    className={`${inputCls} w-40`}
+                    type="number"
+                    min="0"
+                    step="0.01"
+                    value={expenseAmount}
+                    onChange={(e) => setExpenseAmount(e.target.value)}
+                    placeholder="请输入运营费用（元）"
+                  />
+                  <input
+                    className={`${inputCls} w-48`}
+                    value={expenseRemark}
+                    onChange={(e) => setExpenseRemark(e.target.value)}
+                    placeholder="备注（可选）"
+                  />
+                  <button
+                    onClick={() => saveExpenseMutation.mutate()}
+                    disabled={saveExpenseMutation.isPending}
+                    className="rounded-lg bg-amber-600 px-3 py-1.5 text-xs text-white hover:bg-amber-700 disabled:opacity-50"
+                  >保存</button>
+                  {currentExpense && (
+                    <button
+                      onClick={() => deleteExpenseMutation.mutate(currentExpense.id)}
+                      disabled={deleteExpenseMutation.isPending}
+                      className="rounded-lg border border-slate-200 px-3 py-1.5 text-xs text-slate-500 hover:border-rose-300 hover:text-rose-600"
+                    >删除</button>
+                  )}
+                </div>
+                <div className="mt-2 text-[10px] text-slate-400">
+                  运营费用计入该月总成本（分红基数 = 总收入 − 总成本），保存后分红预估、核算明细自动更新。
+                </div>
+              </div>
+
+              {/* 分红预估 */}
+              <div className="rounded-xl border bg-white overflow-hidden">
+                <div className="flex items-center justify-between border-b bg-slate-50 px-4 py-2">
+                  <div className="flex items-center gap-1.5 text-xs font-semibold text-slate-600">
+                    <Wallet className="h-3.5 w-3.5 text-emerald-600" />
+                    分红预估（{periodLabel}）
+                  </div>
+                  <div className="flex gap-1">
+                    <button onClick={() => doExportByLandlord()} className="rounded-md bg-blue-600 px-2 py-1 text-[11px] text-white hover:bg-blue-700">
+                      导出 Excel
+                    </button>
+                    <button onClick={() => setConfigOpen({ open: true, type: "shareholder" })} className="rounded-md bg-blue-50 border border-blue-200 px-2 py-1 text-[11px] text-blue-700 hover:bg-blue-100">
+                      + 股东分红
+                    </button>
+                    <button onClick={() => setConfigOpen({ open: true, type: "introducer" })} className="rounded-md bg-purple-50 border border-purple-200 px-2 py-1 text-[11px] text-purple-700 hover:bg-purple-100">
+                      + 商务分红
+                    </button>
+                    <button onClick={() => setAddDividendOpen(true)} className="rounded-md bg-emerald-600 px-2 py-1 text-[11px] text-white hover:bg-emerald-700">
+                      生成分红记录
+                    </button>
                   </div>
                 </div>
-              )}
+                <div className="p-3">
+                  {previewQueries.some((q) => q.isLoading) ? (
+                    <div className="py-6 text-center text-xs text-slate-400">计算中…</div>
+                  ) : !preview ? (
+                    <div className="py-6 text-center text-xs text-slate-400">该区间暂无分红数据</div>
+                  ) : (
+                    <div className="space-y-4">
+                      {/* 收支汇总 */}
+                      <div className="grid grid-cols-2 gap-2 lg:grid-cols-5">
+                        <div className="rounded-lg bg-emerald-50 px-3 py-2">
+                          <div className="text-[10px] text-emerald-600">总收入（不含税）</div>
+                          <div className="text-sm font-semibold tabular-nums text-emerald-700">{fmtMoney(preview.income?.totalIncome)}</div>
+                        </div>
+                        <div className="rounded-lg bg-rose-50 px-3 py-2">
+                          <div className="text-[10px] text-rose-600">总成本</div>
+                          <div className="text-sm font-semibold tabular-nums text-rose-700">{fmtMoney(preview.cost?.totalCost)}</div>
+                        </div>
+                        <div className="rounded-lg bg-amber-50 px-3 py-2">
+                          <div className="text-[10px] text-amber-600">税费</div>
+                          <div className="text-sm font-semibold tabular-nums text-amber-700">{fmtMoney((preview.cost?.elecTax || 0) + (preview.cost?.rentTax || 0))}</div>
+                        </div>
+                        <div className="rounded-lg bg-blue-50 px-3 py-2">
+                          <div className="text-[10px] text-blue-600">净利润</div>
+                          <div className="text-sm font-semibold tabular-nums text-blue-700">{fmtMoney(preview.profit)}</div>
+                        </div>
+                        <div className="rounded-lg border-2 border-emerald-300 bg-emerald-50 px-3 py-2">
+                          <div className="text-[10px] text-emerald-600">分红合计</div>
+                          <div className="text-sm font-bold tabular-nums text-emerald-700">
+                            {fmtMoney((preview.summary?.totalShareholderDividend || 0) + (preview.summary?.totalBusinessDividend || 0))}
+                          </div>
+                        </div>
+                      </div>
 
-              {/* 品牌列表：该场地下各品牌方的收支（按月） */}
-              {landlordBrands.length > 0 && (
-                <div className="rounded-xl border bg-white overflow-hidden">
-                  <div className="border-b bg-slate-50 px-4 py-2 text-xs font-semibold text-slate-600">
-                    品牌（{landlordBrands.length} 个 · {stationPeriodLabel}）
+                      {/* 股东分红明细 */}
+                      <div className="rounded-lg border">
+                        <div className="border-b bg-blue-50/50 px-3 py-1.5 text-[11px] font-semibold text-blue-700">股东分红</div>
+                        {(preview.shareholderDividends ?? []).length > 0 ? (
+                          preview.shareholderDividends.map((d: any) => renderBeneficiary(d, "股东"))
+                        ) : (
+                          <div className="py-4 text-center text-xs text-slate-400">暂无股东分红配置</div>
+                        )}
+                      </div>
+
+                      {/* 商务分红明细 */}
+                      <div className="rounded-lg border">
+                        <div className="border-b bg-purple-50/50 px-3 py-1.5 text-[11px] font-semibold text-purple-700">商务分红（介绍人）</div>
+                        {(preview.bizDividends ?? []).length > 0 ? (
+                          preview.bizDividends.map((d: any) => renderBeneficiary(d, "介绍人"))
+                        ) : (
+                          <div className="py-4 text-center text-xs text-slate-400">暂无商务分红配置</div>
+                        )}
+                      </div>
+
+                      <div className="text-[10px] text-slate-400">
+                        * 分红周期：月分红每月结算；季度分红在 3/6/9/12 月结算（非结算月金额累计）；半年分红在 6/12 月结算；年分红在 12 月结算。
+                        {isRange
+                          ? "区间预估 = 区间内各月预估之和（每月按 当月基数 × 比例 估算，不乘周期倍数）；到结算月生成记录时按周期倍数核算累计金额。"
+                          : "本月预估 = 当月基数 × 比例（不乘周期倍数）；到结算月生成记录时按周期倍数核算累计金额。"}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* 分红配置（股东/介绍人） */}
+              <div className="rounded-xl border bg-white overflow-hidden">
+                <div className="flex items-center justify-between border-b bg-slate-50 px-4 py-2">
+                  <div className="flex items-center gap-1.5 text-xs font-semibold text-slate-600">
+                    <Settings className="h-3.5 w-3.5 text-slate-500" />
+                    分红配置
                   </div>
+                  <div className="flex gap-1">
+                    <button onClick={() => setConfigOpen({ open: true, type: "shareholder" })} className="rounded-md bg-blue-50 border border-blue-200 px-2 py-1 text-[11px] text-blue-700 hover:bg-blue-100">+ 股东分红</button>
+                    <button onClick={() => setConfigOpen({ open: true, type: "introducer" })} className="rounded-md bg-purple-50 border border-purple-200 px-2 py-1 text-[11px] text-purple-700 hover:bg-purple-100">+ 商务分红</button>
+                  </div>
+                </div>
+                <div className="divide-y">
+                  {/* 股东配置 */}
+                  <div>
+                    <div className="px-4 pt-2 pb-1 text-[11px] font-semibold text-blue-700">股东分红配置</div>
+                    {(shConfigs.data ?? []).length === 0 ? (
+                      <div className="px-4 pb-3 text-[11px] text-slate-400">暂无股东分红配置，点击右上角「+ 股东分红」添加</div>
+                    ) : (
+                      <div className="space-y-1 px-3 pb-3">
+                        {(shConfigs.data ?? []).map((c: any) => (
+                          <div key={c.id} className="flex items-center justify-between rounded border bg-slate-50/60 px-3 py-1.5 text-xs">
+                            <div className="flex items-center gap-2">
+                              <span className="font-medium text-slate-700">{c.shareholderName}</span>
+                              {c.brandName ? <span className="rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] text-amber-700">{c.brandName}</span> : <span className="rounded-full bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-500">全场</span>}
+                              <span className="text-slate-600">{c.mode === "固定金额" ? `固定 ${fmtMoney(c.fixedAmount)}/月` : `${c.mode} ${((c.ratio || 0) * 100).toFixed(1)}%`}</span>
+                              <span className="text-slate-400">{c.settlementPeriod}分红</span>
+                              {c.startDate && <span className="text-[10px] text-slate-400">起 {String(c.startDate).slice(0, 10)}</span>}
+                              {c.endDate && <span className="text-[10px] text-slate-400">止 {String(c.endDate).slice(0, 10)}</span>}
+                            </div>
+                            <div className="flex items-center gap-1">
+                              <button onClick={() => setConfigOpen({ open: true, type: "shareholder", config: c })} className="text-slate-400 hover:text-blue-600" title="编辑">
+                                <Pencil className="h-3.5 w-3.5" />
+                              </button>
+                              <button onClick={() => configMutations.mutate({ type: "shareholder", id: c.id })} className="text-slate-400 hover:text-rose-500">
+                                <Trash2 className="h-3.5 w-3.5" />
+                              </button>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                  {/* 介绍人配置 */}
+                  <div>
+                    <div className="px-4 pt-2 pb-1 text-[11px] font-semibold text-purple-700">商务分红配置（介绍人）</div>
+                    {(intConfigs.data ?? []).length === 0 ? (
+                      <div className="px-4 pb-3 text-[11px] text-slate-400">暂无商务分红配置，点击右上角「+ 商务分红」添加</div>
+                    ) : (
+                      <div className="space-y-1 px-3 pb-3">
+                        {(intConfigs.data ?? []).map((c: any) => (
+                          <div key={c.id} className="flex items-center justify-between rounded border bg-slate-50/60 px-3 py-1.5 text-xs">
+                            <div className="flex items-center gap-2">
+                              <span className="font-medium text-slate-700">{c.introducerName}</span>
+                              {c.brandName ? <span className="rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] text-amber-700">{c.brandName}</span> : <span className="rounded-full bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-500">全场</span>}
+                              <span className="text-slate-600">{c.mode === "固定金额" ? `固定 ${fmtMoney(c.fixedAmount)}/月` : `${c.mode} ${((c.ratio || 0) * 100).toFixed(1)}%`}</span>
+                              <span className="text-slate-400">{c.settlementPeriod}分红</span>
+                              {c.countAsCost && <span className="rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] text-amber-700">计入成本</span>}
+                            </div>
+                            <div className="flex items-center gap-1">
+                              <button onClick={() => setConfigOpen({ open: true, type: "introducer", config: c })} className="text-slate-400 hover:text-blue-600" title="编辑">
+                                <Pencil className="h-3.5 w-3.5" />
+                              </button>
+                              <button onClick={() => configMutations.mutate({ type: "introducer", id: c.id })} className="text-slate-400 hover:text-rose-500">
+                                <Trash2 className="h-3.5 w-3.5" />
+                              </button>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              {/* 已生成分红记录 */}
+              <div className="rounded-xl border bg-white overflow-hidden">
+                <div className="border-b bg-slate-50 px-4 py-2 text-xs font-semibold text-slate-600">分红记录（{periodLabel}）</div>
+                {filteredDividends.length > 0 ? (
                   <div className="divide-y">
-                    {landlordBrands.map((b: { id: number; name: string }) => {
-                      const isBrandExpanded = expandedBrandId === b.id;
-                      const brandData = (dividendPreview?.brandBreakdown ?? []).find((x: any) => x.brandId === b.id);
-                      const rentIncome = brandData?.rentIncome || 0;
-                      const elecIncome = brandData?.elecIncome || 0;
-                      const elecCost = brandData?.elecCost || 0;
-                      const venueCost = brandData?.venueCost || 0;
-                      const elecTax = brandData?.elecTax || 0;
-                      const rentTax = brandData?.rentTax || 0;
-                      const profit = brandData?.profit ?? null;
+                    {filteredDividends.map((r: any) => (
+                      <div key={r.id} className="flex items-center justify-between px-4 py-2.5 text-xs">
+                        <div className="flex items-center gap-2">
+                          <span className={`rounded-full px-2 py-0.5 text-[10px] ${r.type === "股东分红" ? "bg-blue-100 text-blue-700" : "bg-purple-100 text-purple-700"}`}>{r.type}</span>
+                          <span className="font-medium text-slate-700">{r.period}</span>
+                          {r.brandName && <span className="text-slate-400">{r.brandName}</span>}
+                          <span className="text-slate-500">利润 {fmtMoney(r.profit)}</span>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <span className="tabular-nums text-emerald-600">{fmtMoney(r.shares?.reduce((s: number, sh: any) => s + Number(sh.amount || 0), 0))}</span>
+                          <span className={`rounded-full px-2 py-0.5 text-[10px] ${r.status === "已结算" ? "bg-emerald-100 text-emerald-700" : r.status === "已通过" ? "bg-blue-100 text-blue-700" : r.status === "申报中" ? "bg-amber-100 text-amber-700" : r.status === "已驳回" ? "bg-rose-100 text-rose-700" : "bg-slate-100 text-slate-600"}`}>{r.status}</span>
+                          {r.status === "未结算" && (
+                            <button
+                              onClick={() => submitMutation.mutate(r.id)}
+                              disabled={submitMutation.isPending}
+                              className="rounded-md border border-emerald-300 bg-emerald-50 px-2 py-1 text-[10px] font-medium text-emerald-700 hover:bg-emerald-100 disabled:opacity-50"
+                            >提交审核</button>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="py-6 text-center text-xs text-slate-400">该区间暂无分红记录</div>
+                )}
+              </div>
+            </div>
+          )
+        ) : (
+          // ─── 股东视图 ───
+          !selectedShareholder ? (
+            <div className="flex h-full flex-col items-center justify-center text-slate-400">
+              <Users className="h-10 w-10 mb-2 text-slate-300" />
+              <div className="text-sm">请从左侧选择股东</div>
+            </div>
+          ) : (
+            <div className="space-y-4">
+              {/* 股东信息卡 */}
+              <div className="rounded-xl border bg-white p-4">
+                <div className="flex items-center gap-3 mb-3">
+                  <div className="flex h-10 w-10 items-center justify-center rounded-full bg-emerald-100 text-emerald-600">
+                    <Users className="h-5 w-5" />
+                  </div>
+                  <div>
+                    <div className="text-sm font-semibold text-slate-800">{selectedShareholder.name}</div>
+                    {selectedShareholder.phone && <div className="text-xs text-slate-400">{selectedShareholder.phone}</div>}
+                  </div>
+                  <div className="ml-auto flex items-center gap-2">
+                    <button onClick={() => doExportByShareholder()} className="rounded-md bg-blue-600 px-2 py-1 text-[11px] text-white hover:bg-blue-700">
+                      导出 Excel
+                    </button>
+                    <span className="text-xs text-slate-400">{periodLabel} 分红</span>
+                  </div>
+                </div>
+                <div className="grid grid-cols-3 gap-3">
+                  <div className="rounded-lg bg-blue-50 border border-blue-100 px-3 py-2">
+                    <div className="text-[10px] text-blue-600">本月分红</div>
+                    <div className="text-sm font-semibold tabular-nums text-blue-700">
+                      {fmtMoney((shSummary.data ?? []).find((s: any) => s.shareholderId === selectedShareholder.id)?.totalAmount || 0)}
+                    </div>
+                  </div>
+                  <div className="rounded-lg bg-emerald-50 border border-emerald-100 px-3 py-2">
+                    <div className="text-[10px] text-emerald-600">已结算</div>
+                    <div className="text-sm font-semibold tabular-nums text-emerald-700">
+                      {fmtMoney((shSummary.data ?? []).find((s: any) => s.shareholderId === selectedShareholder.id)?.settledAmount || 0)}
+                    </div>
+                  </div>
+                  <div className="rounded-lg bg-amber-50 border border-amber-100 px-3 py-2">
+                    <div className="text-[10px] text-amber-600">待结算</div>
+                    <div className="text-sm font-semibold tabular-nums text-amber-700">
+                      {fmtMoney((shSummary.data ?? []).find((s: any) => s.shareholderId === selectedShareholder.id)?.pendingAmount || 0)}
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* 该股东在各场地的分红配置与预估 */}
+              <div className="rounded-xl border bg-white overflow-hidden">
+                <div className="border-b bg-slate-50 px-4 py-2 text-xs font-semibold text-slate-600">
+                  该股东涉及场地（{shareholderLandlords.length} 个 · {periodLabel}）
+                </div>
+                {shareholderLandlords.length === 0 ? (
+                  <div className="py-8 text-center text-xs text-slate-400">
+                    该股东暂无分红配置，请到「按场地方」视图配置
+                  </div>
+                ) : (
+                  <div className="divide-y">
+                    {shareholderLandlords.map((r: any) => {
+                      const lid = r.landlord.id;
+                      const configs = (allShConfigs.data ?? []).filter((c: any) => c.shareholderId === selectedShareholder.id && c.landlordId === lid);
                       return (
-                        <div key={b.id}>
-                          <button
-                            className="flex w-full items-center justify-between px-4 py-2.5 hover:bg-slate-50 transition-colors"
-                            onClick={() => setExpandedBrandId(isBrandExpanded ? null : b.id)}
-                          >
-                            <div className="flex items-center gap-2 text-xs">
-                              {isBrandExpanded ? <ChevronDown className="h-3.5 w-3.5 text-slate-400" /> : <ChevronRight className="h-3.5 w-3.5 text-slate-300" />}
-                              <MapPin className="h-3.5 w-3.5 text-emerald-500" />
-                              <span className="font-medium text-slate-700">{b.name}</span>
-                            </div>
-                            <div className="flex items-center gap-3 text-[11px]">
-                              <span className="text-slate-400">收入 {fmtMoney(rentIncome + elecIncome)}</span>
-                              {profit !== null && (
-                                <span className={`font-medium tabular-nums ${profit >= 0 ? "text-emerald-600" : "text-rose-600"}`}>
-                                  利润 {fmtMoney(profit)}
-                                </span>
-                              )}
-                            </div>
-                          </button>
-                          {/* 品牌展开：收支明细 */}
-                          {isBrandExpanded && (
-                            <div className="bg-slate-50/50 border-t px-4 py-3">
-                              <div className="grid grid-cols-2 gap-2 text-xs">
-                                <div className="rounded-lg border bg-white p-2.5">
-                                  <div className="mb-1 text-[10px] font-semibold text-emerald-600">收入</div>
-                                  <div className="flex justify-between"><span className="text-slate-500">电费收入</span><span className="tabular-nums">{fmtMoney(elecIncome)}</span></div>
-                                  <div className="flex justify-between"><span className="text-slate-500">场地费收入</span><span className="tabular-nums">{fmtMoney(rentIncome)}</span></div>
+                        <div key={lid} className="px-4 py-3">
+                          <div className="flex items-center gap-2 mb-2">
+                            <MapPin className="h-3.5 w-3.5 text-emerald-600" />
+                            <span className="text-xs font-semibold text-slate-700">{r.landlord.name}</span>
+                            <span className="text-[11px] text-slate-400">总利润 {fmtMoney(r.totalProfit)}</span>
+                            <span className={`rounded-full px-2 py-0.5 text-[10px] ${(shareholderEstimateByLandlord[lid] ?? 0) > 0 ? "bg-emerald-100 text-emerald-700" : "bg-slate-100 text-slate-400"}`}>
+                              {isRange ? "区间预估" : "本月预估"} {fmtMoney(shareholderEstimateByLandlord[lid] ?? 0)}
+                            </span>
+                            <button
+                              onClick={() => setDetail({
+                                open: true,
+                                personKey: "shareholderId",
+                                personId: selectedShareholderId,
+                                personName: selectedShareholder?.name || "",
+                                landlordName: r.landlord.name,
+                                months: monthsInRange,
+                                monthDatas: monthsInRange.map((_m, mi) => shareholderEstimateQueries[shareholderLandlordIds.indexOf(lid) * monthsInRange.length + mi]?.data ?? null),
+                              })}
+                              className="rounded-md border border-blue-200 bg-blue-50 px-2 py-1 text-[10px] text-blue-700 hover:bg-blue-100"
+                            >核算明细</button>
+                          </div>
+                          <div className="space-y-1">
+                            {configs.map((c: any) => (
+                              <div key={c.id} className="flex items-center justify-between rounded border bg-slate-50/50 px-3 py-1.5 text-xs">
+                                <div className="flex items-center gap-2">
+                                  {c.brandName ? <span className="rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] text-amber-700">{c.brandName}</span> : <span className="rounded-full bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-500">全场</span>}
+                                  <span className="text-slate-600">{c.mode === "固定金额" ? `固定 ${fmtMoney(c.fixedAmount)}/月` : `${c.mode} ${(c.ratio * 100).toFixed(1)}%`}</span>
+                                  <span className="text-slate-400">{c.settlementPeriod}分红</span>
+                                  {c.startDate && <span className="text-[10px] text-slate-400">起 {c.startDate.slice(0, 10)}</span>}
+                                  {c.endDate && <span className="text-[10px] text-slate-400">止 {c.endDate.slice(0, 10)}</span>}
                                 </div>
-                                <div className="rounded-lg border bg-white p-2.5">
-                                  <div className="mb-1 text-[10px] font-semibold text-rose-600">支出</div>
-                                  <div className="flex justify-between"><span className="text-slate-500">电费成本</span><span className="tabular-nums">{fmtMoney(elecCost)}</span></div>
-                                  <div className="flex justify-between"><span className="text-slate-500">承担场地成本</span><span className="tabular-nums">{fmtMoney(venueCost)}</span></div>
-                                  <div className="flex justify-between"><span className="text-slate-500">电费税费</span><span className="tabular-nums">{fmtMoney(elecTax)}</span></div>
-                                  <div className="flex justify-between"><span className="text-slate-500">场地税费</span><span className="tabular-nums">{fmtMoney(rentTax)}</span></div>
+                                <div className="flex items-center gap-1">
+                                  <button onClick={() => setConfigOpen({ open: true, type: "shareholder", config: c })} className="text-slate-400 hover:text-blue-600" title="编辑">
+                                    <Pencil className="h-3.5 w-3.5" />
+                                  </button>
+                                  <button onClick={() => configMutations.mutate({ type: "shareholder", id: c.id })} className="text-slate-400 hover:text-rose-500">
+                                    <Trash2 className="h-3.5 w-3.5" />
+                                  </button>
                                 </div>
                               </div>
-                              {profit !== null && (
-                                <div className="mt-2 flex justify-between text-xs font-semibold">
-                                  <span className="text-slate-700">品牌利润</span>
-                                  <span className={`tabular-nums ${profit >= 0 ? "text-emerald-600" : "text-rose-600"}`}>{fmtMoney(profit)}</span>
-                                </div>
-                              )}
-                            </div>
-                          )}
+                            ))}
+                            {configs.length === 0 && <div className="text-[11px] text-slate-400">该场地暂无配置</div>}
+                          </div>
                         </div>
                       );
                     })}
                   </div>
-                </div>
-              )}
-
-              {/* 分红配置（v3：按场地） */}
-              {landlordId && (
-                <div className="rounded-xl border bg-white overflow-hidden">
-                  <div className="flex items-center justify-between border-b bg-slate-50 px-4 py-2">
-                    <div className="flex items-center gap-1.5 text-xs font-semibold text-slate-600">
-                      <Settings className="h-3.5 w-3.5" />
-                      分红配置
-                    </div>
-                    <div className="flex gap-1">
-                      <button onClick={() => setConfigOpen({ open: true, type: "shareholder", landlordId })} className="rounded-md bg-blue-50 border border-blue-200 px-2 py-1 text-[11px] text-blue-700 hover:bg-blue-100">
-                        + 股东分红
-                      </button>
-                      <button onClick={() => setConfigOpen({ open: true, type: "introducer", landlordId })} className="rounded-md bg-purple-50 border border-purple-200 px-2 py-1 text-[11px] text-purple-700 hover:bg-purple-100">
-                        + 商务分红
-                      </button>
-                    </div>
-                  </div>
-
-                  {activeShConfigs && activeShConfigs.length > 0 && (
-                    <div className="border-b">
-                      <div className="px-4 py-1.5 text-[11px] font-semibold text-slate-500 bg-blue-50/50">股东分红配置</div>
-                      {activeShConfigs.map((c: any) => {
-                        const isExpanded = expandedShareholderId === c.shareholderId;
-                        // 获取该股东在当前场地的分红记录
-                        const shareholderRecords = (stationDividends ?? []).flatMap((r: any) => {
-                          const shares = (r.shares ?? []).filter((s: any) => s.shareholderId === c.shareholderId);
-                          if (shares.length === 0) return [];
-                          return [{ ...r, shares }];
-                        });
-                        // 获取该股东的预估分红
-                        const estimatedDividend = dividendPreview?.shareholderDividends?.find(
-                          (d: any) => d.shareholderId === c.shareholderId
-                        );
-                        const hasEstimate = !!estimatedDividend;
-                        // 该配置若指定品牌，取该品牌的分红基数（按品牌口径展示公式）
-                        const brandPreview = c.brandId
-                          ? (dividendPreview?.brandBreakdown ?? []).find((b: any) => b.brandId === c.brandId)
-                          : null;
-                        const formulaIncome = brandPreview ? brandPreview.income : (dividendPreview?.income?.totalIncome || 0);
-                        const formulaProfit = brandPreview ? brandPreview.profit : (dividendPreview?.profit || 0);
-                        // 汇总视图（季度/半年）下基数已含多月累加，不再叠加周期倍数
-                        const formulaMultiplier = stationGranularity === "month" && (estimatedDividend?.settlementPeriod || "月") !== "月"
-                          ? (estimatedDividend?.settlementPeriod === "季度" ? 3 : estimatedDividend?.settlementPeriod === "半年" ? 6 : 12)
-                          : 0;
-                        return (
-                          <div key={c.id}>
-                            <div className={`flex items-center justify-between border-b last:border-0 px-4 py-2 hover:bg-slate-50/50 ${isExpanded ? "bg-blue-50/30" : ""}`}>
-                              <div className="flex items-center gap-2 text-xs">
-                                <Users className="h-3.5 w-3.5 text-blue-500" />
-                                <button
-                                  onClick={() => setExpandedShareholderId(isExpanded ? null : c.shareholderId)}
-                                  className="font-medium text-slate-700 hover:text-blue-600 transition-colors cursor-pointer"
-                                >
-                                  {c.shareholderName}
-                                </button>
-                                {c.brandName && (
-                                  <span className="rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700">{c.brandName}</span>
-                                )}
-                                {!c.brandName && (
-                                  <span className="rounded-full bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-500">全场</span>
-                                )}
-                                <span className="text-slate-400">·</span>
-                                <span className="text-slate-500">{c.mode === "固定金额" ? `固定 ${fmtMoney(c.fixedAmount)}` : `${c.mode} ${(c.ratio * 100).toFixed(1)}%`}</span>
-                                <span className="text-slate-400">·</span>
-                                <span className="text-slate-500">{c.settlementPeriod || "月"}分红</span>
-                                {hasEstimate && (
-                                  <span className="rounded-full bg-emerald-100 px-1.5 py-0.5 text-[10px] text-emerald-700 font-medium">预估 {fmtMoney(estimatedDividend.amount)}</span>
-                                )}
-                                {shareholderRecords.length > 0 && (
-                                  <span className="rounded-full bg-blue-100 px-1.5 py-0.5 text-[10px] text-blue-600">{shareholderRecords.length} 条记录</span>
-                                )}
-                              </div>
-                              <button onClick={() => deleteConfigMut.mutate({ type: "shareholder", id: c.id })} className="text-slate-400 hover:text-rose-500 transition-colors">
-                                <Trash2 className="h-3.5 w-3.5" />
-                              </button>
-                            </div>
-                            {/* 展开的分红详情 */}
-                            {isExpanded && (
-                              <div className="bg-blue-50/20 border-b px-4 py-3 space-y-3">
-                                {/* 分红配置信息 */}
-                                <div className="rounded-lg border bg-white p-3">
-                                  <div className="text-[11px] font-semibold text-slate-600 mb-2">分红配置</div>
-                                  <div className="grid grid-cols-2 gap-2 text-xs">
-                                    <div><span className="text-slate-400">分红模式：</span><span className="font-medium text-slate-700">{c.mode}</span></div>
-                                    {c.mode !== "固定金额" && (
-                                      <div><span className="text-slate-400">分红比例：</span><span className="font-medium text-slate-700">{(c.ratio * 100).toFixed(1)}%</span></div>
-                                    )}
-                                    {c.mode === "固定金额" && (
-                                      <div><span className="text-slate-400">固定金额：</span><span className="font-medium text-slate-700">{fmtMoney(c.fixedAmount)}/月</span></div>
-                                    )}
-                                  </div>
-                                </div>
-
-                                {/* 预估分红计算明细 */}
-                                {hasEstimate && dividendPreview && (
-                                  <div className="rounded-lg border bg-white overflow-hidden">
-                                    <div className="px-3 py-1.5 text-[11px] font-semibold text-slate-600 bg-slate-50 border-b">
-                                      预估分红计算明细（{stationPeriodLabel}）
-                                    </div>
-                                    <div className="p-3 space-y-3">
-                                      {/* 收入明细 */}
-                                      <div>
-                                        <div className="text-[11px] font-semibold text-emerald-600 mb-1.5">收入构成</div>
-                                        <table className="w-full text-xs">
-                                          <tbody>
-                                            <tr className="border-b">
-                                              <td className="py-1 text-slate-500">电费收入</td>
-                                              <td className="py-1 text-right tabular-nums text-slate-700">{fmtMoney(dividendPreview.income?.elecIncome?.total || 0)}</td>
-                                            </tr>
-                                            {dividendPreview.income?.elecIncome?.details?.length > 0 && dividendPreview.income.elecIncome.details.map((d: any, i: number) => (
-                                              <tr key={i} className="text-[10px]">
-                                                <td className="py-0.5 pl-4 text-slate-400">
-                                                  {d.meterNo}（{d.brandName}）{d.kwh}度 × {d.unitPrice}元/度
-                                                  {d.postTaxPrice && <span className="ml-1 text-amber-600">（税后 {d.postTaxPrice}元/度）</span>}
-                                                </td>
-                                                <td className="py-0.5 text-right tabular-nums text-slate-500">{fmtMoney(d.amount)}</td>
-                                              </tr>
-                                            ))}
-                                            <tr className="border-b">
-                                              <td className="py-1 text-slate-500">租金收入（品牌方合同）</td>
-                                              <td className="py-1 text-right tabular-nums text-slate-700">{fmtMoney(dividendPreview.income?.rentIncome?.total || 0)}</td>
-                                            </tr>
-                                            {dividendPreview.income?.rentIncome?.details?.length > 0 && dividendPreview.income.rentIncome.details.map((d: any, i: number) => (
-                                              <tr key={i} className="text-[10px]">
-                                                <td className="py-0.5 pl-4 text-slate-400">
-                                                  {d.brandName} {d.isFirstMonth ? "首月场地租金" : `${d.cabinets}柜 × ${fmtMoney(d.unitMonthlyRent)}/柜`}
-                                                  {d.postTaxRent && <span className="ml-1 text-amber-600">（税后 {fmtMoney(d.postTaxRent)}元/月）</span>}
-                                                </td>
-                                                <td className="py-0.5 text-right tabular-nums text-slate-500">{fmtMoney(d.amount)}</td>
-                                              </tr>
-                                            ))}
-                                            <tr className="font-semibold">
-                                              <td className="py-1 text-slate-700">总收入</td>
-                                              <td className="py-1 text-right tabular-nums text-emerald-600">{fmtMoney(dividendPreview.income?.totalIncome || 0)}</td>
-                                            </tr>
-                                          </tbody>
-                                        </table>
-                                      </div>
-
-                                      {/* 成本明细 */}
-                                      <div>
-                                        <div className="text-[11px] font-semibold text-rose-600 mb-1.5">成本构成</div>
-                                        <table className="w-full text-xs">
-                                          <tbody>
-                                            <tr className="border-b">
-                                              <td className="py-1 text-slate-500">电费成本</td>
-                                              <td className="py-1 text-right tabular-nums text-slate-700">{fmtMoney(dividendPreview.cost?.elecCost || 0)}</td>
-                                            </tr>
-                                            {dividendPreview.cost?.details?.electricity?.length > 0 && dividendPreview.cost.details.electricity.map((d: any, i: number) => (
-                                              <tr key={i} className="text-[10px]">
-                                                <td className="py-0.5 pl-4 text-slate-400">{d.meterNo} {d.kwh}度 × {d.unitPrice}元/度</td>
-                                                <td className="py-0.5 text-right tabular-nums text-slate-500">{fmtMoney(d.amount)}</td>
-                                              </tr>
-                                            ))}
-                                            <tr className="border-b">
-                                              <td className="py-1 text-slate-500">场地租金</td>
-                                              <td className="py-1 text-right tabular-nums text-slate-700">{fmtMoney(dividendPreview.cost?.rentCost || 0)}</td>
-                                            </tr>
-                                            {dividendPreview.cost?.details?.rent?.length > 0 && dividendPreview.cost.details.rent.map((d: any, i: number) => (
-                                              <tr key={i} className="text-[10px]">
-                                                <td className="py-0.5 pl-4 text-slate-400">{d.landlordName}</td>
-                                                <td className="py-0.5 text-right tabular-nums text-slate-500">{fmtMoney(d.monthlyRent)}</td>
-                                              </tr>
-                                            ))}
-                                            <tr className="border-b">
-                                              <td className="py-1 text-slate-500">运营费用</td>
-                                              <td className="py-1 text-right tabular-nums text-slate-700">{fmtMoney(dividendPreview.cost?.opExpense || 0)}</td>
-                                            </tr>
-                                            {dividendPreview.cost?.elecTax > 0 && (
-                                              <>
-                                                <tr className="border-b">
-                                                  <td className="py-1 text-slate-500">电费税收</td>
-                                                  <td className="py-1 text-right tabular-nums text-amber-600">{fmtMoney(dividendPreview.cost.elecTax)}</td>
-                                                </tr>
-                                                {dividendPreview.cost?.details?.elecTax?.details?.length > 0 && dividendPreview.cost.details.elecTax.details.map((d: any, i: number) => (
-                                                  <tr key={i} className="text-[10px]">
-                                                    <td className="py-0.5 pl-4 text-slate-400">{d.meterNo}（{d.brandName}）{d.kwh}度 × ({d.preTaxPrice} - {d.postTaxPrice})元/度</td>
-                                                    <td className="py-0.5 text-right tabular-nums text-amber-500">{fmtMoney(d.amount)}</td>
-                                                  </tr>
-                                                ))}
-                                              </>
-                                            )}
-                                            {dividendPreview.cost?.rentTax > 0 && (
-                                              <>
-                                                <tr className="border-b">
-                                                  <td className="py-1 text-slate-500">场地税收</td>
-                                                  <td className="py-1 text-right tabular-nums text-amber-600">{fmtMoney(dividendPreview.cost.rentTax)}</td>
-                                                </tr>
-                                                {dividendPreview.cost?.details?.rentTax?.details?.length > 0 && dividendPreview.cost.details.rentTax.details.map((d: any, i: number) => (
-                                                  <tr key={i} className="text-[10px]">
-                                                    <td className="py-0.5 pl-4 text-slate-400">{d.brandName} {fmtMoney(d.preTaxPrice)}元/月 × {(d.taxRate * 100).toFixed(0)}%</td>
-                                                    <td className="py-0.5 text-right tabular-nums text-amber-500">{fmtMoney(d.amount)}</td>
-                                                  </tr>
-                                                ))}
-                                              </>
-                                            )}
-                                            {dividendPreview.cost?.rentRefund > 0 && (
-                                              <tr className="border-b">
-                                                <td className="py-1 text-slate-500">场地费退款</td>
-                                                <td className="py-1 text-right tabular-nums text-rose-600">{fmtMoney(dividendPreview.cost.rentRefund)}</td>
-                                              </tr>
-                                            )}
-                                            {dividendPreview.cost?.bizDividendCost > 0 && (
-                                              <tr className="border-b">
-                                                <td className="py-1 text-slate-500">商务分红（计入成本）</td>
-                                                <td className="py-1 text-right tabular-nums text-slate-700">{fmtMoney(dividendPreview.cost.bizDividendCost)}</td>
-                                              </tr>
-                                            )}
-                                            <tr className="font-semibold">
-                                              <td className="py-1 text-slate-700">总成本</td>
-                                              <td className="py-1 text-right tabular-nums text-rose-600">{fmtMoney(dividendPreview.cost?.totalCost || 0)}</td>
-                                            </tr>
-                                          </tbody>
-                                        </table>
-                                      </div>
-
-                                      {/* 按品牌 P&L */}
-                                      {dividendPreview.brandBreakdown?.length > 0 && (
-                                        <div>
-                                          <div className="text-[11px] font-semibold text-blue-600 mb-1.5">按品牌经营数据</div>
-                                          <table className="w-full text-xs">
-                                            <tbody>
-                                              {dividendPreview.brandBreakdown.map((b: any, i: number) => (
-                                                <tr key={i} className="border-b last:border-0">
-                                                  <td className="py-1 text-slate-500 font-medium">{b.brandName}</td>
-                                                  <td className="py-1 text-right tabular-nums text-slate-600">
-                                                    收入 {fmtMoney(b.income)} · 承担场地成本 {fmtMoney(b.venueCost)} · 利润
-                                                    <span className={`ml-1 font-medium ${b.profit >= 0 ? "text-emerald-600" : "text-rose-600"}`}>{fmtMoney(b.profit)}</span>
-                                                  </td>
-                                                </tr>
-                                              ))}
-                                            </tbody>
-                                          </table>
-                                        </div>
-                                      )}
-
-                                      {/* 利润和分红计算 */}
-                                      <div className="rounded-lg bg-slate-50 p-2.5 space-y-1.5">
-                                        <div className="flex justify-between text-xs">
-                                          <span className="text-slate-500">净利润</span>
-                                          <span className={`font-semibold tabular-nums ${(dividendPreview.profit || 0) >= 0 ? "text-emerald-600" : "text-rose-600"}`}>{fmtMoney(dividendPreview.profit || 0)}</span>
-                                        </div>
-                                        {/* 净利润公式 */}
-                                        <div className="rounded bg-white/60 border border-slate-100 px-2 py-1.5 text-[10px] text-slate-500 leading-relaxed">
-                                          <div>净利润 = 总收入 − 总成本</div>
-                                          <div>
-                                            {fmtMoney(dividendPreview?.income?.elecIncome?.total || 0)}（电费）+ {fmtMoney(dividendPreview?.income?.rentIncome?.total || 0)}（场地费）
-                                            − {fmtMoney(dividendPreview?.cost?.elecCost || 0)}（电费成本）− {fmtMoney(dividendPreview?.cost?.rentCost || 0)}（场地租金）− {fmtMoney(dividendPreview?.cost?.opExpense || 0)}（运营费）− {fmtMoney(dividendPreview?.cost?.elecTax || 0)}（电费税）− {fmtMoney(dividendPreview?.cost?.rentTax || 0)}（场地税）− {fmtMoney(dividendPreview?.cost?.rentRefund || 0)}（退款）− {fmtMoney(dividendPreview?.cost?.bizDividendCost || 0)}（商务分红）
-                                          </div>
-                                        </div>
-                                        <div className="border-t pt-1.5">
-                                          <div className="flex justify-between text-xs">
-                                            <span className="text-slate-500">分红模式</span>
-                                            <span className="font-medium text-slate-700">{estimatedDividend.mode}</span>
-                                          </div>
-                                          <div className="flex justify-between text-xs">
-                                            <span className="text-slate-500">分红周期</span>
-                                            <span className="font-medium text-slate-700">{estimatedDividend.settlementPeriod || "月"}分红</span>
-                                          </div>
-                                          {estimatedDividend.mode === "收入分红" && (
-                                            <div className="flex justify-between text-xs">
-                                              <span className="text-slate-500">计算公式</span>
-                                              <span className="text-slate-600">{brandPreview ? `${brandPreview.brandName}收入` : "总收入"} {fmtMoney(formulaIncome)} × {(estimatedDividend.ratio * 100).toFixed(1)}%{formulaMultiplier > 0 ? ` × ${formulaMultiplier}` : ""}</span>
-                                            </div>
-                                          )}
-                                          {estimatedDividend.mode === "利润分红" && (
-                                            <div className="flex justify-between text-xs">
-                                              <span className="text-slate-500">计算公式</span>
-                                              <span className="text-slate-600">{brandPreview ? `${brandPreview.brandName}利润` : "净利润"} {fmtMoney(formulaProfit)} × {(estimatedDividend.ratio * 100).toFixed(1)}%{formulaMultiplier > 0 ? ` × ${formulaMultiplier}` : ""}</span>
-                                            </div>
-                                          )}
-                                          {estimatedDividend.mode === "固定金额" && (
-                                            <div className="flex justify-between text-xs">
-                                              <span className="text-slate-500">计算公式</span>
-                                              <span className="text-slate-600">固定金额 {fmtMoney(estimatedDividend.fixedAmount)}/月{formulaMultiplier > 0 ? ` × ${formulaMultiplier}` : ""}</span>
-                                            </div>
-                                          )}
-                                        </div>
-                                        <div className="border-t pt-1.5">
-                                          <div className="flex justify-between text-sm font-semibold">
-                                            <span className="text-slate-700">预估分红金额</span>
-                                            <span className="tabular-nums text-emerald-600">{fmtMoney(estimatedDividend.amount)}</span>
-                                          </div>
-                                        </div>
-                                      </div>
-                                    </div>
-                                  </div>
-                                )}
-
-                                {/* 历史分红记录 */}
-                                {shareholderRecords.length > 0 ? (
-                                  <div className="rounded-lg border bg-white overflow-hidden">
-                                    <div className="px-3 py-1.5 text-[11px] font-semibold text-slate-600 bg-slate-50 border-b">历史分红记录</div>
-                                    <table className="w-full text-xs">
-                                      <thead>
-                                        <tr className="border-b bg-slate-50/50 text-left text-slate-500">
-                                          <th className="px-2.5 py-1.5 font-medium">月份</th>
-                                          <th className="px-2.5 py-1.5 font-medium">类型</th>
-                                          <th className="px-2.5 py-1.5 text-right font-medium">分红金额</th>
-                                          <th className="px-2.5 py-1.5 font-medium">状态</th>
-                                        </tr>
-                                      </thead>
-                                      <tbody>
-                                        {shareholderRecords.map((r: any) => (
-                                          <tr key={r.id} className="border-b last:border-0">
-                                            <td className="px-2.5 py-1.5 text-slate-600">{r.period}</td>
-                                            <td className="px-2.5 py-1.5">
-                                              <span className={`rounded-full px-2 py-0.5 text-[10px] ${r.type === "股东分红" ? "bg-blue-100 text-blue-700" : "bg-purple-100 text-purple-700"}`}>{r.type}</span>
-                                            </td>
-                                            <td className="px-2.5 py-1.5 text-right font-medium text-emerald-600 tabular-nums">
-                                              {fmtMoney(r.shares.reduce((sum: number, s: any) => sum + Number(s.amount || 0), 0))}
-                                            </td>
-                                            <td className="px-2.5 py-1.5">
-                                              <span className={`rounded-full px-2 py-0.5 text-[10px] ${r.status === "已结算" ? "bg-emerald-100 text-emerald-700" : r.status === "已通过" ? "bg-blue-100 text-blue-700" : "bg-slate-100 text-slate-600"}`}>{r.status}</span>
-                                            </td>
-                                          </tr>
-                                        ))}
-                                      </tbody>
-                                      <tfoot>
-                                        <tr className="border-t bg-slate-50 font-medium">
-                                          <td colSpan={2} className="px-2.5 py-1.5">合计</td>
-                                          <td className="px-2.5 py-1.5 text-right text-emerald-600 tabular-nums">
-                                            {fmtMoney(shareholderRecords.reduce((sum: number, r: any) => sum + r.shares.reduce((s: number, sh: any) => s + Number(sh.amount || 0), 0), 0))}
-                                          </td>
-                                          <td></td>
-                                        </tr>
-                                      </tfoot>
-                                    </table>
-                                  </div>
-                                ) : !hasEstimate ? (
-                                  <div className="py-4 text-center text-xs text-slate-400">暂无分红记录和预估数据</div>
-                                ) : null}
-
-                                {/* 提示信息 */}
-                                {shareholderRecords.length === 0 && hasEstimate && (
-                                  <div className="text-[10px] text-slate-400 text-center">
-                                    提示：点击「新增月结」可创建实际分红记录
-                                  </div>
-                                )}
-                              </div>
-                            )}
-                          </div>
-                        );
-                      })}
-                    </div>
-                  )}
-
-                  {intConfigs && intConfigs.length > 0 && (
-                    <div>
-                      <div className="px-4 py-1.5 text-[11px] font-semibold text-slate-500 bg-purple-50/50">商务分红配置</div>
-                      {intConfigs.map((c: any) => {
-                        const isIntExpanded = expandedShareholderId === -c.introducerId; // 用负数区分介绍人
-                        // 获取该介绍人在当前场地的分红记录
-                        const introducerRecords = (stationDividends ?? []).flatMap((r: any) => {
-                          const shares = (r.shares ?? []).filter((s: any) => s.introducerId === c.introducerId);
-                          if (shares.length === 0) return [];
-                          return [{ ...r, shares }];
-                        });
-                        // 获取该介绍人的预估分红
-                        const estimatedBizDividend = dividendPreview?.bizDividends?.find(
-                          (d: any) => d.introducerId === c.introducerId
-                        );
-                        const hasBizEstimate = !!estimatedBizDividend;
-                        // 汇总视图（季度/半年）下基数已含多月累加，不再叠加周期倍数
-                        const bizFormulaMultiplier = stationGranularity === "month" && (estimatedBizDividend?.settlementPeriod || "月") !== "月"
-                          ? (estimatedBizDividend?.settlementPeriod === "季度" ? 3 : estimatedBizDividend?.settlementPeriod === "半年" ? 6 : 12)
-                          : 0;
-                        return (
-                          <div key={c.id}>
-                            <div className={`flex items-center justify-between border-b last:border-0 px-4 py-2 hover:bg-slate-50/50 ${isIntExpanded ? "bg-purple-50/30" : ""}`}>
-                              <div className="flex items-center gap-2 text-xs">
-                                <UserPlus className="h-3.5 w-3.5 text-purple-500" />
-                                <button
-                                  onClick={() => setExpandedShareholderId(isIntExpanded ? null : -c.introducerId)}
-                                  className="font-medium text-slate-700 hover:text-purple-600 transition-colors cursor-pointer"
-                                >
-                                  {c.introducerName}
-                                </button>
-                                {c.brandName && (
-                                  <span className="rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700">{c.brandName}</span>
-                                )}
-                                {!c.brandName && (
-                                  <span className="rounded-full bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-500">全场</span>
-                                )}
-                                <span className="text-slate-400">·</span>
-                                <span className="text-slate-500">{c.mode === "固定金额" ? `固定 ${fmtMoney(c.fixedAmount)}` : `${c.mode} ${(c.ratio * 100).toFixed(1)}%`}</span>
-                                <span className="text-slate-400">·</span>
-                                <span className="text-slate-500">{c.settlementPeriod || "月"}分红</span>
-                                {c.countAsCost && <span className="rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] text-amber-700">计入成本</span>}
-                                {hasBizEstimate && (
-                                  <span className="rounded-full bg-emerald-100 px-1.5 py-0.5 text-[10px] text-emerald-700 font-medium">预估 {fmtMoney(estimatedBizDividend.amount)}</span>
-                                )}
-                              </div>
-                              <button onClick={() => deleteConfigMut.mutate({ type: "introducer", id: c.id })} className="text-slate-400 hover:text-rose-500 transition-colors">
-                                <Trash2 className="h-3.5 w-3.5" />
-                              </button>
-                            </div>
-                            {/* 展开的分红详情 */}
-                            {isIntExpanded && (
-                              <div className="bg-purple-50/20 border-b px-4 py-3 space-y-3">
-                                {/* 分红配置信息 */}
-                                <div className="rounded-lg border bg-white p-3">
-                                  <div className="text-[11px] font-semibold text-slate-600 mb-2">商务分红配置</div>
-                                  <div className="grid grid-cols-2 gap-2 text-xs">
-                                    <div><span className="text-slate-400">分红模式：</span><span className="font-medium text-slate-700">{c.mode}</span></div>
-                                    {c.mode !== "固定金额" && (
-                                      <div><span className="text-slate-400">分红比例：</span><span className="font-medium text-slate-700">{(c.ratio * 100).toFixed(1)}%</span></div>
-                                    )}
-                                    {c.mode === "固定金额" && (
-                                      <div><span className="text-slate-400">固定金额：</span><span className="font-medium text-slate-700">{fmtMoney(c.fixedAmount)}/月</span></div>
-                                    )}
-                                    <div><span className="text-slate-400">计入成本：</span><span className={`font-medium ${c.countAsCost ? "text-amber-600" : "text-slate-500"}`}>{c.countAsCost ? "是" : "否"}</span></div>
-                                  </div>
-                                </div>
-
-                                {/* 预估分红计算明细 */}
-                                {hasBizEstimate && dividendPreview && (
-                                  <div className="rounded-lg border bg-white overflow-hidden">
-                                    <div className="px-3 py-1.5 text-[11px] font-semibold text-slate-600 bg-slate-50 border-b">
-                                      预估商务分红计算明细（{stationPeriodLabel}）
-                                    </div>
-                                    <div className="p-3 space-y-3">
-                                      {/* 收入明细 */}
-                                      <div>
-                                        <div className="text-[11px] font-semibold text-emerald-600 mb-1.5">收入构成</div>
-                                        <table className="w-full text-xs">
-                                          <tbody>
-                                            <tr className="border-b">
-                                              <td className="py-1 text-slate-500">电费收入</td>
-                                              <td className="py-1 text-right tabular-nums text-slate-700">{fmtMoney(dividendPreview.income?.elecIncome?.total || 0)}</td>
-                                            </tr>
-                                            <tr className="border-b">
-                                              <td className="py-1 text-slate-500">租金收入（品牌方合同）</td>
-                                              <td className="py-1 text-right tabular-nums text-slate-700">{fmtMoney(dividendPreview.income?.rentIncome?.total || 0)}</td>
-                                            </tr>
-                                            <tr className="font-semibold">
-                                              <td className="py-1 text-slate-700">总收入</td>
-                                              <td className="py-1 text-right tabular-nums text-emerald-600">{fmtMoney(dividendPreview.income?.totalIncome || 0)}</td>
-                                            </tr>
-                                          </tbody>
-                                        </table>
-                                      </div>
-
-                                      {/* 成本明细 */}
-                                      <div>
-                                        <div className="text-[11px] font-semibold text-rose-600 mb-1.5">成本构成</div>
-                                        <table className="w-full text-xs">
-                                          <tbody>
-                                            <tr className="border-b">
-                                              <td className="py-1 text-slate-500">电费成本</td>
-                                              <td className="py-1 text-right tabular-nums text-slate-700">{fmtMoney(dividendPreview.cost?.elecCost || 0)}</td>
-                                            </tr>
-                                            <tr className="border-b">
-                                              <td className="py-1 text-slate-500">场地租金</td>
-                                              <td className="py-1 text-right tabular-nums text-slate-700">{fmtMoney(dividendPreview.cost?.rentCost || 0)}</td>
-                                            </tr>
-                                            <tr className="border-b">
-                                              <td className="py-1 text-slate-500">运营费用</td>
-                                              <td className="py-1 text-right tabular-nums text-slate-700">{fmtMoney(dividendPreview.cost?.opExpense || 0)}</td>
-                                            </tr>
-                                            <tr className="font-semibold">
-                                              <td className="py-1 text-slate-700">基础成本</td>
-                                              <td className="py-1 text-right tabular-nums text-rose-600">{fmtMoney((dividendPreview.cost?.elecCost || 0) + (dividendPreview.cost?.rentCost || 0) + (dividendPreview.cost?.opExpense || 0))}</td>
-                                            </tr>
-                                          </tbody>
-                                        </table>
-                                      </div>
-
-                                      {/* 分红计算 */}
-                                      <div className="rounded-lg bg-slate-50 p-2.5 space-y-1.5">
-                                        <div className="flex justify-between text-xs">
-                                          <span className="text-slate-500">分红周期</span>
-                                          <span className="font-medium text-slate-700">{estimatedBizDividend.settlementPeriod || "月"}分红</span>
-                                        </div>
-                                        {estimatedBizDividend.mode === "利润分红" && c.countAsCost && (
-                                          <>
-                                            <div className="flex justify-between text-xs">
-                                              <span className="text-slate-500">分红基数（总收入 - 基础成本）</span>
-                                              <span className="font-medium tabular-nums text-slate-700">{fmtMoney(estimatedBizDividend.baseAmount)}</span>
-                                            </div>
-                                            <div className="flex justify-between text-xs">
-                                              <span className="text-slate-500">计算公式</span>
-                                              <span className="text-slate-600">{fmtMoney(estimatedBizDividend.baseAmount)} × {(estimatedBizDividend.ratio * 100).toFixed(1)}%{bizFormulaMultiplier > 0 ? ` × ${bizFormulaMultiplier}` : ""}</span>
-                                            </div>
-                                          </>
-                                        )}
-                                        {estimatedBizDividend.mode === "利润分红" && !c.countAsCost && (
-                                          <>
-                                            <div className="flex justify-between text-xs">
-                                              <span className="text-slate-500">净利润</span>
-                                              <span className={`font-medium tabular-nums ${(dividendPreview.profit || 0) >= 0 ? "text-emerald-600" : "text-rose-600"}`}>{fmtMoney(dividendPreview.profit || 0)}</span>
-                                            </div>
-                                            <div className="flex justify-between text-xs">
-                                              <span className="text-slate-500">计算公式</span>
-                                              <span className="text-slate-600">净利润 {fmtMoney(dividendPreview.profit)} × {(estimatedBizDividend.ratio * 100).toFixed(1)}%{bizFormulaMultiplier > 0 ? ` × ${bizFormulaMultiplier}` : ""}</span>
-                                            </div>
-                                          </>
-                                        )}
-                                        {estimatedBizDividend.mode === "收入分红" && (
-                                          <div className="flex justify-between text-xs">
-                                            <span className="text-slate-500">计算公式</span>
-                                            <span className="text-slate-600">总收入 {fmtMoney(dividendPreview.income?.totalIncome)} × {(estimatedBizDividend.ratio * 100).toFixed(1)}%{bizFormulaMultiplier > 0 ? ` × ${bizFormulaMultiplier}` : ""}</span>
-                                          </div>
-                                        )}
-                                        {estimatedBizDividend.mode === "固定金额" && (
-                                          <div className="flex justify-between text-xs">
-                                            <span className="text-slate-500">计算公式</span>
-                                            <span className="text-slate-600">固定金额 {fmtMoney(estimatedBizDividend.fixedAmount)}/月{bizFormulaMultiplier > 0 ? ` × ${bizFormulaMultiplier}` : ""}</span>
-                                          </div>
-                                        )}
-                                        <div className="border-t pt-1.5">
-                                          <div className="flex justify-between text-sm font-semibold">
-                                            <span className="text-slate-700">预估商务分红</span>
-                                            <span className="tabular-nums text-emerald-600">{fmtMoney(estimatedBizDividend.amount)}</span>
-                                          </div>
-                                          {c.countAsCost && (
-                                            <div className="text-[10px] text-amber-600 mt-1">此金额将计入成本，影响股东分红基数</div>
-                                          )}
-                                        </div>
-                                      </div>
-                                    </div>
-                                  </div>
-                                )}
-
-                                {/* 历史分红记录 */}
-                                {introducerRecords.length > 0 ? (
-                                  <div className="rounded-lg border bg-white overflow-hidden">
-                                    <div className="px-3 py-1.5 text-[11px] font-semibold text-slate-600 bg-slate-50 border-b">历史分红记录</div>
-                                    <table className="w-full text-xs">
-                                      <thead>
-                                        <tr className="border-b bg-slate-50/50 text-left text-slate-500">
-                                          <th className="px-2.5 py-1.5 font-medium">月份</th>
-                                          <th className="px-2.5 py-1.5 text-right font-medium">分红金额</th>
-                                          <th className="px-2.5 py-1.5 font-medium">状态</th>
-                                        </tr>
-                                      </thead>
-                                      <tbody>
-                                        {introducerRecords.map((r: any) => (
-                                          <tr key={r.id} className="border-b last:border-0">
-                                            <td className="px-2.5 py-1.5 text-slate-600">{r.period}</td>
-                                            <td className="px-2.5 py-1.5 text-right font-medium text-emerald-600 tabular-nums">
-                                              {fmtMoney(r.shares.reduce((sum: number, s: any) => sum + Number(s.amount || 0), 0))}
-                                            </td>
-                                            <td className="px-2.5 py-1.5">
-                                              <span className={`rounded-full px-2 py-0.5 text-[10px] ${r.status === "已结算" ? "bg-emerald-100 text-emerald-700" : r.status === "已通过" ? "bg-blue-100 text-blue-700" : "bg-slate-100 text-slate-600"}`}>{r.status}</span>
-                                            </td>
-                                          </tr>
-                                        ))}
-                                      </tbody>
-                                      <tfoot>
-                                        <tr className="border-t bg-slate-50 font-medium">
-                                          <td className="px-2.5 py-1.5">合计</td>
-                                          <td className="px-2.5 py-1.5 text-right text-emerald-600 tabular-nums">
-                                            {fmtMoney(introducerRecords.reduce((sum: number, r: any) => sum + r.shares.reduce((s: number, sh: any) => s + Number(sh.amount || 0), 0), 0))}
-                                          </td>
-                                          <td></td>
-                                        </tr>
-                                      </tfoot>
-                                    </table>
-                                  </div>
-                                ) : !hasBizEstimate ? (
-                                  <div className="py-4 text-center text-xs text-slate-400">暂无分红记录和预估数据</div>
-                                ) : null}
-                              </div>
-                            )}
-                          </div>
-                        );
-                      })}
-                    </div>
-                  )}
-
-                  {(!activeShConfigs || activeShConfigs.length === 0) && (!intConfigs || intConfigs.length === 0) && (
-                    <div className="px-4 py-6 text-center text-xs text-slate-400">暂无分红配置，请点击上方按钮添加</div>
-                  )}
-                </div>
-              )}
-
-              {/* 运营费用（v3：按场地） */}
-              {landlordId && (
-                <div className="rounded-xl border bg-white overflow-hidden">
-                  <div className="flex items-center justify-between border-b bg-slate-50 px-4 py-2">
-                    <div className="flex items-center gap-1.5 text-xs font-semibold text-slate-600">
-                      <DollarSign className="h-3.5 w-3.5" />
-                      运营费用（{stationPeriodLabel}）
-                    </div>
-                  </div>
-                  <div className="p-3">
-                    {/* 新增行（汇总视图下禁用，提示切换为按月） */}
-                    {stationGranularity === "month" ? (
-                      <div className="flex items-center gap-2 mb-2">
-                        <input className={`${inputCls} w-24 text-[11px]`} type="number" placeholder="金额" value={expenseDraft.amount}
-                          onChange={(e) => setExpenseDraft((p) => ({ ...p, amount: e.target.value }))} />
-                        <input className={`${inputCls} flex-1 text-[11px]`} placeholder="备注（如：维护费、保险费）" value={expenseDraft.remark}
-                          onChange={(e) => setExpenseDraft((p) => ({ ...p, remark: e.target.value }))} />
-                        <button className="rounded bg-emerald-600 px-2 py-1 text-[11px] text-white hover:bg-emerald-700"
-                          onClick={() => {
-                            if (!expenseDraft.amount) { toast.error("请填写金额"); return; }
-                            saveExpenseMut.mutate({ landlordId, period: selectedMonth, amount: Number(expenseDraft.amount), remark: expenseDraft.remark || null });
-                          }}>添加</button>
-                      </div>
-                    ) : (
-                      <div className="mb-2 rounded-md border border-amber-200 bg-amber-50 px-2.5 py-1.5 text-[10px] text-amber-700">
-                        当前为{stationPeriodLabel}汇总视图，如需新增运营费用请切换为「月」粒度
-                      </div>
-                    )}
-                    {/* 列表 */}
-                    {expenses && expenses.length > 0 ? (
-                      <div className="space-y-1">
-                        {expenses.map((e: any) => (
-                          <div key={e.id} className="flex items-center justify-between rounded border px-2 py-1.5 text-[11px] hover:bg-slate-50">
-                            {editExpenseId === e.id ? (
-                              <>
-                                <input className={`${inputCls} w-20 text-[11px]`} type="number" value={editExpenseDraft.amount}
-                                  onChange={(ev) => setEditExpenseDraft((p) => ({ ...p, amount: ev.target.value }))} />
-                                <input className={`${inputCls} flex-1 mx-2 text-[11px]`} value={editExpenseDraft.remark}
-                                  onChange={(ev) => setEditExpenseDraft((p) => ({ ...p, remark: ev.target.value }))} />
-                                <button className="text-emerald-600 mr-1" onClick={() => {
-                                  saveExpenseMut.mutate({ id: e.id, landlordId, period: e.period || selectedMonth, amount: Number(editExpenseDraft.amount), remark: editExpenseDraft.remark || null });
-                                  setEditExpenseId(null);
-                                }}>保存</button>
-                                <button className="text-slate-400" onClick={() => setEditExpenseId(null)}>取消</button>
-                              </>
-                            ) : (
-                              <>
-                                <span className="font-medium text-slate-700 tabular-nums">{fmtMoney(e.amount)}</span>
-                                {stationGranularity !== "month" && (
-                                  <span className="ml-1 rounded bg-slate-100 px-1 py-0.5 text-[9px] text-slate-500">{toDisplay(e.period)}</span>
-                                )}
-                                <span className="flex-1 mx-2 text-slate-500 truncate">{e.remark || "-"}</span>
-                                <button className="text-slate-400 hover:text-emerald-600 mr-1" onClick={() => {
-                                  setEditExpenseId(e.id);
-                                  setEditExpenseDraft({ amount: String(e.amount), remark: e.remark || "" });
-                                }}>编辑</button>
-                                <button className="text-slate-400 hover:text-rose-500" onClick={() => {
-                                  if (window.confirm("删除该费用？")) deleteExpenseMut.mutate(e.id);
-                                }}>删除</button>
-                              </>
-                            )}
-                          </div>
-                        ))}
-                      </div>
-                    ) : (
-                      <div className="py-3 text-center text-[11px] text-slate-400">暂无运营费用</div>
-                    )}
-                  </div>
-                </div>
-              )}
-
-              {/* 分红记录（v3：按场地） */}
-              {landlordId && (
-                <div className="rounded-xl border bg-white overflow-hidden">
-                  <div className="flex items-center justify-between border-b bg-slate-50 px-4 py-2">
-                    <div className="flex items-center gap-1.5 text-xs font-semibold text-slate-600">
-                      <DollarSign className="h-3.5 w-3.5" />
-                      分红记录
-                      {stationGranularity !== "month" && stationDividends?.length > 0 && (
-                        <span className="ml-1 rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-medium text-emerald-700">
-                          {stationDividends.length} 条 · 合计 {fmtMoney(stationDividends.reduce((sum: number, r: any) => sum + (r.shares?.reduce((s: number, sh: any) => s + Number(sh.amount || 0), 0) || 0), 0))}
-                        </span>
-                      )}
-                    </div>
-                    <button onClick={() => setAddDividendOpen({ open: true, landlordId })} className="rounded-md bg-emerald-600 px-2 py-1 text-[11px] text-white hover:bg-emerald-700">
-                      新增月结
-                    </button>
-                  </div>
-
-                  {/* 期间分红汇总（季度/半年粒度） */}
-                  {stationDividendSummary && (
-                    <div className="border-b bg-emerald-50/40 px-4 py-3 space-y-2">
-                      <div className="text-[11px] font-semibold text-slate-600">{stationPeriodLabel}分红汇总</div>
-                      <div className="grid grid-cols-2 gap-2">
-                        {(["股东分红", "商务分红"] as const).map((t) => (
-                          <div key={t} className="flex items-center justify-between rounded border bg-white px-2.5 py-1.5 text-[11px]">
-                            <span className="text-slate-500">{t}</span>
-                            <span className="font-semibold tabular-nums text-emerald-700">{fmtMoney(stationDividendSummary.byType[t] || 0)}</span>
-                          </div>
-                        ))}
-                      </div>
-                      {stationDividendSummary.persons.length > 0 && (
-                        <div className="space-y-1">
-                          <div className="text-[10px] text-slate-400">按股东/介绍人合计</div>
-                          {stationDividendSummary.persons.map((p: any, i: number) => (
-                            <div key={i} className="flex items-center justify-between text-[11px]">
-                              <span className="text-slate-600">
-                                {p.name}
-                                {p.brandName && <span className="ml-1 rounded bg-amber-50 px-1 py-0.5 text-[9px] text-amber-600">{p.brandName}</span>}
-                              </span>
-                              <span className="font-medium tabular-nums text-slate-700">{fmtMoney(p.amount)}</span>
-                            </div>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                  )}
-
-                  {stationDividends && stationDividends.length > 0 ? (
-                    <div className="divide-y">
-                      {stationDividends.map((r: any) => (
-                        <div key={r.id} className="px-4 py-3">
-                          <div className="flex items-center justify-between mb-2">
-                            <div className="flex items-center gap-2">
-                              <span className="text-xs font-semibold text-slate-700">{r.period}</span>
-                              <span className={`rounded-full px-2 py-0.5 text-[10px] ${r.type === "股东分红" ? "bg-blue-100 text-blue-700" : "bg-purple-100 text-purple-700"}`}>{r.type}</span>
-                              <span className={`rounded-full px-2 py-0.5 text-[10px] ${r.status === "已结算" ? "bg-emerald-100 text-emerald-700" : r.status === "已通过" ? "bg-blue-100 text-blue-700" : "bg-slate-100 text-slate-600"}`}>{r.status}</span>
-                            </div>
-                            <div className="flex items-center gap-2">
-                              <div className={`text-sm font-semibold tabular-nums ${r.profit >= 0 ? "text-emerald-600" : "text-rose-600"}`}>利润 {fmtMoney(r.profit)}</div>
-                              {r.status === "未结算" && (
-                                <button
-                                  onClick={() => setSubmitApprovalDiv(r)}
-                                  className="rounded-md bg-blue-600 px-2 py-1 text-[11px] text-white hover:bg-blue-700"
-                                >
-                                  提交审批
-                                </button>
-                              )}
-                              {r.status === "审批中" && (
-                                <span className="text-[10px] text-amber-600">审批中…</span>
-                              )}
-                            </div>
-                          </div>
-                          {r.shares && r.shares.length > 0 && (
-                            <div className="ml-4 space-y-1">
-                              {r.shares.map((s: any, i: number) => (
-                                <div key={i} className="flex items-center justify-between text-[11px]">
-                                  <span className="text-slate-500">
-                                    {s.shareholderName || s.introducerName || "-"}
-                                    {s.brandName && <span className="ml-1 rounded bg-amber-50 px-1 py-0.5 text-[9px] text-amber-600">{s.brandName}</span>}
-                                  </span>
-                                  <span className="font-medium tabular-nums text-slate-700">{fmtMoney(s.amount)}</span>
-                                </div>
-                              ))}
-                            </div>
-                          )}
-                        </div>
-                      ))}
-                    </div>
-                  ) : (
-                    <div className="px-4 py-8 text-center text-xs text-slate-400">暂无分红记录</div>
-                  )}
-                </div>
-              )}
+                )}
+              </div>
             </div>
           )
         )}
@@ -2836,23 +1659,9 @@ export default function Shareholders() {
 
       {/* ─── 弹窗 ─── */}
       <AddShareholderDialog open={addShareholderOpen} onClose={() => setAddShareholderOpen(false)} />
-      <ConfigDividendDialog open={configOpen.open} onClose={() => setConfigOpen({ ...configOpen, open: false })} type={configOpen.type} landlordId={configOpen.landlordId} brands={landlordBrands} />
-      <AddDividendDialog open={addDividendOpen.open} onClose={() => setAddDividendOpen({ ...addDividendOpen, open: false })} landlordId={addDividendOpen.landlordId} />
-      <SubmitApprovalDialog
-        open={!!submitApprovalDiv}
-        onClose={() => { setSubmitApprovalDiv(null); setSelectedApprovalIds([]); }}
-        dividends={Array.isArray(submitApprovalDiv) ? submitApprovalDiv : (submitApprovalDiv ? [submitApprovalDiv] : [])}
-        onSuccess={() => {
-          qc.invalidateQueries({ queryKey: ["stationDividends"] });
-          qc.invalidateQueries({ queryKey: ["approvals"] });
-        }}
-      />
-      <ExportDateDialog
-        open={exportDateOpen}
-        onClose={() => setExportDateOpen(false)}
-        onConfirm={viewMode === "shareholder" ? doShareholderExport : doStationExport}
-        hint={exportHint}
-      />
+      <ConfigDividendDialog open={configOpen.open} onClose={() => setConfigOpen({ ...configOpen, open: false, config: null })} type={configOpen.type} editingConfig={configOpen.config} landlordId={configOpen.config?.landlordId ?? landlordId ?? undefined} brands={configOpen.config?.landlordId ? brandsOfLandlord(configOpen.config.landlordId) : landlordBrands} />
+      <AddDividendDialog open={addDividendOpen} onClose={() => setAddDividendOpen(false)} landlordId={landlordId ?? undefined} defaultPeriod={periodEnd} estimatePreview={endMonthPreview} />
+      {detail && <DividendDetailDialog open={detail.open} onClose={() => setDetail(null)} landlordName={detail.landlordName} personName={detail.personName} months={detail.months} monthDatas={detail.monthDatas} personKey={detail.personKey} personId={detail.personId} />}
     </div>
   );
 }

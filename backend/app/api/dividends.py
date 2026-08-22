@@ -45,10 +45,12 @@ async def delete_introducer_config(config_id: int):
 
 @router.post("/calculate")
 async def calculate_dividend(data: dict, request: Request):
-    """计算分红（预览，不入库）v3：按 场地(+品牌) 计算"""
+    """计算分红（预览，不入库）v3：按 场地(+品牌) 计算。
+    estimate=true 时：返回本月预估分红（不乘周期倍数）+ 周期信息（是否结算月/周期起点月）。"""
     from ..infra.period import to_compact
     landlord_id = data.get("landlordId")
     brand_id = data.get("brandId")
+    estimate = bool(data.get("estimate"))
     period = to_compact(data.get("period"))
     if not landlord_id or not period:
         raise HTTPException(400, "landlordId 和 period 必填")
@@ -58,7 +60,7 @@ async def calculate_dividend(data: dict, request: Request):
     if allowed is not None and int(landlord_id) not in allowed:
         raise HTTPException(403, "无权查看该场地分红")
 
-    result = dividend_calculator.calculate(int(landlord_id), brand_id, period)
+    result = dividend_calculator.calculate(int(landlord_id), brand_id, period, estimate=estimate)
     if not result:
         raise HTTPException(404, "场地不存在")
     return result
@@ -181,20 +183,28 @@ async def create_dividend(data: dict):
 
 @router.post("/{record_id}/submit")
 async def submit_dividend(record_id: int, data: dict):
-    """提交分红审批"""
+    """提交分红审批（关联分红记录，审核人员可展开查看详细分红核算信息）"""
     record = dividend_repo.get_record(record_id)
     if not record:
         raise HTTPException(404, "分红记录不存在")
     if record["status"] != "未结算":
         raise HTTPException(400, f"当前状态 {record['status']} 不允许提交")
 
-    # 创建审批单
+    # 审批金额 = 该记录所有分红明细之和（实际要发放的金额）；无明细时退回用净利润
+    shares = dividend_repo.get_shares(record_id)
+    dividend_total = round(sum(float(s.get("amount") or 0) for s in shares), 2)
+    amount = dividend_total if dividend_total > 0 else (record.get("profit") or 0)
+
+    # 创建审批单（bizType 需与 approval_flows 流程配置一致，Approvals 页按此类型展示分红详情）
     approval = approval_repo.create_request({
-        "bizType": "股东分红",
+        "bizType": "分红审批",
         "title": f"{record.get('landlord_name', '')} {record['period']} 分红",
         "reason": data.get("reason"),
-        "amount": record.get("profit"),
+        "amount": amount,
         "applicant": data.get("applicant", "系统"),
+        "dividendRecordId": record_id,
+        "landlordId": record.get("landlord_id"),
+        "period": record.get("period"),
     })
 
     # 更新分红状态

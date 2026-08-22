@@ -128,7 +128,7 @@ export function MapPicker({ latitude, longitude, onLocationChange }: MapPickerPr
         </div>
       )}
 
-      <p className="text-xs text-slate-400">点击地图选择站点位置</p>
+      <p className="text-xs text-slate-400">点击地图选择场地位置</p>
     </div>
   );
 }

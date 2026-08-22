@@ -165,7 +165,7 @@ async def sync_collectors():
 # ─── 实时状态同步 ──────────────────────────────────────────
 
 async def sync_status():
-    """同步实时状态（遍历所有配置账户，每10分钟）"""
+    """同步实时状态（遍历所有配置账户，每2小时）"""
     logger.info("🔄 开始同步实时状态...")
     configs = get_account_configs()
     total = 0
@@ -214,7 +214,7 @@ async def sync_status():
 # ─── 能耗数据同步 ──────────────────────────────────────────
 
 async def sync_hourly_data():
-    """同步最近24小时用电量（遍历所有配置账户，每小时）"""
+    """同步最近24小时用电量（遍历所有配置账户，每2小时）"""
     logger.info("🔄 开始同步小时用电量...")
     now = datetime.now()
     start = (now - timedelta(hours=24)).strftime("%Y%m%d%H")

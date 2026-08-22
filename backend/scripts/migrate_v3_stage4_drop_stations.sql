@@ -1,5 +1,5 @@
 -- ═══════════════════════════════════════════════════════════════════════════
--- v3 阶段4：彻底删除站点层（stations 表 + 全部 station_id 列 + v2 旧配置/租金表）
+-- v3 阶段4：删除 stations 表和所有 station_id 列
 -- 前置：业务已全部场地化（landlord_id/brand_id 直连），本脚本为收尾清理。
 -- 先执行备份脚本 backup_v3_stage4.sql，再执行本脚本。
 -- ═══════════════════════════════════════════════════════════════════════════
@@ -42,13 +42,14 @@ ALTER TABLE approval_requests    DROP COLUMN IF EXISTS station_name;
 DROP TABLE IF EXISTS stations;
 
 -- ── 4. 删除 v2 遗留空表（已由 landlord_* / rent_*_schedule 替代）────────
-DROP TABLE IF EXISTS station_shareholder_configs;
-DROP TABLE IF EXISTS station_introducer_configs;
-DROP TABLE IF EXISTS rent_leases;
-DROP TABLE IF EXISTS rent_incomes;
-DROP TABLE IF EXISTS rent_income_records;
-DROP TABLE IF EXISTS rent_payment_records;
-DROP TABLE IF EXISTS rent_receipts;
+-- 注意：这些表可能还有数据，需要确认后再删除
+-- DROP TABLE IF EXISTS station_shareholder_configs;
+-- DROP TABLE IF EXISTS station_introducer_configs;
+-- DROP TABLE IF EXISTS rent_leases;
+-- DROP TABLE IF EXISTS rent_incomes;
+-- DROP TABLE IF EXISTS rent_income_records;
+-- DROP TABLE IF EXISTS rent_payment_records;
+-- DROP TABLE IF EXISTS rent_receipts;
 
 COMMIT;
 

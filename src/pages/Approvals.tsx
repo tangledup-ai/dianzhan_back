@@ -353,6 +353,17 @@ function DividendDetail({ req }: { req: any }) {
                     <td className="py-1 text-slate-700">总成本</td>
                     <td className="py-1 text-right tabular-nums text-rose-600">{fmtMoney(dividendPreview.cost?.totalCost || 0)}</td>
                   </tr>
+                  <tr className="border-b">
+                    <td className="py-1 text-slate-500">电费税费</td>
+                    <td className="py-1 text-right tabular-nums text-slate-500">{fmtMoney(dividendPreview.cost?.elecTax || 0)}</td>
+                  </tr>
+                  <tr className="border-b">
+                    <td className="py-1 text-slate-500">租金税费</td>
+                    <td className="py-1 text-right tabular-nums text-slate-500">{fmtMoney(dividendPreview.cost?.rentTax || 0)}</td>
+                  </tr>
+                  <tr>
+                    <td colSpan={2} className="py-1 text-[10px] text-slate-400">税费单独核算展示，不参与净利润（避免与不含税收入双扣）</td>
+                  </tr>
                 </tbody>
               </table>
             </div>
@@ -470,7 +481,7 @@ function ApprovalDetail({ req }: { req: any }) {
         )}
       </div>
 
-      {/* 站点费用审批详情 */}
+      {/* 费用审批详情（电费/场地费） */}
       {(req.bizType === "电费付款" || req.bizType === "场地费付款" || req.bizType === "电费+场地费") && (
         <StationApprovalDetail req={req} />
       )}
@@ -652,7 +663,7 @@ export default function Approvals() {
                 options={bizTypes.map((b: string) => ({ value: b, label: b }))} />
             </Field>
             <Field label="申请人 *"><TextInput value={form.applicant} onChange={(v) => setForm((p) => ({ ...p, applicant: v }))} placeholder="经办人姓名" /></Field>
-            <Field label="审批事由 *" span><TextInput value={form.title} onChange={(v) => setForm((p) => ({ ...p, title: v }))} placeholder="如：XX站点6月电费付款" /></Field>
+            <Field label="审批事由 *" span><TextInput value={form.title} onChange={(v) => setForm((p) => ({ ...p, title: v }))} placeholder="如：XX场地6月电费付款" /></Field>
             <Field label="金额（元）"><NumInput value={form.amount} onChange={(v) => setForm((p) => ({ ...p, amount: v }))} /></Field>
             <Field label="事由说明" span>
               <textarea className={`${inputCls} w-full`} rows={4} value={form.reason} onChange={(e) => setForm((p) => ({ ...p, reason: e.target.value }))} placeholder="付款依据、合同条款、计算过程等…" />

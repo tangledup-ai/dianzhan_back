@@ -1,6 +1,6 @@
 # 数据库改造 v3 — 去掉「站点」层，场地直挂电表
 
-> 状态：**进行中**（用户确认方案 B：场地方 → 智慧电表 直挂，无站点层）
+> 状态：**已完成**（用户确认方案 B：场地方 → 智慧电表 直挂，无站点层）
 > 原则：每阶段先备份、可验证、不破坏 Meters 第三方数据（meter_devices/meter_monthly/能耗缓存/meters 本体不动）。
 
 ---
@@ -62,9 +62,9 @@ v3：场地方(landlord) ──────────────────�
 | 阶段 | 内容 | 验证 |
 |---|---|---|
 | **① 表结构 + 数据迁移**（已完成） | 备份 → 加列 → 迁移数据 → 建 landlord_* 配置表并迁移 → 改唯一键 | 行数核对、映射正确 |
-| **② 后端改造**（已完成） | generate / dividend_calc / electricity / dividends / rent / approval / overview 已 landlord 化；mp_snapshot / mp_finance 进行中 | py_compile + 台账重算 + 实库验证 |
-| **③ 前端改造**（已完成主要） | Shareholders 页已按场地；Stations 页已改「场地→品牌电表」视图；其余页面显示层已适配 landlord | tsc 通过 |
-| **④ 收尾**（待做） | 删 stations 表、删 station_id 残留列、清理 StationForm/StationDrawer/ElecForm/RentForms 站点表单、更新文档 | 全量编译 |
+| **② 后端改造**（已完成） | generate / dividend_calc / electricity / dividends / rent / approval / overview / mp_* 全部 landlord 化；JOIN stations 引用清零 | py_compile + 台账重算 + 实库验证 |
+| **③ 前端改造**（已完成） | Shareholders / Stations（场地-品牌视图）/ Approvals / DividendForm / Entities / Landlords / Brands / Meters / Contracts 全部适配 landlord；站点组件（StationForm/StationDrawer/ElecForm/RentForms）已删 | tsc 通过 |
+| **④ 收尾**（已完成） | 删 stations 表、删全部 station_id/station_name 列、删 v2 旧表（station_*_configs / rent_leases / rent_incomes / rent_*_records / rent_receipts）、重建 v3 视图、更新 database_init.sql | 实库验证：overview/station_board/dividend_calc/landlord meter-view/monthly-ledger/mp_* 全部通过 |
 
 ---
 

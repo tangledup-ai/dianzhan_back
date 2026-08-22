@@ -7,7 +7,7 @@ import { StatusBadge } from "@/components/Stat";
 import { Button } from "@/components/ui/button";
 import { inputCls } from "@/components/fields";
 import { exportXlsx } from "@/lib/export";
-import { fmtMoney, fmtNum, fmtDate, fmtPct } from "@/lib/format";
+import { fmtMoney, fmtNum, fmtDate } from "@/lib/format";
 import { Download, Search, ChevronDown, ChevronRight, MapPin, Zap, FileText, DollarSign, Building2 } from "lucide-react";
 import { toast } from "sonner";
 

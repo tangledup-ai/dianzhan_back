@@ -192,6 +192,18 @@ async def get_landlord_meter_view(landlord_id: int, period: str = None, request:
         elif c.get("contract_type") == "品牌方合同":
             if c.get("brand_id") and c["brand_id"] not in station_brand_ids:
                 continue
+            # 收款分期（contracts 中已有：按 pay_method 拆期）
+            income_scheds = contract_schedule_repo.list_income_schedules(contract_id=c["id"])
+            paid_count = sum(1 for s in income_scheds if s.get("status") == "已到账")
+            total_count = len(income_scheds)
+            # 覆盖所选月份的收款分期区间（如 2026-02-12 ~ 2026-03-11）
+            cur_period_sched = None
+            for s in income_scheds:
+                ps = str(s.get("period_start", ""))[:7]
+                pe = str(s.get("period_end", ""))[:7]
+                if ps <= period <= pe:
+                    cur_period_sched = s
+                    break
             contract_rent["income"].append({
                 "id": c.get("id"),
                 "brandId": c.get("brand_id"),
@@ -202,6 +214,11 @@ async def get_landlord_meter_view(landlord_id: int, period: str = None, request:
                 "startDate": str(c.get("start_date", ""))[:10] if c.get("start_date") else None,
                 "endDate": str(c.get("end_date", ""))[:10] if c.get("end_date") else None,
                 "payStatus": c.get("pay_status"),
+                # 场地收款期间（覆盖所选月的分期区间）与 租金收款情况（已到账 X/Y 期）
+                "periodStart": str(cur_period_sched.get("period_start", ""))[:10] if cur_period_sched else None,
+                "periodEnd": str(cur_period_sched.get("period_end", ""))[:10] if cur_period_sched else None,
+                "paidCount": paid_count,
+                "totalCount": total_count,
             })
 
     # 按品牌分组电表
@@ -329,8 +346,15 @@ async def get_landlord_meter_view(landlord_id: int, period: str = None, request:
         if c.get("monthlyRent"):
             total_rent_income += float(c["monthlyRent"])
 
+    # 租金税费（品牌方合同启用税率：含税月租 − 税后月租），利润扣税，与 Rent 页/分红一致
+    rent_tax = 0.0
+    for c in contracts:
+        if c.get("contract_type") == "品牌方合同" and c.get("brand_id") in station_brand_ids:
+            if c.get("rent_tax_enabled") and c.get("post_tax_rent_price"):
+                rent_tax += float(c.get("monthly_rent") or 0) - float(c["post_tax_rent_price"])
+
     total_elec_profit = total_collect_net - total_pay_amount
-    total_rent_profit = total_rent_income - total_rent_cost
+    total_rent_profit = round(total_rent_income - total_rent_cost - rent_tax, 2)
 
     landlord_name = None
     if meters and meters[0].get("landlord_name"):
@@ -352,6 +376,7 @@ async def get_landlord_meter_view(landlord_id: int, period: str = None, request:
             "totalElecProfit": total_elec_profit,
             "totalRentCost": total_rent_cost,
             "totalRentIncome": total_rent_income,
+            "totalRentTax": round(rent_tax, 2),
             "totalRentProfit": total_rent_profit,
         },
     }

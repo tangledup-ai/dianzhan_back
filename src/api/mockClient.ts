@@ -85,6 +85,10 @@ async function handleGetRequest(url: string, params?: any): Promise<any> {
   if (path === '/api/electricity/monthly-ledger') {
     return { period: String(params?.period || ''), dim: params?.dim || 'landlord', rows: [], totals: { kwh: 0, payAmount: 0, collectAmount: 0, collectNet: 0, elecTax: 0, profit: 0 } }
   }
+  // 电费收付明细导出（mock 备用：返回空结构，真实数据走后端）
+  if (path === '/api/electricity/export') {
+    return { period: String(params?.period || ''), dim: params?.dim || 'landlord', rows: [], groupTotals: [], totals: { kwh: 0, payAmount: 0, collectAmount: 0, collectNet: 0, profit: 0, opExpense: 0, profitAfterOp: 0, companyNetProfit: 0 } }
+  }
 
   // 租金
   if (path === '/api/rent/leases') {

@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # 数据库
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://quant:quant-speed123@host.docker.internal:5432/dianzhan-test")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://quant:quant-speed123@localhost:5432/huandian_v2")
 
 # 服务
 PORT = int(os.getenv("PORT", "3001"))

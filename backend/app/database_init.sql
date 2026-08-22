@@ -1,10 +1,10 @@
 -- ============================================================
 -- 2026_08_full_redesign.sql
--- 数据库全量重设计 v2 —— 全部表一次建齐（全新安装基准 + 存量库对齐）
+-- 数据库全量重设计 v3 —— 全部表一次建齐（全新安装基准 + 存量库对齐，stations 已移除）
 --
 -- 配套设计文档：DATABASE_REDESIGN_V2.md
--- 覆盖：档案域 / 站点域 / 电表接入域 / 电表档案域 / 合同域 /
---       台账派生域 / 分配规则域 / 审批域 / 过渡表 / 视图  = 39 表 + 3 视图
+-- 覆盖：档案域 / 电表接入域 / 电表档案域 / 合同域 /
+--       台账派生域 / 分配规则域 / 审批域 / 视图  = 33 表 + 3 视图
 -- 幂等：可重复执行（CREATE IF NOT EXISTS / ALTER IF NOT EXISTS / DO 块加约束）
 -- 说明：
 --   1) 对"全新空库"：本文件即完整数据库（可作为 database_init.sql 的整体替代基准，
@@ -95,32 +95,29 @@ CREATE TABLE IF NOT EXISTS platform_users (
 );
 COMMENT ON TABLE platform_users IS '平台用户（RBAC：boss/finance/finance_supervisor/shareholder；shareholder 用 landlord_ids 限定可见场地）';
 
--- ══════════ 2. 站点域 ══════════
+-- ══════════ 2. 站点域（v3 已废弃，保留表定义用于兼容） ══════════
 
-CREATE TABLE IF NOT EXISTS stations (
-    id SERIAL PRIMARY KEY,
-    name VARCHAR(200) NOT NULL,
-    code VARCHAR(50),
-    region VARCHAR(50),
-    address VARCHAR(300),
-    landlord_id INTEGER REFERENCES landlords(id),
-    entity_id INTEGER REFERENCES entities(id),
-    company_share NUMERIC(5,4),
-    status VARCHAR(20) DEFAULT '运营中',
-    latitude NUMERIC(10,7),
-    longitude NUMERIC(10,7),
-    remark TEXT,
-    created_at TIMESTAMP DEFAULT NOW()
-);
-COMMENT ON TABLE stations IS '站点（主链枢纽）；landlord_id 是电表 landlord 单源真相';
-COMMENT ON COLUMN stations.landlord_id IS '场地方（唯一真相：电表 landlord 由此带出）';
-COMMENT ON COLUMN stations.company_share IS '公司占股（展示用；分红计算以 station_*_configs 为准）';
+-- CREATE TABLE IF NOT EXISTS stations (
+--     id SERIAL PRIMARY KEY,
+--     name VARCHAR(200) NOT NULL,
+--     code VARCHAR(50),
+--     region VARCHAR(50),
+--     address VARCHAR(300),
+--     landlord_id INTEGER REFERENCES landlords(id),
+--     entity_id INTEGER REFERENCES entities(id),
+--     company_share NUMERIC(5,4),
+--     status VARCHAR(20) DEFAULT '运营中',
+--     latitude NUMERIC(10,7),
+--     longitude NUMERIC(10,7),
+--     remark TEXT,
+--     created_at TIMESTAMP DEFAULT NOW()
+-- );
+-- COMMENT ON TABLE stations IS '站点（v3 已废弃，landlord_id 为单源真相）';
 
 -- ══════════ 3. 电表·档案域（业务计算唯一入口）══════════
 
 CREATE TABLE IF NOT EXISTS meters (
     id SERIAL PRIMARY KEY,
-    station_id INTEGER NOT NULL REFERENCES stations(id),
     brand_id INTEGER REFERENCES brands(id),
     landlord_id INTEGER REFERENCES landlords(id),
     entity_id INTEGER REFERENCES entities(id),
@@ -137,7 +134,7 @@ CREATE TABLE IF NOT EXISTS meters (
 COMMENT ON TABLE meters IS '电表档案（业务计算唯一入口，禁止业务绕过本表直读缓存层）';
 COMMENT ON COLUMN meters.meter_no IS '电表号 = 第三方设备 address（全局唯一身份）';
 COMMENT ON COLUMN meters.transformer_ratio IS '互感器倍数：实际用电量 = 表码度数 × 倍数';
-COMMENT ON COLUMN meters.landlord_id IS '场地方（冗余跟随列，以 stations.landlord_id 为唯一真相）';
+COMMENT ON COLUMN meters.landlord_id IS '场地方（v3 主链聚合根：以 landlords 为唯一真相）';
 COMMENT ON COLUMN meters.tag IS '电表类型：合作商电表/民用电表/共享电表（第三方导入按账户写）';
 
 CREATE TABLE IF NOT EXISTS cabinets (
@@ -294,8 +291,6 @@ CREATE TABLE IF NOT EXISTS contracts (
     landlord_id INTEGER NOT NULL REFERENCES landlords(id),
     brand_id INTEGER REFERENCES brands(id),
     entity_id INTEGER REFERENCES entities(id),
-    station_id INTEGER REFERENCES stations(id),
-    station_name VARCHAR(200),
     -- ② 类型组
     contract_type VARCHAR(20) NOT NULL DEFAULT '场地合同',
     data_source VARCHAR(20) NOT NULL DEFAULT 'manual',
@@ -312,6 +307,7 @@ CREATE TABLE IF NOT EXISTS contracts (
     cabinets_count NUMERIC(8,2),
     monthly_rent NUMERIC(12,2),
     rent_amount NUMERIC(12,2),
+    input_cost NUMERIC(12,2),
     first_month_rent NUMERIC(12,2),
     rent_refund NUMERIC(12,2),
     early_end_date DATE,
@@ -340,7 +336,6 @@ COMMENT ON COLUMN contracts.electricity_price IS '电费单价（元/度）：�
 COMMENT ON COLUMN contracts.monthly_rent IS '月租金（元/月）：场地合同=付业主；品牌方合同=品牌方应付';
 COMMENT ON COLUMN contracts.cabinets_count IS 'DEPRECATED 参考快照：计费柜数以 meters→cabinets 实时统计为准';
 COMMENT ON COLUMN contracts.pay_status IS 'DEPRECATED：业务读分期推导值';
-COMMENT ON COLUMN contracts.station_name IS 'DEPRECATED 冗余显示列（曾存场地方名），收尾删除';
 COMMENT ON COLUMN contracts.partner IS 'DEPRECATED 无用列（无代码写入），收尾删除';
 
 CREATE TABLE IF NOT EXISTS rent_payment_schedule (
@@ -379,7 +374,8 @@ COMMENT ON TABLE rent_income_schedule IS '收款分期（品牌方合同：品�
 
 CREATE TABLE IF NOT EXISTS electricity_records (
     id SERIAL PRIMARY KEY,
-    station_id INTEGER NOT NULL REFERENCES stations(id),
+    landlord_id INTEGER REFERENCES landlords(id),
+    brand_id INTEGER REFERENCES brands(id),
     period VARCHAR(6) NOT NULL,
     pay_start_date DATE,
     pay_start_reading NUMERIC(14,2),
@@ -403,7 +399,7 @@ CREATE TABLE IF NOT EXISTS electricity_records (
     remark TEXT,
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW(),
-    UNIQUE(station_id, period)
+    UNIQUE(landlord_id, brand_id, period)
 );
 COMMENT ON TABLE electricity_records IS '电费月台账（快照，由 表码×倍数×合同单价 生成）；period 统一 6 位 YYYYMM';
 
@@ -424,19 +420,20 @@ COMMENT ON TABLE electricity_meter_details IS '电费分表明细（生成时与
 
 CREATE TABLE IF NOT EXISTS operating_expenses (
     id SERIAL PRIMARY KEY,
-    station_id INTEGER NOT NULL REFERENCES stations(id),
+    landlord_id INTEGER REFERENCES landlords(id),
     period VARCHAR(6) NOT NULL,
     amount NUMERIC(12,2) NOT NULL,
     remark TEXT,
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW(),
-    UNIQUE(station_id, period)
+    UNIQUE(landlord_id, period)
 );
 COMMENT ON TABLE operating_expenses IS '运营费用（独立手工输入，分红计算成本项）；period 统一 6 位 YYYYMM';
 
 CREATE TABLE IF NOT EXISTS dividend_records (
     id SERIAL PRIMARY KEY,
-    station_id INTEGER NOT NULL REFERENCES stations(id),
+    landlord_id INTEGER REFERENCES landlords(id),
+    brand_id INTEGER REFERENCES brands(id),
     period VARCHAR(6) NOT NULL,
     type VARCHAR(20) NOT NULL,
     elec_income NUMERIC(14,2),
@@ -474,9 +471,9 @@ COMMENT ON TABLE dividend_shares IS '分红明细（配置快照：生成时复�
 
 -- ══════════ 7. 分配规则域 ══════════
 
-CREATE TABLE IF NOT EXISTS station_shareholder_configs (
+CREATE TABLE IF NOT EXISTS landlord_shareholder_configs (
     id SERIAL PRIMARY KEY,
-    station_id INTEGER NOT NULL REFERENCES stations(id),
+    landlord_id INTEGER NOT NULL REFERENCES landlords(id),
     shareholder_id INTEGER NOT NULL REFERENCES shareholders(id),
     brand_id INTEGER REFERENCES brands(id),
     mode VARCHAR(20) NOT NULL,
@@ -489,14 +486,14 @@ CREATE TABLE IF NOT EXISTS station_shareholder_configs (
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW()
 );
-COMMENT ON TABLE station_shareholder_configs IS '股东分红配置（分配规则）；mode: 收入分红/利润分红/固定金额；settlement_period: 月/季度/半年/年';
-COMMENT ON COLUMN station_shareholder_configs.brand_id IS '空=整站配置（基数=场地总收入/净利润）；非空=绑定品牌配置；两类可并存';
-COMMENT ON COLUMN station_shareholder_configs.start_date IS '生效开始（空=1970-01-01，参与唯一键）';
-COMMENT ON COLUMN station_shareholder_configs.end_date IS '生效结束（空=无限期）';
+COMMENT ON TABLE landlord_shareholder_configs IS '股东分红配置（分配规则）；mode: 收入分红/利润分红/固定金额；settlement_period: 月/季度/半年/年';
+COMMENT ON COLUMN landlord_shareholder_configs.brand_id IS '空=整场地配置（基数=场地总收入/净利润）；非空=绑定品牌配置；两类可并存';
+COMMENT ON COLUMN landlord_shareholder_configs.start_date IS '生效开始（空=1970-01-01，参与唯一键）';
+COMMENT ON COLUMN landlord_shareholder_configs.end_date IS '生效结束（空=无限期）';
 
-CREATE TABLE IF NOT EXISTS station_introducer_configs (
+CREATE TABLE IF NOT EXISTS landlord_introducer_configs (
     id SERIAL PRIMARY KEY,
-    station_id INTEGER NOT NULL REFERENCES stations(id),
+    landlord_id INTEGER NOT NULL REFERENCES landlords(id),
     introducer_id INTEGER NOT NULL REFERENCES introducers(id),
     brand_id INTEGER REFERENCES brands(id),
     mode VARCHAR(20) NOT NULL,
@@ -510,21 +507,21 @@ CREATE TABLE IF NOT EXISTS station_introducer_configs (
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW()
 );
-COMMENT ON TABLE station_introducer_configs IS '介绍人商务分红配置（结构同股东配置 + count_as_cost）';
-COMMENT ON COLUMN station_introducer_configs.count_as_cost IS '商务分红是否计入成本：TRUE=先扣再算股东分红；FALSE=单独算';
+COMMENT ON TABLE landlord_introducer_configs IS '介绍人商务分红配置（结构同股东配置 + count_as_cost）';
+COMMENT ON COLUMN landlord_introducer_configs.count_as_cost IS '商务分红是否计入成本：TRUE=先扣再算股东分红；FALSE=单独算';
 
--- 分配规则唯一键（含生效期：同一受益人同站可配多段不重叠生效期）
-CREATE UNIQUE INDEX IF NOT EXISTS uq_ssh_conf_whole
-    ON station_shareholder_configs (station_id, shareholder_id, COALESCE(start_date, DATE '1970-01-01'))
+-- 分配规则唯一键（含生效期：同一受益人同场地可配多段不重叠生效期）
+CREATE UNIQUE INDEX IF NOT EXISTS uq_lsh_conf_whole
+    ON landlord_shareholder_configs (landlord_id, shareholder_id, COALESCE(start_date, DATE '1970-01-01'))
     WHERE brand_id IS NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS uq_ssh_conf_brand
-    ON station_shareholder_configs (station_id, brand_id, shareholder_id, COALESCE(start_date, DATE '1970-01-01'))
+CREATE UNIQUE INDEX IF NOT EXISTS uq_lsh_conf_brand
+    ON landlord_shareholder_configs (landlord_id, brand_id, shareholder_id, COALESCE(start_date, DATE '1970-01-01'))
     WHERE brand_id IS NOT NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS uq_sint_conf_whole
-    ON station_introducer_configs (station_id, introducer_id, COALESCE(start_date, DATE '1970-01-01'))
+CREATE UNIQUE INDEX IF NOT EXISTS uq_lin_conf_whole
+    ON landlord_introducer_configs (landlord_id, introducer_id, COALESCE(start_date, DATE '1970-01-01'))
     WHERE brand_id IS NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS uq_sint_conf_brand
-    ON station_introducer_configs (station_id, brand_id, introducer_id, COALESCE(start_date, DATE '1970-01-01'))
+CREATE UNIQUE INDEX IF NOT EXISTS uq_lin_conf_brand
+    ON landlord_introducer_configs (landlord_id, brand_id, introducer_id, COALESCE(start_date, DATE '1970-01-01'))
     WHERE brand_id IS NOT NULL;
 
 -- ══════════ 8. 审批域 ══════════
@@ -549,8 +546,7 @@ CREATE TABLE IF NOT EXISTS approval_requests (
     current_node INTEGER DEFAULT 0,
     status VARCHAR(20) DEFAULT '审批中',
     urge_count INTEGER DEFAULT 0,
-    station_id INTEGER REFERENCES stations(id),
-    station_name VARCHAR(200),
+    landlord_id INTEGER REFERENCES landlords(id),
     dividend_record_id INTEGER REFERENCES dividend_records(id),
     period VARCHAR(10),
     electricity_amount NUMERIC(14,2),
@@ -558,7 +554,7 @@ CREATE TABLE IF NOT EXISTS approval_requests (
     created_at TIMESTAMP DEFAULT NOW(),
     finished_at TIMESTAMP
 );
-COMMENT ON TABLE approval_requests IS '审批单（含站点/分红关联；通过后回写台账与分红状态）';
+COMMENT ON TABLE approval_requests IS '审批单（含场地/分红关联；通过后回写台账与分红状态）';
 
 CREATE TABLE IF NOT EXISTS approval_records (
     id SERIAL PRIMARY KEY,
@@ -580,83 +576,6 @@ CREATE TABLE IF NOT EXISTS approval_dividend_records (
     UNIQUE(approval_id, dividend_record_id)
 );
 COMMENT ON TABLE approval_dividend_records IS '审批单 ↔ 分红记录 一对多（支持多月批量审批）';
-
--- ══════════ 9. 过渡表（DEPRECATED：不承担主源职责）══════════
-
-CREATE TABLE IF NOT EXISTS rent_leases (
-    id SERIAL PRIMARY KEY,
-    station_id INTEGER NOT NULL REFERENCES stations(id),
-    contract_start DATE,
-    contract_end DATE,
-    annual_rent NUMERIC(12,2),
-    pay_method VARCHAR(50),
-    pay_amount NUMERIC(12,2),
-    deposit NUMERIC(12,2),
-    pay_deadline DATE,
-    pay_status VARCHAR(20) DEFAULT '未付款',
-    invoice_type VARCHAR(20),
-    remark TEXT,
-    created_at TIMESTAMP DEFAULT NOW()
-);
-COMMENT ON TABLE rent_leases IS 'DEPRECATED 场地租金付款台账（与 contracts 场地合同重复），实施轮并入 contracts 后下线';
-
-CREATE TABLE IF NOT EXISTS rent_incomes (
-    id SERIAL PRIMARY KEY,
-    station_id INTEGER NOT NULL REFERENCES stations(id),
-    brand_id INTEGER REFERENCES brands(id),
-    contract_start DATE,
-    contract_end DATE,
-    unit_monthly_rent NUMERIC(10,2),
-    cabinets_count NUMERIC(8,2),
-    monthly_rent NUMERIC(12,2),
-    annual_income NUMERIC(12,2),
-    tax_rate NUMERIC(5,4),
-    annual_income_net NUMERIC(12,2),
-    input_cost NUMERIC(12,2),
-    profit NUMERIC(12,2),
-    sign_status VARCHAR(100),
-    remark TEXT,
-    created_at TIMESTAMP DEFAULT NOW()
-);
-COMMENT ON TABLE rent_incomes IS 'DEPRECATED 品牌场地租金收款台账（与 contracts 品牌方合同重复），实施轮并入 contracts 后下线';
-
-CREATE TABLE IF NOT EXISTS rent_receipts (
-    id SERIAL PRIMARY KEY,
-    rent_income_id INTEGER NOT NULL REFERENCES rent_incomes(id),
-    seq NUMERIC(3,0) NOT NULL,
-    period_start DATE,
-    period_end DATE,
-    amount NUMERIC(12,2),
-    status VARCHAR(20) DEFAULT '未到账',
-    remark VARCHAR(200)
-);
-COMMENT ON TABLE rent_receipts IS 'DEPRECATED rent_incomes 的分期收款，实施轮并入 rent_income_schedule';
-
-CREATE TABLE IF NOT EXISTS rent_payment_records (
-    id SERIAL PRIMARY KEY,
-    station_id INTEGER NOT NULL REFERENCES stations(id),
-    brand_id INTEGER REFERENCES brands(id),
-    fiscal_year VARCHAR(20) NOT NULL,
-    pay_status VARCHAR(100),
-    invoice VARCHAR(200),
-    remark TEXT,
-    created_at TIMESTAMP DEFAULT NOW(),
-    UNIQUE(station_id, brand_id, fiscal_year)
-);
-COMMENT ON TABLE rent_payment_records IS '年度付款台账（发票归档，station+brand+fiscal_year）；与分期表 invoice 的分工实施轮明确';
-
-CREATE TABLE IF NOT EXISTS rent_income_records (
-    id SERIAL PRIMARY KEY,
-    station_id INTEGER NOT NULL REFERENCES stations(id),
-    brand_id INTEGER REFERENCES brands(id),
-    fiscal_year VARCHAR(20) NOT NULL,
-    income_status VARCHAR(100),
-    input_cost NUMERIC(12,2),
-    remark TEXT,
-    created_at TIMESTAMP DEFAULT NOW(),
-    UNIQUE(station_id, brand_id, fiscal_year)
-);
-COMMENT ON TABLE rent_income_records IS '年度收款台账（进项成本归档，station+brand+fiscal_year）；与分期表 invoice 的分工实施轮明确';
 
 -- ══════════ 10. 视图 ══════════
 
@@ -696,61 +615,89 @@ WITH periods AS (
     SELECT period FROM electricity_records
     UNION SELECT period FROM operating_expenses
     UNION SELECT period FROM dividend_records
+),
+elec AS (
+    SELECT landlord_id, period,
+           SUM(pay_kwh) AS pay_kwh,
+           SUM(pay_amount) AS pay_amount,
+           SUM(collect_amount) AS collect_amount,
+           SUM(collect_net) AS collect_net,
+           SUM(profit) AS profit
+    FROM electricity_records
+    GROUP BY landlord_id, period
+),
+venue_cost AS (
+    SELECT oc.landlord_id, p.period,
+           SUM(oc.monthly_rent) AS rent_cost
+    FROM contracts oc
+    CROSS JOIN periods p
+    WHERE oc.contract_type = '场地合同'
+      AND (oc.start_date IS NULL OR oc.start_date <= (DATE(p.period || '01') + INTERVAL '1 month' - INTERVAL '1 day'))
+      AND (COALESCE(oc.early_end_date, oc.end_date) IS NULL OR COALESCE(oc.early_end_date, oc.end_date) >= DATE(p.period || '01'))
+    GROUP BY oc.landlord_id, p.period
+),
+brand_income AS (
+    SELECT ic.landlord_id, p.period,
+           SUM(ic.monthly_rent) AS rent_income,
+           SUM(CASE WHEN ic.rent_tax_enabled AND ic.post_tax_rent_price IS NOT NULL
+                    THEN ic.monthly_rent - ic.post_tax_rent_price ELSE 0 END) AS rent_tax
+    FROM contracts ic
+    CROSS JOIN periods p
+    WHERE ic.contract_type = '品牌方合同'
+      AND (ic.start_date IS NULL OR ic.start_date <= (DATE(p.period || '01') + INTERVAL '1 month' - INTERVAL '1 day'))
+      AND (COALESCE(ic.early_end_date, ic.end_date) IS NULL OR COALESCE(ic.early_end_date, ic.end_date) >= DATE(p.period || '01'))
+    GROUP BY ic.landlord_id, p.period
+),
+op AS (
+    SELECT landlord_id, period, SUM(amount) AS amount
+    FROM operating_expenses
+    GROUP BY landlord_id, period
+),
+div AS (
+    SELECT d.landlord_id, d.period,
+           SUM(d.profit) AS net_profit,
+           SUM(ds.amount) FILTER (WHERE ds.shareholder_id IS NOT NULL) AS shareholder_dividend,
+           SUM(ds.amount) FILTER (WHERE ds.introducer_id IS NOT NULL) AS biz_dividend
+    FROM dividend_records d
+    LEFT JOIN dividend_shares ds ON ds.dividend_id = d.id
+    GROUP BY d.landlord_id, d.period
 )
 SELECT
     l.id AS landlord_id,
     l.name AS landlord_name,
     p.period,
-    COUNT(DISTINCT s.id)::INTEGER AS station_count,
-    COUNT(DISTINCT m.id)::INTEGER AS meter_count,
-    -- 电费（已生成台账口径：收款 = 实际度数 × 品牌方合同单价，按电表品牌匹配）
-    COALESCE(SUM(e.pay_kwh), 0)::NUMERIC(14,2) AS elec_pay_kwh,
-    COALESCE(SUM(e.pay_amount), 0)::NUMERIC(14,2) AS elec_pay_amount,
-    COALESCE(SUM(e.collect_amount), 0)::NUMERIC(14,2) AS elec_collect_amount,
-    COALESCE(SUM(e.collect_net), 0)::NUMERIC(14,2) AS elec_collect_net,
-    (COALESCE(SUM(e.collect_amount), 0) - COALESCE(SUM(e.collect_net), 0))::NUMERIC(14,2) AS elec_tax,
-    -- 电费利润 = 含税收款 − 付款 − 电费税费（等价 不含税收款 − 付款；税费为空按 0）
-    (COALESCE(SUM(e.collect_net), 0) - COALESCE(SUM(e.pay_amount), 0))::NUMERIC(14,2) AS elec_profit,
-    -- 租金（标准月口径：场地合同=成本，品牌方合同=收入；仅统计覆盖该月的合同）
-    COALESCE(SUM(oc.monthly_rent), 0)::NUMERIC(14,2) AS rent_cost,
-    COALESCE(SUM(ic.monthly_rent), 0)::NUMERIC(14,2) AS rent_income,
-    -- 租金利润 = 收入 − 成本 − 租金税费（税费为空按 0）
-    (COALESCE(SUM(ic.monthly_rent), 0) - COALESCE(SUM(oc.monthly_rent), 0)
-     - COALESCE(SUM(CASE WHEN ic.rent_tax_enabled AND ic.post_tax_rent_price IS NOT NULL
-                         THEN ic.monthly_rent - ic.post_tax_rent_price ELSE 0 END), 0))::NUMERIC(14,2) AS rent_profit,
-    COALESCE(SUM(CASE WHEN ic.rent_tax_enabled AND ic.post_tax_rent_price IS NOT NULL
-                      THEN ic.monthly_rent - ic.post_tax_rent_price ELSE 0 END), 0)::NUMERIC(14,2) AS rent_tax,
-    -- 运营费用
-    COALESCE(SUM(oe.amount), 0)::NUMERIC(14,2) AS op_expense,
-    -- 净利润（分红计算器口径，含税费/退款/商务分红成本）
-    COALESCE(SUM(d.profit), 0)::NUMERIC(14,2) AS net_profit,
-    -- 经营毛利 = 电费利润 + 租金利润 − 运营费用 − 股东分红 − 商务分红
-    (COALESCE(SUM(e.collect_net), 0) - COALESCE(SUM(e.pay_amount), 0)
-     + COALESCE(SUM(ic.monthly_rent), 0) - COALESCE(SUM(oc.monthly_rent), 0)
-     - COALESCE(SUM(CASE WHEN ic.rent_tax_enabled AND ic.post_tax_rent_price IS NOT NULL
-                         THEN ic.monthly_rent - ic.post_tax_rent_price ELSE 0 END), 0)
-     - COALESCE(SUM(oe.amount), 0)
-     - COALESCE(SUM(ds.amount) FILTER (WHERE ds.shareholder_id IS NOT NULL), 0)
-     - COALESCE(SUM(ds.amount) FILTER (WHERE ds.introducer_id IS NOT NULL), 0))::NUMERIC(14,2) AS gross_profit,
-    -- 分红去向（分红明细实分金额）
-    COALESCE(SUM(ds.amount) FILTER (WHERE ds.shareholder_id IS NOT NULL), 0)::NUMERIC(14,2) AS shareholder_dividend,
-    COALESCE(SUM(ds.amount) FILTER (WHERE ds.introducer_id IS NOT NULL), 0)::NUMERIC(14,2) AS biz_dividend
+    (SELECT COUNT(DISTINCT m.id) FROM meters m
+      WHERE m.landlord_id = l.id AND m.brand_id IS NOT NULL AND m.meter_no NOT LIKE 'TEST%')::INTEGER AS meter_count,
+    COALESCE(e.pay_kwh, 0)::NUMERIC(14,2) AS elec_pay_kwh,
+    COALESCE(e.pay_amount, 0)::NUMERIC(14,2) AS elec_pay_amount,
+    COALESCE(e.collect_amount, 0)::NUMERIC(14,2) AS elec_collect_amount,
+    COALESCE(e.collect_net, 0)::NUMERIC(14,2) AS elec_collect_net,
+    (COALESCE(e.collect_amount, 0) - COALESCE(e.collect_net, 0))::NUMERIC(14,2) AS elec_tax,
+    (COALESCE(e.collect_net, 0) - COALESCE(e.pay_amount, 0))::NUMERIC(14,2) AS elec_profit,
+    COALESCE(vc.rent_cost, 0)::NUMERIC(14,2) AS rent_cost,
+    COALESCE(bi.rent_income, 0)::NUMERIC(14,2) AS rent_income,
+    (COALESCE(bi.rent_income, 0) - COALESCE(vc.rent_cost, 0) - COALESCE(bi.rent_tax, 0))::NUMERIC(14,2) AS rent_profit,
+    COALESCE(bi.rent_tax, 0)::NUMERIC(14,2) AS rent_tax,
+    COALESCE(op.amount, 0)::NUMERIC(14,2) AS op_expense,
+    COALESCE(dv.net_profit, 0)::NUMERIC(14,2) AS net_profit,
+    (COALESCE(e.collect_net, 0) - COALESCE(e.pay_amount, 0)
+     + COALESCE(bi.rent_income, 0) - COALESCE(vc.rent_cost, 0)
+     - COALESCE(bi.rent_tax, 0)
+     - COALESCE(op.amount, 0)
+     - COALESCE(dv.shareholder_dividend, 0)
+     - COALESCE(dv.biz_dividend, 0))::NUMERIC(14,2) AS gross_profit,
+    COALESCE(dv.shareholder_dividend, 0)::NUMERIC(14,2) AS shareholder_dividend,
+    COALESCE(dv.biz_dividend, 0)::NUMERIC(14,2) AS biz_dividend
 FROM landlords l
 CROSS JOIN periods p
-LEFT JOIN stations s ON s.landlord_id = l.id
-LEFT JOIN meters m ON m.station_id = s.id AND m.landlord_id IS NOT NULL AND m.brand_id IS NOT NULL
-LEFT JOIN electricity_records e ON e.station_id = s.id AND e.period = p.period
-LEFT JOIN contracts oc ON oc.landlord_id = l.id AND oc.contract_type = '场地合同'
-    AND (oc.start_date IS NULL OR oc.start_date <= (DATE(p.period || '01') + INTERVAL '1 month' - INTERVAL '1 day'))
-    AND (COALESCE(oc.early_end_date, oc.end_date) IS NULL OR COALESCE(oc.early_end_date, oc.end_date) >= DATE(p.period || '01'))
-LEFT JOIN contracts ic ON ic.landlord_id = l.id AND ic.contract_type = '品牌方合同'
-    AND (ic.start_date IS NULL OR ic.start_date <= (DATE(p.period || '01') + INTERVAL '1 month' - INTERVAL '1 day'))
-    AND (COALESCE(ic.early_end_date, ic.end_date) IS NULL OR COALESCE(ic.early_end_date, ic.end_date) >= DATE(p.period || '01'))
-LEFT JOIN operating_expenses oe ON oe.station_id = s.id AND oe.period = p.period
-LEFT JOIN dividend_records d ON d.station_id = s.id AND d.period = p.period
-LEFT JOIN dividend_shares ds ON ds.dividend_id = d.id
-GROUP BY l.id, l.name, p.period;
-COMMENT ON VIEW landlord_monthly_summary IS '场地月度经营汇总（跨表聚合）：电费收支+税费/租金收支+税费/运营费用/净利润/分红，按场地×月份一行';
+LEFT JOIN elec e ON e.landlord_id = l.id AND e.period = p.period
+LEFT JOIN venue_cost vc ON vc.landlord_id = l.id AND vc.period = p.period
+LEFT JOIN brand_income bi ON bi.landlord_id = l.id AND bi.period = p.period
+LEFT JOIN op ON op.landlord_id = l.id AND op.period = p.period
+LEFT JOIN div dv ON dv.landlord_id = l.id AND dv.period = p.period
+ORDER BY l.id, p.period;
+COMMENT ON VIEW landlord_monthly_summary IS '场地月度经营汇总（v3：landlord 直连，各源预聚合防笛卡尔积）：电费收支+税费/租金收支+税费/运营费用/净利润/分红，按场地×月份一行';
+
 
 -- 分红结算周期视图：受益人 × 周期（月/季度/半年/年）的 下次结算期/日期 + 待结算/已结算金额
 DROP VIEW IF EXISTS dividend_settlement_schedule;
@@ -790,53 +737,37 @@ period_range AS (
 ),
 periods AS (
     SELECT '股东' AS beneficiary_type, shareholder_id AS beneficiary_id, settlement_period,
-           COUNT(DISTINCT station_id) AS station_count
-    FROM station_shareholder_configs
+           COUNT(DISTINCT landlord_id) AS landlord_count
+    FROM landlord_shareholder_configs
     WHERE COALESCE(end_date, DATE '9999-12-31') >= CURRENT_DATE
     GROUP BY shareholder_id, settlement_period
     UNION ALL
-    SELECT '介绍人' AS beneficiary_type, introducer_id AS beneficiary_id, settlement_period,
-           COUNT(DISTINCT station_id) AS station_count
-    FROM station_introducer_configs
+    SELECT '商务' AS beneficiary_type, introducer_id AS beneficiary_id, settlement_period,
+           COUNT(DISTINCT landlord_id) AS landlord_count
+    FROM landlord_introducer_configs
     WHERE COALESCE(end_date, DATE '9999-12-31') >= CURRENT_DATE
     GROUP BY introducer_id, settlement_period
-),
-b AS (
-    SELECT '股东' AS beneficiary_type, id AS beneficiary_id, name AS beneficiary_name FROM shareholders
-    UNION ALL
-    SELECT '介绍人', id, name FROM introducers
-),
-shares AS (
-    SELECT '股东' AS beneficiary_type, ds.shareholder_id AS beneficiary_id,
-           d.period, d.status, ds.amount
-    FROM dividend_shares ds JOIN dividend_records d ON ds.dividend_id = d.id
-    WHERE ds.shareholder_id IS NOT NULL
-    UNION ALL
-    SELECT '介绍人', ds.introducer_id, d.period, d.status, ds.amount
-    FROM dividend_shares ds JOIN dividend_records d ON ds.dividend_id = d.id
-    WHERE ds.introducer_id IS NOT NULL
 )
 SELECT
     p.beneficiary_type,
-    b.beneficiary_name,
+    p.beneficiary_id,
+    COALESCE(sh.name, i.name) AS beneficiary_name,
     p.settlement_period,
-    p.station_count,
-    pr.next_period      AS next_settlement_period,
-    pr.next_date        AS next_settlement_date,
-    pr.p_start          AS period_start,
-    pr.p_end            AS period_end,
-    COALESCE(SUM(CASE WHEN s.period BETWEEN pr.p_start AND pr.p_end
-                       AND s.status <> '已结算' THEN s.amount END), 0)::NUMERIC(14,2) AS pending_amount,
-    COALESCE(SUM(CASE WHEN s.period BETWEEN pr.p_start AND pr.p_end
-                       AND s.status = '已结算' THEN s.amount END), 0)::NUMERIC(14,2) AS settled_amount
+    p.landlord_count,
+    pr.p_start, pr.p_end, pr.next_period, pr.next_date,
+    COALESCE(SUM(CASE WHEN d.status = '已结算' THEN ds.amount ELSE 0 END), 0)::NUMERIC(14,2) AS settled_amount,
+    COALESCE(SUM(CASE WHEN d.status <> '已结算' THEN ds.amount ELSE 0 END), 0)::NUMERIC(14,2) AS pending_amount
 FROM periods p
-JOIN period_range pr ON pr.settlement_period = p.settlement_period
-JOIN b ON b.beneficiary_type = p.beneficiary_type AND b.beneficiary_id = p.beneficiary_id
-LEFT JOIN shares s ON s.beneficiary_type = p.beneficiary_type
-                  AND s.beneficiary_id = p.beneficiary_id
-GROUP BY p.beneficiary_type, b.beneficiary_name, p.settlement_period, p.station_count,
-         pr.next_period, pr.next_date, pr.p_start, pr.p_end;
-COMMENT ON VIEW dividend_settlement_schedule IS '分红结算周期视图：受益人×周期 的 下次结算期/日期、待结算金额、已结算金额';
+CROSS JOIN period_range pr
+LEFT JOIN dividend_shares ds ON ds.dividend_id IS NOT NULL
+    AND ((p.beneficiary_type = '股东' AND ds.shareholder_id = p.beneficiary_id)
+         OR (p.beneficiary_type = '商务' AND ds.introducer_id = p.beneficiary_id))
+LEFT JOIN dividend_records d ON ds.dividend_id = d.id AND d.period BETWEEN pr.p_start AND pr.p_end
+LEFT JOIN shareholders sh ON p.beneficiary_type = '股东' AND sh.id = p.beneficiary_id
+LEFT JOIN introducers i ON p.beneficiary_type = '商务' AND i.id = p.beneficiary_id
+GROUP BY p.beneficiary_type, p.beneficiary_id, COALESCE(sh.name, i.name), p.settlement_period,
+         p.landlord_count, pr.p_start, pr.p_end, pr.next_period, pr.next_date;
+COMMENT ON VIEW dividend_settlement_schedule IS '分红结算周期视图（v3：landlord 配置表）：受益人 × 周期 的下次结算期/日期 + 待结算/已结算金额';
 
 -- 末尾补充：dividend_records.approval_id 外键（解除循环引用）
 DO $$
@@ -851,27 +782,19 @@ END $$;
 -- 第二部分：存量库对齐（非破坏性）
 -- ────────────────────────────────────────────────────────────
 
--- 2.1 档案/站点补列
+-- 2.1 档案补列
 ALTER TABLE shareholders ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
 ALTER TABLE introducers  ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
-ALTER TABLE stations     ADD COLUMN IF NOT EXISTS latitude NUMERIC(10,7);
-ALTER TABLE stations     ADD COLUMN IF NOT EXISTS longitude NUMERIC(10,7);
 ALTER TABLE landlords    ADD COLUMN IF NOT EXISTS region VARCHAR(50);
 ALTER TABLE landlords    ADD COLUMN IF NOT EXISTS address VARCHAR(300);
 ALTER TABLE landlords    ADD COLUMN IF NOT EXISTS latitude NUMERIC(10,7);
 ALTER TABLE landlords    ADD COLUMN IF NOT EXISTS longitude NUMERIC(10,7);
 
--- 2.2 电表档案补列 + landlord 单源回填（以站点为准，幂等）
+-- 2.2 电表档案补列
 ALTER TABLE meters ADD COLUMN IF NOT EXISTS landlord_id INTEGER REFERENCES landlords(id);
 ALTER TABLE meters ADD COLUMN IF NOT EXISTS entity_id  INTEGER REFERENCES entities(id);
 ALTER TABLE meters ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
 ALTER TABLE meters ADD COLUMN IF NOT EXISTS tag VARCHAR(20) DEFAULT '合作商电表';
-UPDATE meters m
-SET landlord_id = s.landlord_id
-FROM stations s
-WHERE m.station_id = s.id
-  AND s.landlord_id IS NOT NULL
-  AND m.landlord_id IS DISTINCT FROM s.landlord_id;
 
 -- 2.3 缓存表补列（兼容漂移过的存量库）
 ALTER TABLE meter_monthly ADD COLUMN IF NOT EXISTS device_id VARCHAR(50);
@@ -894,15 +817,12 @@ UPDATE operating_expenses SET period = REPLACE(period, '-', '') WHERE period LIK
 UPDATE contracts SET contract_type = '场地合同'   WHERE contract_type = '场租付款';
 UPDATE contracts SET contract_type = '品牌方合同' WHERE contract_type = '场租收款';
 
--- 2.6 结算周期口径统一：季 → 季度
-UPDATE station_shareholder_configs SET settlement_period = '季度' WHERE settlement_period = '季';
-UPDATE station_introducer_configs  SET settlement_period = '季度' WHERE settlement_period = '季';
-
--- 2.7 contracts 补列（兼容历史缺列库）
+-- 2.6 contracts 补列（兼容历史缺列库）
 ALTER TABLE contracts ADD COLUMN IF NOT EXISTS entity_id INTEGER REFERENCES entities(id);
 ALTER TABLE contracts ADD COLUMN IF NOT EXISTS data_source VARCHAR(20) NOT NULL DEFAULT 'manual';
 ALTER TABLE contracts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
 ALTER TABLE contracts ADD COLUMN IF NOT EXISTS deposit NUMERIC(12,2);
+ALTER TABLE contracts ADD COLUMN IF NOT EXISTS input_cost NUMERIC(12,2);
 ALTER TABLE contracts ADD COLUMN IF NOT EXISTS first_month_rent NUMERIC(12,2);
 ALTER TABLE contracts ADD COLUMN IF NOT EXISTS rent_refund NUMERIC(12,2);
 ALTER TABLE contracts ADD COLUMN IF NOT EXISTS early_end_date DATE;
@@ -910,26 +830,15 @@ ALTER TABLE contracts ADD COLUMN IF NOT EXISTS rent_tax_enabled BOOLEAN DEFAULT 
 ALTER TABLE contracts ADD COLUMN IF NOT EXISTS rent_tax_rate NUMERIC(6,4);
 ALTER TABLE contracts ADD COLUMN IF NOT EXISTS post_tax_rent_price NUMERIC(8,4);
 
--- 2.8 分配规则表补列（生效期 + 审计列）
-ALTER TABLE station_shareholder_configs ADD COLUMN IF NOT EXISTS start_date DATE;
-ALTER TABLE station_shareholder_configs ADD COLUMN IF NOT EXISTS end_date DATE;
-ALTER TABLE station_shareholder_configs ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();
-ALTER TABLE station_shareholder_configs ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
-ALTER TABLE station_introducer_configs  ADD COLUMN IF NOT EXISTS start_date DATE;
-ALTER TABLE station_introducer_configs  ADD COLUMN IF NOT EXISTS end_date DATE;
-ALTER TABLE station_introducer_configs  ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();
-ALTER TABLE station_introducer_configs  ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
-
--- 2.9 审批表补列
-ALTER TABLE approval_requests ADD COLUMN IF NOT EXISTS station_id INTEGER REFERENCES stations(id);
-ALTER TABLE approval_requests ADD COLUMN IF NOT EXISTS station_name VARCHAR(200);
+-- 2.7 审批表补列
+ALTER TABLE approval_requests ADD COLUMN IF NOT EXISTS landlord_id INTEGER REFERENCES landlords(id);
 ALTER TABLE approval_requests ADD COLUMN IF NOT EXISTS dividend_record_id INTEGER REFERENCES dividend_records(id);
 ALTER TABLE approval_requests ADD COLUMN IF NOT EXISTS period VARCHAR(10);
 ALTER TABLE approval_requests ADD COLUMN IF NOT EXISTS electricity_amount NUMERIC(14,2);
 ALTER TABLE approval_requests ADD COLUMN IF NOT EXISTS rent_amount NUMERIC(14,2);
 ALTER TABLE dividend_records ADD COLUMN IF NOT EXISTS approval_id INTEGER;
 
--- 2.10 守卫式 CHECK 约束（仅当存量无违规时才添加）
+-- 2.8 守卫式 CHECK 约束（仅当存量无违规时才添加）
 
 -- contracts.contract_type 两分法
 DO $$
@@ -950,77 +859,77 @@ BEGIN
     END IF;
 END $$;
 
--- 分红配置 mode / settlement_period / 联动（股东 + 介绍人，共 8 个）
+-- 分红配置 mode / settlement_period / 联动（股东 + 介绍人，共 8 个，v3：landlord_* 配置表）
 DO $$
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_ssh_mode')
-       AND NOT EXISTS (SELECT 1 FROM station_shareholder_configs WHERE mode NOT IN ('收入分红','利润分红','固定金额')) THEN
-        ALTER TABLE station_shareholder_configs ADD CONSTRAINT ck_ssh_mode
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_lsh_mode')
+       AND NOT EXISTS (SELECT 1 FROM landlord_shareholder_configs WHERE mode NOT IN ('收入分红','利润分红','固定金额')) THEN
+        ALTER TABLE landlord_shareholder_configs ADD CONSTRAINT ck_lsh_mode
             CHECK (mode IN ('收入分红','利润分红','固定金额'));
     END IF;
 END $$;
 DO $$
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_ssh_settlement')
-       AND NOT EXISTS (SELECT 1 FROM station_shareholder_configs WHERE settlement_period NOT IN ('月','季度','半年','年')) THEN
-        ALTER TABLE station_shareholder_configs ADD CONSTRAINT ck_ssh_settlement
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_lsh_settlement')
+       AND NOT EXISTS (SELECT 1 FROM landlord_shareholder_configs WHERE settlement_period NOT IN ('月','季度','半年','年')) THEN
+        ALTER TABLE landlord_shareholder_configs ADD CONSTRAINT ck_lsh_settlement
             CHECK (settlement_period IN ('月','季度','半年','年'));
     END IF;
 END $$;
 DO $$
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_ssh_fixed')
-       AND NOT EXISTS (SELECT 1 FROM station_shareholder_configs
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_lsh_fixed')
+       AND NOT EXISTS (SELECT 1 FROM landlord_shareholder_configs
                        WHERE mode = '固定金额' AND fixed_amount IS NULL) THEN
-        ALTER TABLE station_shareholder_configs ADD CONSTRAINT ck_ssh_fixed
+        ALTER TABLE landlord_shareholder_configs ADD CONSTRAINT ck_lsh_fixed
             CHECK (mode <> '固定金额' OR fixed_amount IS NOT NULL);
     END IF;
 END $$;
 DO $$
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_ssh_ratio')
-       AND NOT EXISTS (SELECT 1 FROM station_shareholder_configs
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_lsh_ratio')
+       AND NOT EXISTS (SELECT 1 FROM landlord_shareholder_configs
                        WHERE mode <> '固定金额' AND ratio IS NULL) THEN
-        ALTER TABLE station_shareholder_configs ADD CONSTRAINT ck_ssh_ratio
+        ALTER TABLE landlord_shareholder_configs ADD CONSTRAINT ck_lsh_ratio
             CHECK (mode = '固定金额' OR ratio IS NOT NULL);
     END IF;
 END $$;
 DO $$
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_sint_mode')
-       AND NOT EXISTS (SELECT 1 FROM station_introducer_configs WHERE mode NOT IN ('收入分红','利润分红','固定金额')) THEN
-        ALTER TABLE station_introducer_configs ADD CONSTRAINT ck_sint_mode
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_li_mode')
+       AND NOT EXISTS (SELECT 1 FROM landlord_introducer_configs WHERE mode NOT IN ('收入分红','利润分红','固定金额')) THEN
+        ALTER TABLE landlord_introducer_configs ADD CONSTRAINT ck_li_mode
             CHECK (mode IN ('收入分红','利润分红','固定金额'));
     END IF;
 END $$;
 DO $$
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_sint_settlement')
-       AND NOT EXISTS (SELECT 1 FROM station_introducer_configs WHERE settlement_period NOT IN ('月','季度','半年','年')) THEN
-        ALTER TABLE station_introducer_configs ADD CONSTRAINT ck_sint_settlement
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_li_settlement')
+       AND NOT EXISTS (SELECT 1 FROM landlord_introducer_configs WHERE settlement_period NOT IN ('月','季度','半年','年')) THEN
+        ALTER TABLE landlord_introducer_configs ADD CONSTRAINT ck_li_settlement
             CHECK (settlement_period IN ('月','季度','半年','年'));
     END IF;
 END $$;
 DO $$
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_sint_fixed')
-       AND NOT EXISTS (SELECT 1 FROM station_introducer_configs
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_li_fixed')
+       AND NOT EXISTS (SELECT 1 FROM landlord_introducer_configs
                        WHERE mode = '固定金额' AND fixed_amount IS NULL) THEN
-        ALTER TABLE station_introducer_configs ADD CONSTRAINT ck_sint_fixed
+        ALTER TABLE landlord_introducer_configs ADD CONSTRAINT ck_li_fixed
             CHECK (mode <> '固定金额' OR fixed_amount IS NOT NULL);
     END IF;
 END $$;
 DO $$
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_sint_ratio')
-       AND NOT EXISTS (SELECT 1 FROM station_introducer_configs
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_li_ratio')
+       AND NOT EXISTS (SELECT 1 FROM landlord_introducer_configs
                        WHERE mode <> '固定金额' AND ratio IS NULL) THEN
-        ALTER TABLE station_introducer_configs ADD CONSTRAINT ck_sint_ratio
+        ALTER TABLE landlord_introducer_configs ADD CONSTRAINT ck_li_ratio
             CHECK (mode = '固定金额' OR ratio IS NOT NULL);
     END IF;
 END $$;
 
--- 2.11 防重复/唯一索引（仅当无重复时添加）
+-- 2.9 防重复/唯一索引（仅当无重复时添加）
 
 DO $$
 BEGIN
@@ -1087,9 +996,8 @@ BEGIN
     END IF;
 END $$;
 
--- 2.12 常用查询索引
+-- 2.10 常用查询索引
 CREATE INDEX IF NOT EXISTS idx_meter_monthly_device ON meter_monthly(device_id, month_period);
-CREATE INDEX IF NOT EXISTS idx_meters_station   ON meters(station_id);
 CREATE INDEX IF NOT EXISTS idx_meters_landlord  ON meters(landlord_id);
 CREATE INDEX IF NOT EXISTS idx_meters_brand     ON meters(brand_id);
 CREATE INDEX IF NOT EXISTS idx_meters_entity    ON meters(entity_id);
@@ -1101,11 +1009,11 @@ CREATE INDEX IF NOT EXISTS idx_cabinets_meter   ON cabinets(meter_id);
 CREATE INDEX IF NOT EXISTS idx_contracts_landlord ON contracts(landlord_id);
 CREATE INDEX IF NOT EXISTS idx_contracts_brand    ON contracts(brand_id);
 CREATE INDEX IF NOT EXISTS idx_contracts_type     ON contracts(contract_type);
-CREATE INDEX IF NOT EXISTS idx_ssh_station        ON station_shareholder_configs(station_id);
-CREATE INDEX IF NOT EXISTS idx_ssh_shareholder    ON station_shareholder_configs(shareholder_id);
-CREATE INDEX IF NOT EXISTS idx_sint_station       ON station_introducer_configs(station_id);
-CREATE INDEX IF NOT EXISTS idx_sint_introducer    ON station_introducer_configs(introducer_id);
-CREATE INDEX IF NOT EXISTS idx_approval_requests_station ON approval_requests(station_id);
+CREATE INDEX IF NOT EXISTS idx_lsh_landlord       ON landlord_shareholder_configs(landlord_id);
+CREATE INDEX IF NOT EXISTS idx_lsh_shareholder    ON landlord_shareholder_configs(shareholder_id);
+CREATE INDEX IF NOT EXISTS idx_li_landlord        ON landlord_introducer_configs(landlord_id);
+CREATE INDEX IF NOT EXISTS idx_li_introducer      ON landlord_introducer_configs(introducer_id);
+CREATE INDEX IF NOT EXISTS idx_approval_requests_landlord ON approval_requests(landlord_id);
 CREATE INDEX IF NOT EXISTS idx_platform_users_name ON platform_users(name);
 CREATE INDEX IF NOT EXISTS idx_elec_details_meter ON electricity_meter_details(meter_id);
 

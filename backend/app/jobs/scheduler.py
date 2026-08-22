@@ -19,11 +19,11 @@ def start_scheduler():
     # 采集器 - 每6小时
     scheduler.add_job(sync_collectors, IntervalTrigger(hours=6), id="sync_collectors", replace_existing=True)
 
-    # 实时状态 - 每10分钟
-    scheduler.add_job(sync_status, IntervalTrigger(minutes=10), id="sync_status", replace_existing=True)
+    # 实时状态 - 每2小时
+    scheduler.add_job(sync_status, IntervalTrigger(hours=2), id="sync_status", replace_existing=True)
 
-    # 小时用电量 - 每小时
-    scheduler.add_job(sync_hourly_data, IntervalTrigger(hours=1), id="sync_hourly", replace_existing=True)
+    # 小时用电量 - 每2小时
+    scheduler.add_job(sync_hourly_data, IntervalTrigger(hours=2), id="sync_hourly", replace_existing=True)
 
     # 日用电量 - 每天凌晨2点
     scheduler.add_job(sync_daily_data, CronTrigger(hour=2, minute=0), id="sync_daily", replace_existing=True)
@@ -40,8 +40,8 @@ def start_scheduler():
     scheduler.start()
     print("✅ 定时任务调度器已启动")
     print("  - 设备/采集器: 每6小时")
-    print("  - 电表状态: 每10分钟")
-    print("  - 小时用电量: 每小时")
+    print("  - 电表状态: 每2小时")
+    print("  - 小时用电量: 每2小时")
     print("  - 日用电量: 每天凌晨2点")
     print("  - 月用电量: 每天凌晨3点")
     print("  - 年用电量: 每10天")

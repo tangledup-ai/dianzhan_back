@@ -805,7 +805,7 @@ function ElectricityRentView({ entity, period }: { entity: any; period: string }
   if (validGroups.length === 0) {
     return (
       <div className="border-t px-5 py-10 text-center text-sm text-slate-400">
-        暂无电租数据，请确保站点已关联电表并同步了用电数据
+        暂无电租数据，请确保场地已关联电表并同步了用电数据
       </div>
     );
   }

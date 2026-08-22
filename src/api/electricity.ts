@@ -25,3 +25,7 @@ export const generateElectricity = (data: { period: string; landlordId?: number 
 // 电费月台账（Electricity 页，v2）：按场地方/品牌方 × 月份 汇总+明细（只含电费）
 export const getElectricityMonthlyLedger = (period: string, dim: "landlord" | "brand" = "landlord") =>
   client.get("/electricity/monthly-ledger", { params: { period, dim } }).then(r => r.data);
+
+// 电费收付明细导出（参考 Excel 格式：每电表一行）
+export const exportElectricityLedger = (period: string, dim: "landlord" | "brand" = "landlord") =>
+  client.get("/electricity/export", { params: { period, dim } }).then(r => r.data);

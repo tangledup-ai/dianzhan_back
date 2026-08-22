@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { listPaymentSchedules, listIncomeSchedules, markScheduleDone, createSchedule } from "@/api/contracts";
+import { listPaymentSchedules, listIncomeSchedules, updateSchedule, createSchedule } from "@/api/contracts";
 import { Button } from "@/components/ui/button";
 import { inputCls } from "@/components/fields";
 import { fmtMoney } from "@/lib/format";
@@ -20,6 +20,8 @@ export function ContractSchedule({ contractId, side, title, editable = true }: {
   const queryClient = useQueryClient();
   const [adding, setAdding] = useState(false);
   const [addForm, setAddForm] = useState({ periodStart: "", periodEnd: "", amount: "", remark: "" });
+  const [markingId, setMarkingId] = useState<number | null>(null);
+  const [markDate, setMarkDate] = useState("");
   const fetchFn = side === "payment" ? listPaymentSchedules : listIncomeSchedules;
   const queryKey = side === "payment" ? "paymentSchedules" : "incomeSchedules";
   const { data: schedules } = useQuery({
@@ -27,11 +29,15 @@ export function ContractSchedule({ contractId, side, title, editable = true }: {
     queryFn: () => fetchFn(contractId),
   });
 
+  const doneStatus = side === "payment" ? "已付款" : "已到账";
   const markDone = useMutation({
-    mutationFn: (scheduleId: number) => markScheduleDone(scheduleId, side),
+    mutationFn: ({ id, payDate }: { id: number; payDate: string }) =>
+      updateSchedule(id, { status: doneStatus, payDate, side }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: [queryKey] });
       toast.success(side === "payment" ? "已标记付款" : "已标记到账");
+      setMarkingId(null);
+      setMarkDate("");
     },
     onError: (e: any) => toast.error(e.message || "操作失败"),
   });
@@ -55,7 +61,6 @@ export function ContractSchedule({ contractId, side, title, editable = true }: {
   });
 
   const rows = schedules ?? [];
-  const doneStatus = side === "payment" ? "已付款" : "已到账";
   const paidCount = rows.filter((r: any) => r.status === doneStatus).length;
 
   return (
@@ -130,16 +135,42 @@ export function ContractSchedule({ contractId, side, title, editable = true }: {
                     <span className={`rounded-full px-1.5 py-0.5 text-[10px] ${done ? "bg-emerald-100 text-emerald-700" : "bg-slate-100 text-slate-600"}`}>
                       {r.status}
                     </span>
+                    {done && r.payDate && (
+                      <span className="ml-1 text-[10px] text-slate-400">{String(r.payDate).slice(0, 10)}</span>
+                    )}
                   </td>
                   {editable && (
                     <td className="px-2.5 py-1.5 text-center">
                       {!done && (
-                        <button
-                          onClick={() => markDone.mutate(r.id)}
-                          className="rounded bg-blue-600 px-1.5 py-0.5 text-[10px] text-white hover:bg-blue-700"
-                        >
-                          {side === "payment" ? "标记付款" : "标记到账"}
-                        </button>
+                        markingId === r.id ? (
+                          <div className="flex items-center justify-center gap-1">
+                            <input
+                              type="date"
+                              className={inputCls + " w-32 text-xs"}
+                              value={markDate}
+                              onChange={(e) => setMarkDate(e.target.value)}
+                            />
+                            <button
+                              onClick={() => {
+                                if (!markDate) { toast.error("请选择日期"); return; }
+                                markDone.mutate({ id: r.id, payDate: markDate });
+                              }}
+                              disabled={markDone.isPending}
+                              className="rounded bg-emerald-600 px-1.5 py-0.5 text-[10px] text-white hover:bg-emerald-700 disabled:opacity-50"
+                            >确认</button>
+                            <button
+                              onClick={() => { setMarkingId(null); setMarkDate(""); }}
+                              className="rounded bg-slate-200 px-1.5 py-0.5 text-[10px] text-slate-600 hover:bg-slate-300"
+                            >取消</button>
+                          </div>
+                        ) : (
+                          <button
+                            onClick={() => { setMarkingId(r.id); setMarkDate(new Date().toISOString().slice(0, 10)); }}
+                            className="rounded bg-blue-600 px-1.5 py-0.5 text-[10px] text-white hover:bg-blue-700"
+                          >
+                            {side === "payment" ? "标记付款" : "标记到账"}
+                          </button>
+                        )
                       )}
                     </td>
                   )}

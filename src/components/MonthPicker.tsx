@@ -6,9 +6,11 @@ interface MonthPickerProps {
   value: string; // YYYY-MM
   onChange: (value: string) => void;
   className?: string;
+  /** 弹出面板对齐方向：默认左对齐（left-0）；容器较窄时用 right 避免右溢出被裁剪 */
+  align?: "left" | "right";
 }
 
-export function MonthPicker({ value, onChange, className }: MonthPickerProps) {
+export function MonthPicker({ value, onChange, className, align = "left" }: MonthPickerProps) {
   const [isOpen, setIsOpen] = useState(false);
   const [viewYear, setViewYear] = useState(() => {
     if (value) {
@@ -71,9 +73,9 @@ export function MonthPicker({ value, onChange, className }: MonthPickerProps) {
 
       {/* 弹出面板 */}
       {isOpen && (
-        <div className="absolute top-full left-0 z-50 mt-1 w-64 rounded-lg border bg-white p-3 shadow-lg">
+        <div className={cn("absolute top-full z-50 mt-1 w-48 rounded-lg border bg-white p-2.5 shadow-lg", align === "right" ? "right-0" : "left-0")}>
           {/* 年份选择 */}
-          <div className="mb-3 flex items-center justify-between">
+          <div className="mb-2 flex items-center justify-between">
             <button
               onClick={() => setViewYear(viewYear - 1)}
               className="rounded p-1 hover:bg-slate-100"
@@ -103,7 +105,7 @@ export function MonthPicker({ value, onChange, className }: MonthPickerProps) {
                   key={m.value}
                   onClick={() => handleSelectMonth(m.value)}
                   className={cn(
-                    "rounded-md px-2 py-2 text-sm transition-colors",
+                    "rounded-md px-1 py-1.5 text-sm transition-colors",
                     isSelected
                       ? "bg-emerald-600 text-white"
                       : isCurrent

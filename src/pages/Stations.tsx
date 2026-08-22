@@ -8,8 +8,8 @@ import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Field, TextInput, SelectInput, inputCls } from "@/components/fields";
 import { MonthPicker } from "@/components/MonthPicker";
-import { exportXlsx } from "@/lib/export";
 import { fmtMoney, fmtNum, fmtDate } from "@/lib/format";
+import * as XLSX from "xlsx";
 import { Download, Search, ChevronDown, ChevronRight, ChevronLeft, MapPin, Gauge, ArrowLeft, Zap, Battery, Receipt, TrendingUp, Home, DollarSign, Activity, BarChart3, FileCheck2 } from "lucide-react";
 import { toast } from "sonner";
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend, PieChart, Pie, Cell } from "recharts";
@@ -491,7 +491,7 @@ function LandlordMeterDetail({ landlordId, period, onBack, landlordName }: { lan
 }
 
 // ─── 展开行详情组件（v3：按 场地×品牌 展示电表）───
-function ExpandedDetail({ landlordId, meters, period, summary, landlordName, onEditMeter }: { landlordId: number; meters: any[]; period: string; summary?: any; landlordName?: string; onEditMeter?: (m: any) => void }) {
+function ExpandedDetail({ landlordId, meters, period, summary, landlordName }: { landlordId: number; meters: any[]; period: string; summary?: any; landlordName?: string }) {
   const [expandedBrand, setExpandedBrand] = useState<string | null>(null);
   const [expandedMetric, setExpandedMetric] = useState<string | null>(null);
 
@@ -528,7 +528,7 @@ function ExpandedDetail({ landlordId, meters, period, summary, landlordName, onE
               <div className="text-sm font-semibold tabular-nums text-rose-600">{fmtMoney(summary.elecPay)}</div>
             </button>
             <button onClick={() => toggleMetric("elecCollect")} className={`rounded-lg border bg-white px-3 py-2 text-left transition-colors hover:border-emerald-400 ${expandedMetric === "elecCollect" ? "border-emerald-500 ring-1 ring-emerald-500" : ""}`}>
-              <div className="text-[10px] text-slate-400">电费收入</div>
+              <div className="text-[10px] text-slate-400">电费收入（不含税）</div>
               <div className="text-sm font-semibold tabular-nums text-emerald-600">{fmtMoney(summary.elecCollect)}</div>
             </button>
             <button onClick={() => toggleMetric("elecProfit")} className={`rounded-lg border bg-white px-3 py-2 text-left transition-colors hover:border-emerald-400 ${expandedMetric === "elecProfit" ? "border-emerald-500 ring-1 ring-emerald-500" : ""}`}>
@@ -681,7 +681,7 @@ function ExpandedDetail({ landlordId, meters, period, summary, landlordName, onE
               <div className="text-xs text-slate-500">
                 <div className="flex items-center justify-between py-1.5 border-b">
                   <span>电费收入（含税）</span>
-                  <span className="font-medium">{fmtMoney(summary?.elecCollect)}</span>
+                  <span className="font-medium">{fmtMoney((summary?.elecCollect || 0) + (summary?.elecTax || 0))}</span>
                 </div>
                 <div className="flex items-center justify-between py-1.5 border-b">
                   <span>电费税费</span>
@@ -689,7 +689,7 @@ function ExpandedDetail({ landlordId, meters, period, summary, landlordName, onE
                 </div>
                 <div className="flex items-center justify-between py-1.5">
                   <span>电费收入（不含税）</span>
-                  <span className="font-medium text-emerald-600">{fmtMoney((summary?.elecCollect || 0) - (summary?.elecTax || 0))}</span>
+                  <span className="font-medium text-emerald-600">{fmtMoney(summary?.elecCollect)}</span>
                 </div>
                 <div className="mt-2 text-[10px] text-slate-400">
                   * 税费 = 含税收入 × 税率（来自品牌方合同配置）
@@ -744,7 +744,7 @@ function ExpandedDetail({ landlordId, meters, period, summary, landlordName, onE
               <div className="mb-2 text-xs font-semibold text-slate-600">
                 {expandedMetric === "kwh" && "各品牌用电量"}
                 {expandedMetric === "elecPay" && "各品牌电费成本"}
-                {expandedMetric === "elecCollect" && "各品牌电费收入"}
+                {expandedMetric === "elecCollect" && "各品牌电费收入（不含税）"}
                 {expandedMetric === "elecProfit" && "各品牌电费利润"}
               </div>
               <table className="w-full text-xs">
@@ -1005,11 +1005,11 @@ function ComparisonPanel({ rows }: { rows: any[] }) {
     .map((r: any) => ({
       name: r.landlord.name,
       电费付款: r.elecPay,
-      电费收款: r.elecCollect,
+      "电费收款（不含税）": r.elecCollect,
       场地成本: r.rentCost,
       场地收入: r.rentIncome,
     }))
-    .sort((a: any, b: any) => (b.电费收款 + b.场地收入) - (a.电费收款 + a.场地收入));
+    .sort((a: any, b: any) => (b["电费收款（不含税）"] + b.场地收入) - (a["电费收款（不含税）"] + a.场地收入));
 
   const selTotals = rows.reduce(
     (t: any, r: any) => ({
@@ -1075,7 +1075,7 @@ function ComparisonPanel({ rows }: { rows: any[] }) {
             <Tooltip formatter={tooltipFmt} labelStyle={{ fontSize: 12 }} />
             <Legend wrapperStyle={{ fontSize: 11 }} />
             <Bar dataKey="电费付款" fill="#ef4444" radius={[0, 2, 2, 0]} barSize={6} />
-            <Bar dataKey="电费收款" fill="#10b981" radius={[0, 2, 2, 0]} barSize={6} />
+            <Bar dataKey="电费收款（不含税）" fill="#10b981" radius={[0, 2, 2, 0]} barSize={6} />
             <Bar dataKey="场地成本" fill="#f97316" radius={[0, 2, 2, 0]} barSize={6} />
             <Bar dataKey="场地收入" fill="#06b6d4" radius={[0, 2, 2, 0]} barSize={6} />
           </BarChart>
@@ -1144,9 +1144,9 @@ export default function Stations() {
     try {
       // 按场地拉取电表视图（v3：landlord 维度）
       const landlordMeterViews = await Promise.all(
-        exportRows.map(r => getLandlordMeterView(r.landlord.id, selectedMonth))
+        exportRows.map((r: any) => getLandlordMeterView(r.landlord.id, selectedMonth))
       );
-      const mvByLandlord = exportRows.map((_, i) => [landlordMeterViews[i]]);
+      const mvByLandlord = exportRows.map((_: any, i: number) => [landlordMeterViews[i]]);
 
       // 每个场地方的付款汇总 + 租金（来自board，场地方级）
       const landlordPayMap = exportRows.map((r: any) => {
@@ -1173,110 +1173,118 @@ export default function Stations() {
         }
       }
 
-      const excelRows: any[] = [];
+      // ── 构建参考 Excel 格式（便民换电柜经营收入台账）──
+      // 第1行标题、第2行分组表头、第3行明细表头、之后数据行（每站点分组 + 合计）
+      const HEADERS_GROUP = ["序号", "站点名称", "站点配置", "", "", "电费付款情况", "", "", "", "电费收款情况", "", "", "", "", "电费利润明细", "", "场地租金收款情况", "", ""];
+      const HEADERS_DETAIL = ["", "", "品牌", "数量", "柜子编号", "付款度数", "付款单价", "付款金额", "付款情况", "电费收款区间", "收款度数", "收入单价\n（含税）", "收入（含税）", "电费收款情况", "收入单价\n（不含税）", "电费收入\n（不含税）", "场地\n收款期间", "场地租金", "租金\n收款情况"];
+      // 参考 Excel 列宽：B=24、E=18.2、J=15.2、Q=14.6，其余默认
+      const COLS = [5, 24, 10, 6, 18.2, 10, 9, 11, 9, 15.2, 10, 10, 11, 9, 11, 11, 14.6, 9, 9];
+
+      const aoa: any[][] = [["便民换电柜经营收入台账"], HEADERS_GROUP, HEADERS_DETAIL];
+      const merges: XLSX.Range[] = [
+        { s: { r: 0, c: 0 }, e: { r: 0, c: 18 } },          // 标题 A1:S1
+        { s: { r: 1, c: 2 }, e: { r: 1, c: 4 } },           // 站点配置 C:E
+        { s: { r: 1, c: 5 }, e: { r: 1, c: 8 } },           // 电费付款情况 F:I
+        { s: { r: 1, c: 9 }, e: { r: 1, c: 13 } },          // 电费收款情况 J:N
+        { s: { r: 1, c: 14 }, e: { r: 1, c: 15 } },         // 电费利润明细 O:P
+        { s: { r: 1, c: 16 }, e: { r: 1, c: 18 } },         // 场地租金收款情况 Q:S
+      ];
 
       for (let li = 0; li < exportRows.length; li++) {
         const r = exportRows[li];
         const pay = landlordPayMap[li];
         const payStatusStr = pay.payStatuses.size === 1 ? [...pay.payStatuses][0] : pay.payStatuses.size > 1 ? "部分付款" : "";
 
-        // 场地级汇总
+        // 收集该场地所有电表 + 品牌方合同租金
+        const mv = mvByLandlord[li][0];
+        const allMeters: any[] = [];
+        for (const group of (mv?.brandGroups || [])) {
+          for (const meter of (group.meters || [])) allMeters.push({ ...meter, brandName: meter.brandName || group.brandName });
+        }
+        const incomeContracts = mv?.contractRent?.income || [];
+
         let landCollectKwh = 0, landCollectAmount = 0, landCollectNet = 0, landMeterCount = 0, landRentIncome = 0;
+        for (const m of allMeters) {
+          landCollectKwh += m.payKwh || 0;
+          landCollectAmount += m.collectAmount || 0;
+          landCollectNet += m.collectNet || 0;
+          landMeterCount += 1;
+          const brandIncome = incomeContracts.find((c: any) => Number(c.brandId) === Number(m.brandId));
+          landRentIncome += brandIncome?.monthlyRent ?? 0;
+        }
 
-        for (const mv of mvByLandlord[li]) {
-          // 收集该场地所有电表
-          const allMeters: any[] = [];
-          for (const group of (mv.brandGroups || [])) {
-            for (const meter of (group.meters || [])) {
-              allMeters.push(meter);
-            }
-          }
+        // 站点分组起始行（数据从第4行开始，1-based = aoa.length+1）
+        const startRow = aoa.length; // 0-based 行号
+        const brandContractMap = new Map<number, any>();
+        for (const c of incomeContracts) brandContractMap.set(Number(c.brandId), c);
 
-          landCollectKwh += allMeters.reduce((s, m) => s + (m.payKwh || 0), 0);
-          landCollectAmount += allMeters.reduce((s, m) => s + (m.collectAmount || 0), 0);
-          landCollectNet += allMeters.reduce((s, m) => s + (m.collectNet || 0), 0);
-          landMeterCount += allMeters.length;
+        // J 电费收款区间 = 用户当前选择的月份自然月区间（如 2026-08 → 2026-08-01 ~ 2026-08-31）
+        const [selY, selM] = selectedMonth.split("-").map(Number);
+        const monthStart = `${selY}-${String(selM).padStart(2, "0")}-01`;
+        const lastDay = new Date(selY, selM, 0).getDate();
+        const monthEnd = `${selY}-${String(selM).padStart(2, "0")}-${String(lastDay).padStart(2, "0")}`;
+        const elecCollectRange = `${monthStart} ~ ${monthEnd}`;
 
-          // 该场地的品牌方合同租金（按品牌 id 匹配）
-          const firstBrandId = allMeters[0]?.brandId;
-          const incomeContracts = mv.contractRent?.income || [];
-          const brandIncome = incomeContracts.find((c: any) => Number(c.brandId) === Number(firstBrandId));
-          const firstRentIncome = brandIncome?.monthlyRent ?? 0;
-          landRentIncome += firstRentIncome;
-
-          if (allMeters.length > 0) {
-            const first = allMeters[0];
-            excelRows.push({
-              场地方: r.landlord.name,
-              品牌: first.brandName,
-              数量: first.cabinetCount,
-              柜子编号: first.cabinetNos,
-              付款度数: pay.payKwh,
-              付款单价: pay.payUnitPrice,
-              付款金额: pay.payAmount,
-              付款情况: payStatusStr,
-              电费收款区间: first.collectStartDate && first.collectEndDate ? `${fmtDate(first.collectStartDate)} ~ ${fmtDate(first.collectEndDate)}` : "",
-              收款度数: first.payKwh ?? "",
-              "收入单价（含税）": first.collectUnitPrice ?? "",
-              "收入（含税）": first.collectAmount ?? "",
-              电费收款情况: first.collectStatus ?? "",
-              "收入单价（不含税）": first.postTaxPrice ?? "",
-              "电费收入（不含税）": first.collectNet ?? "",
-              场地收款期间: brandIncome?.startDate && brandIncome?.endDate ? `${brandIncome.startDate} ~ ${brandIncome.endDate}` : "",
-              场地租金: firstRentIncome,
-              租金收款情况: brandIncome?.payStatus ?? "",
-            });
-          }
-
-          for (let j = 1; j < allMeters.length; j++) {
-            const m = allMeters[j];
-            excelRows.push({
-              场地方: "",
-              品牌: m.brandName,
-              数量: m.cabinetCount,
-              柜子编号: m.cabinetNos,
-              付款度数: "",
-              付款单价: "",
-              付款金额: "",
-              付款情况: "",
-              电费收款区间: m.collectStartDate && m.collectEndDate ? `${fmtDate(m.collectStartDate)} ~ ${fmtDate(m.collectEndDate)}` : "",
-              收款度数: m.payKwh ?? "",
-              "收入单价（含税）": m.collectUnitPrice ?? "",
-              "收入（含税）": m.collectAmount ?? "",
-              电费收款情况: m.collectStatus ?? "",
-              "收入单价（不含税）": m.postTaxPrice ?? "",
-              "电费收入（不含税）": m.collectNet ?? "",
-              场地收款期间: "",
-              场地租金: "",
-              租金收款情况: "",
-            });
-          }
+        allMeters.forEach((m, idx) => {
+          const brandIncome = brandContractMap.get(Number(m.brandId));
+          const isFirst = idx === 0;
+          // Q 场地收款期间 = 该品牌合同覆盖所选月的收款分期区间（contracts 中已有）
+          const rentRange = brandIncome?.periodStart && brandIncome?.periodEnd
+            ? `${brandIncome.periodStart} ~ ${brandIncome.periodEnd}`
+            : "";
+          // S 租金收款情况 = 已到账 X/Y 期（参考 Rent 页面的收款情况）
+          const rentStatus = brandIncome?.totalCount
+            ? `已到账 ${brandIncome.paidCount ?? 0}/${brandIncome.totalCount} 期`
+            : "";
+          aoa.push([
+            isFirst ? li + 1 : "",                                   // A 序号（整组首行）
+            isFirst ? r.landlord.name : "",                          // B 站点名称（整组首行）
+            m.brandName ?? "",                                       // C 品牌
+            m.cabinetCount ?? "",                                    // D 数量
+            m.cabinetNos ?? "",                                      // E 柜子编号
+            isFirst ? pay.payKwh : "",                               // F 付款度数（整组首行）
+            isFirst ? pay.payUnitPrice : "",                         // G 付款单价（整组首行）
+            isFirst ? pay.payAmount : "",                            // H 付款金额（整组首行）
+            isFirst ? payStatusStr : "",                             // I 付款情况（整组首行）
+            isFirst ? elecCollectRange : "",                         // J 电费收款区间（当前选择月份，整组首行）
+            m.payKwh ?? "",                                          // K 收款度数
+            m.collectUnitPrice ?? "",                                // L 收入单价（含税）
+            m.collectAmount ?? "",                                   // M 收入（含税）
+            m.collectStatus ?? "",                                   // N 电费收款情况
+            m.postTaxPrice ?? "",                                    // O 收入单价（不含税）
+            m.collectNet ?? "",                                      // P 电费收入（不含税）
+            rentRange,                                               // Q 场地收款期间（合同收款分期区间）
+            brandIncome?.monthlyRent ?? "",                          // R 场地租金
+            rentStatus,                                              // S 租金收款情况（已到账 X/Y 期）
+          ]);
+        });
+        const endRow = aoa.length - 1; // 0-based 该组末行
+        // 站点分组合并：A、B 整组合并；F~I 付款整组合并（只首行有值）
+        if (endRow > startRow) {
+          merges.push({ s: { r: startRow, c: 0 }, e: { r: endRow, c: 0 } });
+          merges.push({ s: { r: startRow, c: 1 }, e: { r: endRow, c: 1 } });
+          merges.push({ s: { r: startRow, c: 5 }, e: { r: endRow, c: 5 } });
+          merges.push({ s: { r: startRow, c: 6 }, e: { r: endRow, c: 6 } });
+          merges.push({ s: { r: startRow, c: 7 }, e: { r: endRow, c: 7 } });
+          merges.push({ s: { r: startRow, c: 8 }, e: { r: endRow, c: 8 } });
         }
 
         // 场地合计行
-        excelRows.push({
-          场地方: "",
-          品牌: "合计",
-          数量: landMeterCount,
-          柜子编号: "",
-          付款度数: pay.payKwh,
-          付款单价: "",
-          付款金额: pay.payAmount,
-          付款情况: "",
-          电费收款区间: "",
-          收款度数: landCollectKwh,
-          "收入单价（含税）": "",
-          "收入（含税）": landCollectAmount,
-          电费收款情况: "",
-          "收入单价（不含税）": "",
-          "电费收入（不含税）": landCollectNet,
-          场地收款期间: "",
-          场地租金: landRentIncome,
-          租金收款情况: "",
-        });
+        aoa.push([
+          "", "", "合计", landMeterCount, "",
+          pay.payKwh, "", pay.payAmount, "",
+          "", landCollectKwh, "", landCollectAmount, "",
+          "", landCollectNet, "", landRentIncome, "",
+        ]);
       }
 
-      exportXlsx(`场地电表数据_${selectedMonth}`, [{ name: "场地电表数据", rows: excelRows }]);
+      const ws = XLSX.utils.aoa_to_sheet(aoa);
+      ws["!merges"] = merges;
+      ws["!cols"] = COLS.map((w) => ({ wch: w }));
+
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, selectedMonth.replace("-", "").slice(0, 31) || "台账");
+      XLSX.writeFile(wb, `便民换电柜经营收入台账_${selectedMonth}.xlsx`);
       toast.dismiss(tid);
       toast.success("已导出 Excel");
     } catch (e) {
@@ -1328,7 +1336,7 @@ export default function Stations() {
                 <th className="px-3 py-2.5 font-medium">场地方</th>
                 <th className="px-3 py-2.5 text-center font-medium">电表数</th>
                 <th className="px-3 py-2.5 text-right font-medium">电费付款</th>
-                <th className="px-3 py-2.5 text-right font-medium">电费收款</th>
+                <th className="px-3 py-2.5 text-right font-medium">电费收款（不含税）</th>
                 <th className="px-3 py-2.5 text-right font-medium">电费利润</th>
                 <th className="px-3 py-2.5 text-right font-medium">租金成本</th>
                 <th className="px-3 py-2.5 text-right font-medium">租金收入</th>

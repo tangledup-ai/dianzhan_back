@@ -123,6 +123,15 @@ async def overview(request: Request):
                 JOIN contracts c ON rs.contract_id = c.id
                 WHERE c.contract_type = '品牌方合同' AND c.landlord_id = ANY(%s::int[])
             """, (allowed,))
+            rent_uncollected = cur.fetchone()["uncollected"]
+            # 租金税费（品牌方合同启用税率：含税月租 − 税后月租；租金利润扣税，与 Rent 页一致）
+            cur.execute("""
+                SELECT COALESCE(SUM(monthly_rent - post_tax_rent_price), 0) as tax
+                FROM contracts
+                WHERE contract_type = '品牌方合同' AND rent_tax_enabled = TRUE
+                  AND post_tax_rent_price IS NOT NULL AND landlord_id = ANY(%s::int[])
+            """, (allowed,))
+            rent_tax_total = cur.fetchone()["tax"]
         else:
             cur.execute("SELECT COALESCE(SUM(monthly_rent), 0) as total FROM contracts WHERE contract_type = '品牌方合同'")
             rent_income = cur.fetchone()["total"]
@@ -132,7 +141,14 @@ async def overview(request: Request):
                 SELECT COALESCE(SUM(CASE WHEN status = '未到账' THEN amount ELSE 0 END), 0) as uncollected
                 FROM rent_income_schedule
             """)
-        rent_uncollected = cur.fetchone()["uncollected"]
+            rent_uncollected = cur.fetchone()["uncollected"]
+            cur.execute("""
+                SELECT COALESCE(SUM(monthly_rent - post_tax_rent_price), 0) as tax
+                FROM contracts
+                WHERE contract_type = '品牌方合同' AND rent_tax_enabled = TRUE
+                  AND post_tax_rent_price IS NOT NULL
+            """)
+            rent_tax_total = cur.fetchone()["tax"]
 
         # 运营费用（v3：挂 landlord_id）
         if allowed is not None:
@@ -352,6 +368,9 @@ async def overview(request: Request):
             "elecUncollected": float(elec["uncollected"]),
             "rentCostTotal": float(rent_cost),
             "rentIncomeTotal": float(rent_income),
+            "rentTaxTotal": float(rent_tax_total),
+            "rentProfitTotal": round(float(rent_income) - float(rent_cost) - float(rent_tax_total), 2),
+            "netProfitTotal": round(float(elec["total_profit"]) + float(rent_income) - float(rent_cost) - float(rent_tax_total) - float(op_total), 2),
             "rentUncollected": float(rent_uncollected),
             "opExpenseTotal": float(op_total),
             "pendingDividends": div_stats["pending"],
@@ -472,7 +491,8 @@ async def monthly_detail(request: Request, period: str = None):
         if allowed is not None:
             cur.execute("""
                 SELECT c.brand_id, b.name as brand_name, c.monthly_rent,
-                       c.start_date, c.end_date, c.early_end_date, c.first_month_rent, c.rent_refund
+                       c.start_date, c.end_date, c.early_end_date, c.first_month_rent, c.rent_refund,
+                       c.rent_tax_enabled, c.post_tax_rent_price
                 FROM contracts c LEFT JOIN brands b ON c.brand_id = b.id
                 WHERE c.contract_type = '品牌方合同' AND c.landlord_id = ANY(%s::int[])
             """, (allowed,))
@@ -485,7 +505,8 @@ async def monthly_detail(request: Request, period: str = None):
         else:
             cur.execute("""
                 SELECT c.brand_id, b.name as brand_name, c.monthly_rent,
-                       c.start_date, c.end_date, c.early_end_date, c.first_month_rent, c.rent_refund
+                       c.start_date, c.end_date, c.early_end_date, c.first_month_rent, c.rent_refund,
+                       c.rent_tax_enabled, c.post_tax_rent_price
                 FROM contracts c LEFT JOIN brands b ON c.brand_id = b.id
                 WHERE c.contract_type = '品牌方合同'
             """)
@@ -499,7 +520,13 @@ async def monthly_detail(request: Request, period: str = None):
         rent_income = round(sum(rent_income_for_period(c, month_compact) for c in rent_income_contracts)
                             - sum(rent_refund_for_period(c, month_compact) for c in rent_income_contracts), 2)
         rent_cost = sum(float(c["monthly_rent"] or 0) for c in rent_cost_contracts)
-        rent_profit = round(rent_income - rent_cost, 2)
+        # 租金税费（品牌方合同启用租金税率时：含税月租 − 税后月租）；租金利润扣税（与 Rent 页一致）
+        rent_tax = sum(
+            (float(c["monthly_rent"] or 0) - float(c["post_tax_rent_price"]))
+            for c in rent_income_contracts
+            if c.get("rent_tax_enabled") and c.get("post_tax_rent_price")
+        )
+        rent_profit = round(rent_income - rent_cost - rent_tax, 2)
 
         # 4) 运营费用（v3：挂 landlord_id）
         if allowed is not None:
@@ -613,7 +640,8 @@ async def station_board(request: Request, landlordId: int = None, keyword: str =
             cur.execute("""
                 SELECT id, contract_type, electricity_price, monthly_rent, cabinets_count, partner, brand_id,
                        tax_rate, tax_enabled, post_tax_electricity_price,
-                       start_date, end_date, early_end_date, first_month_rent, rent_refund
+                       start_date, end_date, early_end_date, first_month_rent, rent_refund,
+                       rent_tax_enabled, post_tax_rent_price
                 FROM contracts
                 WHERE landlord_id = %s
             """, (lid,))
@@ -629,7 +657,7 @@ async def station_board(request: Request, landlordId: int = None, keyword: str =
                     brand_names[b["id"]] = b["name"]
 
             # 从合同计算场地成本（租金 = Σ 场地合同月租）和电费单价（#2 统一口径）
-            from ..domain.electricity_pricing import resolve_prices
+            from ..domain.electricity_pricing import resolve_prices, split_tax
             rent_cost = 0       # 场地合同月租金合计（= 该场地所有合同金额加和 = 成本）
             for c in contracts:
                 if c["contract_type"] == "场地合同" and c["monthly_rent"]:
@@ -671,11 +699,18 @@ async def station_board(request: Request, landlordId: int = None, keyword: str =
             # 电费成本 = 度数 × 场地合同电费单价
             elec_pay = total_kwh * elec_pay_price if elec_pay_price else 0
 
-            # 电费收入（#2 统一口径：按品牌各算各的——品牌度数 × 该品牌方合同单价）
+            # 电费收入（#2 统一口径：按品牌各算各的——品牌度数 × 该品牌方合同单价；
+            # 收入统一为不含税（启用税率的品牌 split_tax 拆分），税费独立展示，不混入利润，与台账/分红一致）
             def _station_collect(sb):
                 bid = sb.get("brand_id")
-                price = pricing["brand_prices"].get(int(bid), {}).get("price") if bid is not None else None
-                return round(float(sb.get("kwh") or 0) * (price or 0), 2)
+                info = pricing["brand_prices"].get(int(bid)) if bid is not None else None
+                if not info:
+                    return 0.0
+                gross = round(float(sb.get("kwh") or 0) * float(info.get("price") or 0), 2)
+                if info.get("tax_enabled") and info.get("post_tax"):
+                    _, net = split_tax(gross, info.get("tax_rate"))
+                    return round(net, 2)
+                return gross
 
             elec_collect = round(sum(_station_collect(sb) for sb in station_breakdown), 2)
             elec_profit = round(elec_collect - elec_pay, 2)
@@ -693,7 +728,14 @@ async def station_board(request: Request, landlordId: int = None, keyword: str =
                         rent_income += float(c["monthly_rent"])
             rent_income = round(rent_income - rent_refund, 2)
 
-            rent_profit = round(rent_income - rent_cost, 2)
+            # 租金税费（品牌方合同启用租金税率时：含税月租 − 税后月租）；租金利润扣税（与 Rent 页一致）
+            rent_tax_cost = sum(
+                (float(c["monthly_rent"] or 0) - float(c["post_tax_rent_price"]))
+                for c in contracts
+                if c["contract_type"] == "品牌方合同"
+                and c.get("rent_tax_enabled") and c.get("post_tax_rent_price")
+            )
+            rent_profit = round(rent_income - rent_cost - rent_tax_cost, 2)
 
             # 运营费用（按月份筛选；v3：挂 landlord_id）
             op_period = period.replace("-", "") if period else None

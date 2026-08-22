@@ -11,19 +11,13 @@
 |---|---|
 | `brands` | 品牌方（客户，如美团/哈啰/青桔） |
 | `entities` | 公司主体（报税法人，收款/付款主体） |
-| `landlords` | **场地方（业主）**——主链聚合根，站点/合同/电表都挂它名下 |
+| `landlords` | **场地方（业主）**——主链聚合根，合同/电表都直接挂它名下（v3 无站点层） |
 | `shareholders` | 股东（投资人，分红受益人） |
 | `introducers` | 介绍人（商务关系人，拿商务分红） |
 | `entity_brands` | 公司主体和品牌方的归属关系（多对多） |
 | `platform_users` | 平台登录用户（老板/财务/股东，股东限看关联场地） |
 
-## 二、站点域
-
-| 表名 | 一句话说明 |
-|---|---|
-| `stations` | 站点（主链枢纽）——场地下的经营单元，电表归它管 |
-
-## 三、电表·接入域（第三方平台数据缓存，只能 GET 拉取）
+## 二、电表·接入域（第三方平台数据缓存，只能 GET 拉取）
 
 | 表名 | 一句话说明 |
 |---|---|
@@ -38,58 +32,48 @@
 | `meter_warnings_cache` | 电表报警缓存 |
 | `sync_logs` | 第三方同步日志（审计：谁同步的、成功没、多少条） |
 
-## 四、电表·档案域（业务计算的唯一入口）
+## 三、电表·档案域（业务计算的唯一入口）
 
 | 表名 | 一句话说明 |
 |---|---|
-| `meters` | **电表档案**——第三方设备导入/人工建档后挂到站点/品牌/场地/主体 |
+| `meters` | **电表档案**——第三方设备导入/人工建档后直接挂 场地(landlord_id)+品牌(brand_id) |
 | `cabinets` | 柜子（挂在电表下的物理资产；计费柜数从这里实时数） |
 
-## 五、合同域（商务量的唯一主源）
+## 四、合同域（商务量的唯一主源）
 
 | 表名 | 一句话说明 |
 |---|---|
-| `contracts` | **合同台账**——场地合同=成本（付业主）、品牌方合同=收入（品牌方付公司），单价/月租/税都在这里 |
+| `contracts` | **合同台账**——场地合同=成本（付业主）、品牌方合同=收入（品牌方付公司），单价/月租/税都在这里；直挂 landlord_id（+brand_id） |
 | `rent_payment_schedule` | 场地合同的付款分期（按付款方式拆期） |
 | `rent_income_schedule` | 品牌方合同的收款分期（按付款方式拆期） |
 
-## 六、分配规则域（分红怎么分）
+## 五、分配规则域（分红怎么分；v3 按场地）
 
 | 表名 | 一句话说明 |
 |---|---|
-| `station_shareholder_configs` | 股东分红配置（每站每股东：按收入/利润/固定金额 + 比例 + 生效期） |
-| `station_introducer_configs` | 介绍人商务分红配置（同上 + 是否计入成本） |
+| `landlord_shareholder_configs` | 股东分红配置（每场地每股东：按收入/利润/固定金额 + 比例 + 品牌范围 + 生效期） |
+| `landlord_introducer_configs` | 介绍人商务分红配置（同上 + 是否计入成本） |
 
-## 七、台账派生域（源头数据算出来的账本/快照）
+## 六、台账派生域（源头数据算出来的账本/快照）
 
 | 表名 | 一句话说明 |
 |---|---|
-| `electricity_records` | 电费月台账（每站每月：付电费/收电费/利润） |
+| `electricity_records` | 电费月台账（每场地×品牌×每月：付电费/收电费/利润；直挂 landlord_id+brand_id） |
 | `electricity_meter_details` | 电费台账的分表明细（每块电表贡献多少） |
-| `operating_expenses` | 运营费用（每站每月手工填一笔） |
-| `dividend_records` | 分红月结（每站每月：收入-成本=利润，状态流转） |
+| `operating_expenses` | 运营费用（每场地每月手工填一笔，直挂 landlord_id） |
+| `dividend_records` | 分红月结（每场地×品牌每月：收入-成本=利润，状态流转，直挂 landlord_id） |
 | `dividend_shares` | 分红明细（每个股东/介绍人分到多少，含配置快照） |
 
-## 八、审批域
+## 七、审批域
 
 | 表名 | 一句话说明 |
 |---|---|
 | `approval_flows` | 审批流程配置（什么业务走哪几个审批节点） |
-| `approval_requests` | 审批单（电费/租金/分红等付款申请单） |
+| `approval_requests` | 审批单（电费/租金/分红等付款申请单；直挂 landlord_id） |
 | `approval_records` | 审批流转记录（谁在哪个节点通过/驳回） |
 | `approval_dividend_records` | 审批单和分红记录的关系（一张审批单可带多个月分红） |
 
-## 九、过渡表（已废弃，不再作为数据源，实施轮并入主表后下线）
-
-| 表名 | 一句话说明 |
-|---|---|
-| `rent_leases` | ~~旧场地租金付款台账~~（被 contracts 场地合同取代） |
-| `rent_incomes` | ~~旧品牌租金收款台账~~（被 contracts 品牌方合同取代） |
-| `rent_receipts` | ~~旧收款分期~~（被 rent_income_schedule 取代） |
-| `rent_payment_records` | 年度付款台账（发票归档，保留） |
-| `rent_income_records` | 年度收款台账（进项成本归档，保留） |
-
-## 十、视图（只读，实时聚合）
+## 八、视图（只读，实时聚合）
 
 | 视图名 | 一句话说明 |
 |---|---|
@@ -101,6 +85,6 @@
 
 ## 快速记忆（三句话）
 
-1. **源头只有三处**：`meters`+`meter_monthly`（电表度数）→ `contracts`（单价/租金）→ `station_*_configs`（分红规则）。
+1. **源头只有三处**：`meters`+`meter_monthly`（电表度数）→ `contracts`（单价/租金）→ `landlord_*_configs`（分红规则）。
 2. **中间账本**：`electricity_records`（电费）、`operating_expenses`（运营费）、`dividend_records`+`dividend_shares`（分红）。
-3. **支持设施**：`stations`（枢纽）、`landlords`（聚合根）、`approval_*`（审批）、`meter_*` 缓存表（第三方数据中转站）。
+3. **支持设施**：`landlords`（聚合根，v3 无站点层）、`approval_*`（审批）、`meter_*` 缓存表（第三方数据中转站）。

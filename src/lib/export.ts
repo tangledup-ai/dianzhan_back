@@ -57,3 +57,27 @@ export function exportXlsxWithTitle(filename: string, opts: {
   XLSX.utils.book_append_sheet(wb, ws, opts.sheetName.slice(0, 31));
   XLSX.writeFile(wb, filename.endsWith(".xlsx") ? filename : `${filename}.xlsx`);
 }
+
+/** 导出多个带标题行的 sheet（每个 sheet：标题行合并 + 表头 + 数据行），数据为二维数组 */
+export function exportXlsxWithTitles(filename: string, sheets: { name: string; title: string; headers: string[]; rows: unknown[][] }[]) {
+  const wb = XLSX.utils.book_new();
+  for (const s of sheets) {
+    if (s.headers.length === 0) continue;
+    const aoa: unknown[][] = [
+      [s.title],
+      s.headers,
+      ...s.rows,
+    ];
+    const ws = XLSX.utils.aoa_to_sheet(aoa);
+    ws["!merges"] = [{ s: { r: 0, c: 0 }, e: { r: 0, c: s.headers.length - 1 } }];
+    ws["!cols"] = s.headers.map((h, ci) => ({
+      wch: Math.max(
+        h.length * 2,
+        ...s.rows.slice(0, 200).map((r) => String(r[ci] ?? "").length * 1.9),
+        8,
+      ),
+    }));
+    XLSX.utils.book_append_sheet(wb, ws, s.name.slice(0, 31));
+  }
+  XLSX.writeFile(wb, filename.endsWith(".xlsx") ? filename : `${filename}.xlsx`);
+}

@@ -37,14 +37,20 @@ def save_shareholder_config(data: dict):
         brand_id = data.get("brandId")
         landlord_id = data.get("landlordId")
         shareholder_id = data.get("shareholderId")
+        config_id = data.get("configId")
         # v3：按 (场地, 股东, 品牌, 生效期) 匹配；start_date 为空视为 1970-01-01
-        cur.execute("""
-            SELECT id FROM landlord_shareholder_configs
-            WHERE landlord_id = %s AND shareholder_id = %s
-              AND COALESCE(brand_id, 0) = COALESCE(%s, 0)
-              AND COALESCE(start_date, DATE '1970-01-01') = COALESCE(%s::date, DATE '1970-01-01')
-        """, (landlord_id, shareholder_id, brand_id, data.get("startDate")))
-        existing = cur.fetchone()
+        existing = None
+        if config_id:
+            cur.execute("SELECT id FROM landlord_shareholder_configs WHERE id = %s", (config_id,))
+            existing = cur.fetchone()
+        if not existing:
+            cur.execute("""
+                SELECT id FROM landlord_shareholder_configs
+                WHERE landlord_id = %s AND shareholder_id = %s
+                  AND COALESCE(brand_id, 0) = COALESCE(%s, 0)
+                  AND COALESCE(start_date, DATE '1970-01-01') = COALESCE(%s::date, DATE '1970-01-01')
+            """, (landlord_id, shareholder_id, brand_id, data.get("startDate")))
+            existing = cur.fetchone()
 
         fields = (
             data.get("mode"), data.get("ratio"),
@@ -55,12 +61,13 @@ def save_shareholder_config(data: dict):
         if existing:
             cur.execute("""
                 UPDATE landlord_shareholder_configs SET
+                    landlord_id = %s, shareholder_id = %s, brand_id = %s,
                     mode = %s, ratio = %s, fixed_amount = %s,
                     settlement_period = %s, start_date = %s, end_date = %s,
                     remark = %s
                 WHERE id = %s
                 RETURNING *
-            """, (*fields, existing["id"]))
+            """, (landlord_id, shareholder_id, brand_id, *fields, existing["id"]))
         else:
             cur.execute("""
                 INSERT INTO landlord_shareholder_configs
@@ -121,14 +128,20 @@ def save_introducer_config(data: dict):
         brand_id = data.get("brandId")
         landlord_id = data.get("landlordId")
         introducer_id = data.get("introducerId")
+        config_id = data.get("configId")
         # v3：按 (场地, 介绍人, 品牌, 生效期) 匹配；start_date 为空视为 1970-01-01
-        cur.execute("""
-            SELECT id FROM landlord_introducer_configs
-            WHERE landlord_id = %s AND introducer_id = %s
-              AND COALESCE(brand_id, 0) = COALESCE(%s, 0)
-              AND COALESCE(start_date, DATE '1970-01-01') = COALESCE(%s::date, DATE '1970-01-01')
-        """, (landlord_id, introducer_id, brand_id, data.get("startDate")))
-        existing = cur.fetchone()
+        existing = None
+        if config_id:
+            cur.execute("SELECT id FROM landlord_introducer_configs WHERE id = %s", (config_id,))
+            existing = cur.fetchone()
+        if not existing:
+            cur.execute("""
+                SELECT id FROM landlord_introducer_configs
+                WHERE landlord_id = %s AND introducer_id = %s
+                  AND COALESCE(brand_id, 0) = COALESCE(%s, 0)
+                  AND COALESCE(start_date, DATE '1970-01-01') = COALESCE(%s::date, DATE '1970-01-01')
+            """, (landlord_id, introducer_id, brand_id, data.get("startDate")))
+            existing = cur.fetchone()
 
         fields = (
             data.get("mode"), data.get("ratio"),
@@ -140,12 +153,13 @@ def save_introducer_config(data: dict):
         if existing:
             cur.execute("""
                 UPDATE landlord_introducer_configs SET
+                    landlord_id = %s, introducer_id = %s, brand_id = %s,
                     mode = %s, ratio = %s, fixed_amount = %s,
                     settlement_period = %s, count_as_cost = %s,
                     start_date = %s, end_date = %s, remark = %s
                 WHERE id = %s
                 RETURNING *
-            """, (*fields, existing["id"]))
+            """, (landlord_id, introducer_id, brand_id, *fields, existing["id"]))
         else:
             cur.execute("""
                 INSERT INTO landlord_introducer_configs

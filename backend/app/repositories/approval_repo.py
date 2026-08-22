@@ -53,13 +53,14 @@ def list_requests(biz_type: str = None, status: str = None, applicant: str = Non
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         cur.execute(f"""
             SELECT ar.*,
-                   dr.landlord_id as landlord_id,
-                   l.name as landlord_name,
+                   COALESCE(dr.landlord_id, ar.landlord_id) as landlord_id,
+                   COALESCE(l.name, al.name) as landlord_name,
                    COALESCE(ar.period, dr.period) as period,
                    dr.period as dividend_period
             FROM approval_requests ar
             LEFT JOIN dividend_records dr ON ar.dividend_record_id = dr.id
             LEFT JOIN landlords l ON dr.landlord_id = l.id
+            LEFT JOIN landlords al ON ar.landlord_id = al.id
             {where}
             ORDER BY ar.created_at DESC
         """, values)
@@ -161,6 +162,54 @@ def create_request(data: dict):
         conn.close()
 
 
+def apply_payment_links(cur, request: dict):
+    """审批通过 → 联动回写付款状态（Web 端 act_on_request 与小程序端 approve 共用）。
+
+    - 场地费付款审批 → 把覆盖该月份分期的 rent_payment_schedule 置为已付款
+      （区间匹配 [period_start, period_end]，兼容月付/季付/半年付/年付）
+    - 电费付款审批 → 把该场地×月的 electricity_records.pay_status 置为已付款
+    """
+    biz = request.get("biz_type") or ""
+    landlord_id = request.get("landlord_id")
+    period = request.get("period")  # YYYY-MM 或 YYYYMM
+
+    # ── 场地费付款 → 联动付款分期 ──
+    if "场地费" in biz and landlord_id and period:
+        month_key = str(period).replace("-", "")  # 2026-08 -> 202608
+        if len(month_key) == 6 and month_key.isdigit():
+            month_start = f"{month_key[:4]}-{month_key[4:]}-01"  # 2026-08-01
+            cur.execute("""
+                SELECT id FROM contracts
+                WHERE landlord_id = %s AND contract_type = '场地合同'
+            """, (landlord_id,))
+            contracts = cur.fetchall()
+            for c in contracts:
+                # 覆盖该月份的分期（period_start <= 月末 AND period_end >= 月初）
+                cur.execute("""
+                    SELECT id FROM rent_payment_schedule
+                    WHERE contract_id = %s AND status != '已付款'
+                      AND period_start <= (DATE %s + INTERVAL '1 month' - INTERVAL '1 day')::date
+                      AND period_end >= %s::date
+                    ORDER BY seq
+                    LIMIT 1
+                """, (c["id"], month_start, month_start))
+                row = cur.fetchone()
+                if row:
+                    cur.execute("""
+                        UPDATE rent_payment_schedule
+                        SET status = '已付款', pay_date = NOW()::date
+                        WHERE id = %s
+                    """, (row["id"],))
+
+    # ── 电费付款 → 联动电费台账付款状态（v3：台账挂 landlord_id，按 场地×月 更新）──
+    if "电费" in biz and landlord_id and period:
+        cur.execute("""
+            UPDATE electricity_records
+            SET pay_status = '已付款', updated_at = NOW()
+            WHERE landlord_id = %s AND period = %s
+        """, (landlord_id, str(period).replace("-", "")))
+
+
 def act_on_request(request_id: int, action: str, approver: str, comment: str = None, **kwargs):
     conn = get_connection()
     cur = get_dict_cursor(conn)
@@ -183,50 +232,6 @@ def act_on_request(request_id: int, action: str, approver: str, comment: str = N
                 ids.append(request["dividend_record_id"])
             return ids
 
-        # 场地费付款审批通过 → 联动更新场地合同对应周期的付款分期为已付款（v3：按 landlord_id 直接查场地合同）
-        def _link_venue_payment():
-            biz = request.get("biz_type") or ""
-            if "场地费" not in biz:
-                return  # 只有场地费相关审批才联动付款分期
-            landlord_id = request.get("landlord_id")
-            period = request.get("period")  # YYYY-MM
-            if not landlord_id or not period or "-" not in period:
-                return
-            cur.execute("""
-                SELECT id FROM contracts WHERE landlord_id = %s AND contract_type = '场地合同'
-            """, (landlord_id,))
-            contracts = cur.fetchall()
-            month_key = period.replace("-", "")  # 2026-08 -> 202608
-            for c in contracts:
-                cur.execute("""
-                    SELECT id, period_start FROM rent_payment_schedule
-                    WHERE contract_id = %s AND status != '已付款'
-                """, (c["id"],))
-                for s in cur.fetchall():
-                    ps = str(s.get("period_start") or "")[:7].replace("-", "")
-                    if ps == month_key:
-                        cur.execute("""
-                            UPDATE rent_payment_schedule
-                            SET status = '已付款', pay_date = NOW()::date
-                            WHERE id = %s
-                        """, (s["id"],))
-                        break
-
-        # 电费付款审批通过 → 联动更新电费台账付款状态（v3：台账挂 landlord_id，按 场地×月 更新）
-        def _link_elec_payment():
-            biz = request.get("biz_type") or ""
-            if "电费" not in biz:
-                return
-            landlord_id = request.get("landlord_id")
-            period = request.get("period")
-            if not landlord_id or not period:
-                return
-            cur.execute("""
-                UPDATE electricity_records
-                SET pay_status = '已付款', updated_at = NOW()
-                WHERE landlord_id = %s AND period = %s
-            """, (landlord_id, str(period).replace("-", "")))
-
         if action == "通过":
             next_node = current_node + 1
             if next_node >= len(flow_nodes):
@@ -241,10 +246,8 @@ def act_on_request(request_id: int, action: str, approver: str, comment: str = N
                         "UPDATE dividend_records SET status = '已通过', updated_at = NOW() WHERE id = %s",
                         (rid,)
                     )
-                # 场地费付款审批 → 联动更新付款分期
-                _link_venue_payment()
-                # 电费付款审批 → 联动更新电费台账付款状态
-                _link_elec_payment()
+                # 场地费/电费付款审批 → 联动回写付款状态（付款分期 + 电费台账）
+                apply_payment_links(cur, request)
             else:
                 cur.execute(
                     "UPDATE approval_requests SET current_node = %s WHERE id = %s",

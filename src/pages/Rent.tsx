@@ -1,11 +1,14 @@
 import { Fragment, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { getMonthlyLedger } from "@/api/rent";
+import { listEntities } from "@/api/directory";
 import { Button } from "@/components/ui/button";
 import { inputCls } from "@/components/fields";
-import { fmtMoney } from "@/lib/format";
+import { fmtMoney, fmtNum } from "@/lib/format";
 import { toCompact, toDisplay } from "@/lib/period";
-import { Building2, Tag, ChevronDown, ChevronRight } from "lucide-react";
+import { exportXlsxWithTitle } from "@/lib/export";
+import { Building2, Tag, ChevronDown, ChevronRight, Download } from "lucide-react";
+import { toast } from "sonner";
 
 // 场地费月台账（v2 重设计）：只含场地费（不含电费）
 // 支持：按场地方 / 按品牌方；选择任意月份区间（如 1-5 月、2-9 月）；
@@ -29,6 +32,136 @@ function shift(period: string, offset: number): string {
   const m = parseInt(period.slice(4, 6), 10);
   const dt = new Date(y, m - 1 + offset, 1);
   return `${dt.getFullYear()}${String(dt.getMonth() + 1).padStart(2, "0")}`;
+}
+
+// ─── 整年场地收支表（框外展示）：按场地×品牌，付款信息=场地合同，收款信息=品牌方合同 ───
+function YearlyTable({ yearlyRows, yearLabels }: { yearlyRows: any[]; yearLabels: string[] }) {
+  return (
+    <div className="space-y-3">
+      {yearlyRows.map((gy: any) => {
+        const vc: any = gy.venue || {};
+        const brands = (gy.brands ?? []).filter((b: any) => b.contractType === "品牌方合同");
+        if (brands.length === 0) return null;
+        const venue = vc;
+        const costStart = venue.startDate;
+        const costEnd = venue.endDate;
+        const years = costStart && costEnd
+          ? Math.round((new Date(costEnd).getTime() - new Date(costStart).getTime()) / (365.25 * 24 * 60 * 60 * 1000) * 10) / 10
+          : null;
+        return (
+          <div key={gy.landlordId} className="rounded-xl border bg-white overflow-hidden">
+            {/* 场地标题 */}
+            <div className="flex items-center gap-2 border-b bg-blue-50/50 px-4 py-2">
+              <Building2 className="h-4 w-4 text-blue-600" />
+              <span className="text-sm font-semibold text-slate-700">{gy.landlordName}</span>
+              <span className="text-xs text-slate-400">（{brands.length} 个品牌 · 整年场地收支）</span>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full min-w-[1080px] text-[11px]">
+                <thead>
+                  <tr className="border-b bg-slate-100 text-left text-[10px] text-slate-500">
+                    <th className="px-2 py-1.5" rowSpan={2}>品牌方</th>
+                    <th className="border-x bg-rose-50/70 px-2 py-1.5 text-center" colSpan={10}>付款信息（场地合同）</th>
+                    <th className="border-x bg-emerald-50/70 px-2 py-1.5 text-center" colSpan={12}>收款信息（品牌方合同）</th>
+                  </tr>
+                  <tr className="border-b bg-slate-100 text-[10px] text-slate-500">
+                    <th className="border-x px-2 py-1">负责人</th>
+                    <th className="px-2 py-1">租期</th>
+                    <th className="px-2 py-1">合作年限</th>
+                    <th className="px-2 py-1">租金成本/年</th>
+                    <th className="px-2 py-1">付款方式</th>
+                    {yearLabels.map((yl) => (
+                      <th key={yl} className="px-2 py-1">{yl}付款情况</th>
+                    ))}
+                    <th className="px-2 py-1">单台成本/年</th>
+                    <th className="px-2 py-1">押金</th>
+                    <th className="border-x px-2 py-1">合同日期</th>
+                    {yearLabels.map((yl) => (
+                      <th key={`i-${yl}`} className="px-2 py-1">{yl}到账情况</th>
+                    ))}
+                    <th className="px-2 py-1">柜数</th>
+                    <th className="px-2 py-1">单台月租金(含税)</th>
+                    <th className="px-2 py-1">单台年收入(含税)</th>
+                    <th className="px-2 py-1">场地租金收入(含税)/年</th>
+                    <th className="px-2 py-1">场地税率</th>
+                    <th className="px-2 py-1">租金收入(不含税)/年</th>
+                    <th className="px-2 py-1">进项成本</th>
+                    <th className="px-2 py-1">租金利润</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {brands.map((c: any, idx: number) => {
+                    const cabinets = c.cabinetsCount != null ? Number(c.cabinetsCount) : 1;
+                    const unitMonthly = c.unitMonthlyRent != null ? Number(c.unitMonthlyRent) : null;
+                    const unitAnnual = unitMonthly != null ? Math.round(unitMonthly * 12 * 100) / 100 : null;
+                    const taxRate = c.rentTaxRate != null ? c.rentTaxRate : 0;
+                    const inputCost = c.inputCost != null ? Number(c.inputCost) : 0;
+                    const venueRentGross = unitAnnual != null ? Math.round(unitAnnual * cabinets * 100) / 100 : null;
+                    const rentIncomeNet = venueRentGross != null
+                      ? (taxRate > 0 ? Math.round(venueRentGross * (1 - taxRate) * 100) / 100 : venueRentGross)
+                      : null;
+                    const unitCostAnnual = c.unitCostAnnual != null ? Number(c.unitCostAnnual) : null;
+                    const rentCostAnnual = unitCostAnnual != null ? Math.round(unitCostAnnual * cabinets * 100) / 100 : null;
+                    const rentProfit = (rentIncomeNet != null && rentCostAnnual != null)
+                      ? Math.round((rentIncomeNet - rentCostAnnual - inputCost) * 100) / 100
+                      : null;
+                    const isFirstBrand = idx === 0;
+                    return (
+                      <tr key={c.contractId} className="border-b last:border-0 hover:bg-slate-50/50">
+                        <td className="px-2 py-1.5 font-medium text-slate-700">{c.brandName || "—"}</td>
+                        {/* 付款信息（场地合同） */}
+                        <td className="border-x px-2 py-1.5">{venue.landlordContact || venue.landlordName || "—"}</td>
+                        <td className="px-2 py-1.5 whitespace-nowrap">{costStart ? `${costStart.slice(0, 10)} ~ ${costEnd ? costEnd.slice(0, 10) : ""}` : "—"}</td>
+                        <td className="px-2 py-1.5">{years != null ? `${years}年` : "—"}</td>
+                        <td className="px-2 py-1.5 text-right tabular-nums text-rose-600">
+                          {rentCostAnnual != null ? fmtMoney(rentCostAnnual) : "—"}
+                        </td>
+                        <td className="px-2 py-1.5">{venue.payMethod || "—"}</td>
+                        {yearLabels.map((yl) => {
+                          const ys = (venue.yearStatus ?? []).find((y: any) => y.year === yl);
+                          return (
+                            <td key={yl} className="px-2 py-1.5 text-center tabular-nums">
+                              {ys ? `${ys.paid}/${ys.total}` : "—"}
+                            </td>
+                          );
+                        })}
+                        <td className="px-2 py-1.5 text-right tabular-nums">{unitCostAnnual != null ? fmtMoney(unitCostAnnual) : "—"}</td>
+                        <td className="px-2 py-1.5 text-right tabular-nums">
+                          {isFirstBrand
+                            ? (venue.deposit != null ? <span title="整个场地的押金">{fmtMoney(venue.deposit)} <span className="text-[9px] text-slate-400">(整场地)</span></span> : <span title="整个场地的押金">— <span className="text-[9px] text-slate-400">(整场地)</span></span>)
+                            : ""}
+                        </td>
+                        {/* 收款信息（品牌方合同） */}
+                        <td className="border-x px-2 py-1.5 whitespace-nowrap">{c.startDate ? `${c.startDate.slice(0, 10)} ~ ${c.endDate ? c.endDate.slice(0, 10) : ""}` : "—"}</td>
+                        {yearLabels.map((yl) => {
+                          const ys = (c.yearStatus ?? []).find((y: any) => y.year === yl);
+                          return (
+                            <td key={`i-${yl}`} className="px-2 py-1.5 text-center tabular-nums">
+                              {ys ? `${ys.paid}/${ys.total}` : "—"}
+                            </td>
+                          );
+                        })}
+                        <td className="px-2 py-1.5 text-right tabular-nums font-medium text-slate-700">{c.cabinetsCount != null ? `${fmtNum(c.cabinetsCount)} 柜` : "—"}</td>
+                        <td className="px-2 py-1.5 text-right tabular-nums">{unitMonthly != null ? fmtMoney(unitMonthly) : "—"}</td>
+                        <td className="px-2 py-1.5 text-right tabular-nums">{unitAnnual != null ? fmtMoney(unitAnnual) : "—"}</td>
+                        <td className="px-2 py-1.5 text-right tabular-nums text-emerald-600">{venueRentGross != null ? fmtMoney(venueRentGross) : "—"}</td>
+                        <td className="px-2 py-1.5 text-right tabular-nums">{taxRate > 0 ? `${(taxRate * 100).toFixed(0)}%` : "—"}</td>
+                        <td className="px-2 py-1.5 text-right tabular-nums text-emerald-600">{rentIncomeNet != null ? fmtMoney(rentIncomeNet) : "—"}</td>
+                        <td className="px-2 py-1.5 text-right tabular-nums">{inputCost ? fmtMoney(inputCost) : "—"}</td>
+                        <td className={`px-2 py-1.5 text-right tabular-nums font-medium ${rentProfit != null && rentProfit >= 0 ? "text-emerald-600" : "text-rose-600"}`}>
+                          {rentProfit != null ? fmtMoney(rentProfit) : "—"}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
 }
 
 export default function Rent() {
@@ -69,6 +202,24 @@ export default function Rent() {
   };
 
   const months: any[] = q.data ?? [];
+
+  // 逐年付款/到账的年份列：取当前月份所有合同分期覆盖的年份并集（升序）
+  const yearLabels = useMemo(() => {
+    const years = new Set<string>();
+    for (const m of months) {
+      for (const g of m.rows ?? []) {
+        for (const c of g.contracts ?? []) {
+          for (const ys of c.yearStatus ?? []) years.add(ys.year);
+        }
+      }
+    }
+    return [...years].sort();
+  }, [months]);
+
+  // 整年场地收支（框外）：取第一个月的 yearlyRows（后端按该年全年合同构建）
+  const yearlyRows: any[] = useMemo(() => (months[0]?.yearlyRows ?? []), [months]);
+  const yearLabel = useMemo(() => (startPeriod || CUR_MONTH).slice(0, 4) + "年", [startPeriod]);
+
   // 区间合计（总览）
   const totals = useMemo(() => {
     const t = { rentIncome: 0, rentCost: 0, rentTax: 0, paidAmount: 0, pendingAmount: 0, rentProfit: 0 };
@@ -87,6 +238,84 @@ export default function Rent() {
   const quick = (n: number) => {
     setEndPeriod(CUR_MONTH);
     setStartPeriod(shift(CUR_MONTH, -(n - 1)));
+  };
+
+  // 公司主体（导出"收款公司"列）
+  const entities = useQuery({ queryKey: ["entities"], queryFn: listEntities });
+  const collectCompany = useMemo(
+    () => (entities.data ?? []).map((e: any) => e.name).join("、"),
+    [entities.data]
+  );
+
+  // ── 导出 Excel（参考美团场租台账格式：每 场地×品牌 一行，整年口径）──
+  const doExport = () => {
+    if (yearlyRows.length === 0) { toast.error("暂无数据可导出"); return; }
+    const rows: unknown[][] = [];
+    let seq = 0;
+    for (const gy of yearlyRows) {
+      const venue: any = gy.venue || {};
+      const brands = (gy.brands ?? []).filter((b: any) => b.contractType === "品牌方合同");
+      const costStart = venue.startDate;
+      const costEnd = venue.endDate;
+      const years = costStart && costEnd
+        ? Math.round((new Date(costEnd).getTime() - new Date(costStart).getTime()) / (365.25 * 24 * 60 * 60 * 1000) * 10) / 10
+        : null;
+      const payStatus = (venue.yearStatus ?? []).map((ys: any) => `${ys.year}:${ys.paid}/${ys.total}`).join(" ");
+      brands.forEach((c: any, idx: number) => {
+        seq++;
+        const cabinets = c.cabinetsCount != null ? Number(c.cabinetsCount) : 1;
+        const unitMonthly = c.unitMonthlyRent != null ? Number(c.unitMonthlyRent) : null;
+        const unitAnnual = unitMonthly != null ? Math.round(unitMonthly * 12 * 100) / 100 : null;
+        const taxRate = c.rentTaxRate != null ? c.rentTaxRate : 0;
+        const inputCost = c.inputCost != null ? Number(c.inputCost) : 0;
+        const venueRentGross = unitAnnual != null ? Math.round(unitAnnual * cabinets * 100) / 100 : null;
+        const rentIncomeNet = venueRentGross != null
+          ? (taxRate > 0 ? Math.round(venueRentGross * (1 - taxRate) * 100) / 100 : venueRentGross)
+          : null;
+        const unitCostAnnual = c.unitCostAnnual != null ? Number(c.unitCostAnnual) : null;
+        const rentCostAnnual = unitCostAnnual != null ? Math.round(unitCostAnnual * cabinets * 100) / 100 : null;
+        const rentProfit = (rentIncomeNet != null && rentCostAnnual != null)
+          ? Math.round((rentIncomeNet - rentCostAnnual - inputCost) * 100) / 100
+          : null;
+        const incomeStatus = (c.yearStatus ?? []).map((ys: any) => `${ys.year}:${ys.paid}/${ys.total}`).join(" ");
+        rows.push([
+          seq,
+          collectCompany, // 收款公司 = 公司主体
+          "", // 占股（暂无数据）
+          gy.landlordName,
+          c.brandName || "",
+          cabinets,
+          venue.landlordContact || venue.landlordName || "",
+          costStart ? `${String(costStart).slice(0, 10)} ~ ${costEnd ? String(costEnd).slice(0, 10) : ""}` : "",
+          years != null ? `${years}年` : "",
+          rentCostAnnual != null ? Math.round(rentCostAnnual * 100) / 100 : "",
+          venue.payMethod || "",
+          payStatus,
+          unitCostAnnual != null ? Math.round(unitCostAnnual * 100) / 100 : "",
+          idx === 0 && venue.deposit != null ? Math.round(venue.deposit * 100) / 100 : "",
+          c.startDate ? `${String(c.startDate).slice(0, 10)} ~ ${c.endDate ? String(c.endDate).slice(0, 10) : ""}` : "",
+          incomeStatus,
+          unitMonthly != null ? Math.round(unitMonthly * 100) / 100 : "",
+          unitAnnual != null ? Math.round(unitAnnual * 100) / 100 : "",
+          venueRentGross != null ? Math.round(venueRentGross * 100) / 100 : "",
+          taxRate > 0 ? `${(taxRate * 100).toFixed(0)}%` : "",
+          rentIncomeNet != null ? Math.round(rentIncomeNet * 100) / 100 : "",
+          inputCost ? Math.round(inputCost * 100) / 100 : "",
+          rentProfit != null ? Math.round(rentProfit * 100) / 100 : "",
+        ]);
+      });
+    }
+    exportXlsxWithTitle(`场地费台账_${yearLabel.replace("年", "")}`, {
+      sheetName: "场地费台账",
+      title: `${yearLabel}场地费台账（整年口径 · 每 场地×品牌 一行）`,
+      headers: [
+        "序号", "收款公司", "占股", "站名", "品牌方", "柜数", "负责人", "合同租期", "合作年限",
+        "租金成本/年", "付款方式", "付款情况", "单台成本/年", "押金", "合同收款租期", "到账情况",
+        "单台月租金(含税)", "单台年收入(含税)", "租金收入(含税)/年", "税率", "租金收入(不含税)/年", "进项成本", "租金利润",
+      ],
+      rows,
+    });
+    toast.success("已导出 Excel");
   };
 
   return (
@@ -123,6 +352,9 @@ export default function Rent() {
         <span className="text-xs text-slate-400">
           {toDisplay(startPeriod)} ~ {toDisplay(endPeriod)} · 仅场地费（不含电费）
         </span>
+        <Button size="sm" className="ml-auto bg-blue-600 hover:bg-blue-700" onClick={doExport}>
+          <Download className="mr-1 h-3.5 w-3.5" />导出 Excel
+        </Button>
       </div>
 
       {/* ── 区间总览（合计核对） ── */}
@@ -134,6 +366,18 @@ export default function Rent() {
         <StatCard label="区间已收/已付" value={totals.paidAmount} />
         <StatCard label="区间未收/未付" value={totals.pendingAmount} />
       </div>
+
+      {/* ── 整年场地收支（框外：按场地×品牌，整年口径） ── */}
+      {yearlyRows.length > 0 && (
+        <div>
+          <div className="mb-2 flex items-center gap-2">
+            <Building2 className="h-4 w-4 text-emerald-600" />
+            <h3 className="text-sm font-semibold text-slate-700">整年场地收支（{yearLabel}）</h3>
+            <span className="text-[11px] text-slate-400">付款信息=场地合同 · 收款信息=品牌方合同 · 按合同周期计算</span>
+          </div>
+          <YearlyTable yearlyRows={yearlyRows} yearLabels={yearLabels} />
+        </div>
+      )}
 
       {/* ── 按月总览表 ── */}
       <div className="overflow-x-auto rounded-xl border bg-white shadow-sm">
@@ -179,46 +423,36 @@ export default function Rent() {
                       <td colSpan={dim === "landlord" ? 8 : 7} className="px-6 py-3">
                         <div className="space-y-1">
                           <div className="text-[11px] font-medium text-slate-400">
-                            {toDisplay(m.period)} · 按{dim === "landlord" ? "场地方" : "品牌方"}明细（点击可展开合同）
+                            {toDisplay(m.period)} · 按{dim === "landlord" ? "场地方" : "品牌方"}明细（点击展开合同：付款/收款信息）
                           </div>
-                          {(m.rows ?? []).map((g: any) => {
-                            const rKey = `r-${m.period}-${dim}-${g.key}`;
-                            const rOpen = expanded.has(rKey);
-                            return (
-                              <Fragment key={rKey}>
-                                <div className="flex cursor-pointer items-center gap-x-4 rounded-md border bg-white px-3 py-1.5 text-xs hover:bg-slate-50" onClick={() => toggle(rKey)}>
-                                  <span className="text-slate-400">{rOpen ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}</span>
-                                  <span className="w-40 font-medium text-slate-700">{g.name}</span>
-                                  <span className="text-emerald-600 tabular-nums">收 {fmtMoney(g.rentIncome)}</span>
-                                  {dim === "landlord" && <span className="text-rose-600 tabular-nums">成 {fmtMoney(g.rentCost)}</span>}
-                                  <span className="text-slate-400 tabular-nums">税 {fmtMoney(g.rentTax)}</span>
-                                  <span className="text-slate-700 tabular-nums">利 {fmtMoney(g.rentProfit)}</span>
-                                  <span className="ml-auto text-slate-500 tabular-nums">已{fmtMoney(g.paidAmount)} / 未{fmtMoney(g.pendingAmount)}</span>
-                                </div>
-                                {rOpen && (
-                                  <div className="ml-6 space-y-1 border-l pl-3">
-                                    {(g.contracts ?? []).map((c: any) => (
-                                      <div key={c.contractId} className="flex flex-wrap items-center gap-x-4 gap-y-1 rounded-md border bg-white px-3 py-1.5 text-xs">
-                                        <span className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${
-                                          c.contractType === "品牌方合同" ? "bg-emerald-50 text-emerald-600" : "bg-rose-50 text-rose-600"}`}>
-                                          {c.contractType}
-                                        </span>
-                                        {c.brandName && <span className="font-medium text-slate-700">{c.brandName}</span>}
-                                        <span className="text-slate-500">月租 <b className="tabular-nums">{fmtMoney(c.monthlyRent)}</b></span>
-                                        {c.rentTax > 0 && <span className="text-slate-400">税费 {fmtMoney(c.rentTax)}</span>}
-                                        {c.payMethod && <span className="text-slate-400">{c.payMethod}</span>}
-                                        {c.startDate && <span className="text-slate-400">{c.startDate} ~ {c.endDate ?? ""}</span>}
-                                        <span className="ml-auto flex gap-3 tabular-nums">
-                                          <span className="text-emerald-600">已{c.contractType === "品牌方合同" ? "收" : "付"} {fmtMoney(c.paidAmount)}</span>
-                                          <span className="text-amber-600">未{c.contractType === "品牌方合同" ? "收" : "付"} {fmtMoney(c.pendingAmount)}</span>
-                                        </span>
-                                      </div>
-                                    ))}
-                                  </div>
-                                )}
-                              </Fragment>
-                            );
-                          })}
+                          {(m.rows ?? []).map((g: any) => (
+                            <div key={g.key} className="overflow-x-auto rounded-lg border bg-white">
+                              <table className="w-full min-w-[640px] text-[11px]">
+                                <thead>
+                                  <tr className="border-b bg-slate-100 text-left text-[10px] text-slate-500">
+                                    <th className="px-2 py-1">{dim === "landlord" ? "场地方" : "品牌方"}</th>
+                                    <th className="px-2 py-1 text-right">场地费收入</th>
+                                    {dim === "landlord" && <th className="px-2 py-1 text-right">场地费成本</th>}
+                                    <th className="px-2 py-1 text-right">税费</th>
+                                    <th className="px-2 py-1 text-right">利润</th>
+                                    <th className="px-2 py-1 text-right">已收/已付</th>
+                                    <th className="px-2 py-1 text-right">未收/未付</th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  <tr className="border-b last:border-0">
+                                    <td className="px-2 py-1.5 font-medium text-slate-700">{g.name}</td>
+                                    <td className="px-2 py-1.5 text-right tabular-nums text-emerald-600">{fmtMoney(g.rentIncome)}</td>
+                                    {dim === "landlord" && <td className="px-2 py-1.5 text-right tabular-nums text-rose-600">{fmtMoney(g.rentCost)}</td>}
+                                    <td className="px-2 py-1.5 text-right tabular-nums text-slate-500">{fmtMoney(g.rentTax)}</td>
+                                    <td className="px-2 py-1.5 text-right tabular-nums font-medium text-slate-700">{fmtMoney(g.rentProfit)}</td>
+                                    <td className="px-2 py-1.5 text-right tabular-nums text-slate-600">{fmtMoney(g.paidAmount)}</td>
+                                    <td className="px-2 py-1.5 text-right tabular-nums text-amber-600">{fmtMoney(g.pendingAmount)}</td>
+                                  </tr>
+                                </tbody>
+                              </table>
+                            </div>
+                          ))}
                         </div>
                       </td>
                     </tr>

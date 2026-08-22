@@ -143,9 +143,15 @@ async def create_approval(data: dict, user: dict = Depends(get_current_user)):
 
         applicant = user["name"]
 
+        # 保存联动所需字段（v3：场地费/电费审批通过后回写付款状态，需 landlord_id + period）
+        # 注：v3 重构后 stations 表已下线，场地维度统一用 landlord_id，仅接受直接传参
+        landlord_id = data.get("landlordId") or data.get("landlord_id")
+        period = data.get("period")
+
         cur.execute("""
-            INSERT INTO approval_requests (biz_type, title, reason, amount, applicant, flow_nodes, status)
-            VALUES (%s, %s, %s, %s, %s, %s, '审批中')
+            INSERT INTO approval_requests (biz_type, title, reason, amount, applicant, flow_nodes, status,
+                                           landlord_id, period, electricity_amount, rent_amount)
+            VALUES (%s, %s, %s, %s, %s, %s, '审批中', %s, %s, %s, %s)
             RETURNING *
         """, (
             biz_type,
@@ -154,6 +160,10 @@ async def create_approval(data: dict, user: dict = Depends(get_current_user)):
             data.get("amount", 0),
             applicant,
             json.dumps(flow_nodes, ensure_ascii=False),
+            landlord_id,
+            period,
+            data.get("electricityAmount"),
+            data.get("rentAmount"),
         ))
         request = cur.fetchone()
 
@@ -191,6 +201,9 @@ async def approve(request_id: int, data: dict, user: dict = Depends(get_current_
                 "UPDATE approval_requests SET current_node = %s, status = '已通过', finished_at = NOW() WHERE id = %s",
                 (next_node, request_id)
             )
+            # 审批通过 → 联动回写付款状态（场地费→付款分期，电费→电费台账）
+            from ..repositories.approval_repo import apply_payment_links
+            apply_payment_links(cur, request)
         else:
             cur.execute(
                 "UPDATE approval_requests SET current_node = %s WHERE id = %s",

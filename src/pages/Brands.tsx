@@ -5,6 +5,7 @@ import { listContracts } from "@/api/contracts";
 import { listMeters } from "@/api/meters";
 import { listCabinets } from "@/api/cabinets";
 import { listElectricity } from "@/api/electricity";
+import { getMonthlyLedger } from "@/api/rent";
 import { StatusBadge, Money } from "@/components/Stat";
 import { inputCls } from "@/components/fields";
 import { toCompact, toDisplay } from "@/lib/period";
@@ -34,6 +35,12 @@ interface SiteData {
   elecCollectStatus: string;
   // 租金收入
   rentIncome: any | null;
+  // 场地成本平摊（Rent 页口径）：品牌当月平摊场地成本 / 整场地月租 / 租金税费
+  venueCostMonth: number | null;
+  venueMonthlyRent: number;
+  rentTax: number;
+  rentProfit: number;
+  netProfit: number;
 }
 
 export default function Brands() {
@@ -61,6 +68,23 @@ export default function Brands() {
       .filter((c: any) => c.contractType === "品牌方合同")
       .map((c: any) => ({ brandId: c.brandId, landlordId: c.landlordId, monthlyRent: Number(c.monthlyRent || 0) }));
   }, [contracts.data]);
+
+  // 场地费分摊（Rent 页同一口径）：品牌平摊场地成本（当月）/ 整场地月租 / 租金税费
+  const rentLedger = useQuery({
+    queryKey: ["rentMonthlyLedger", selectedMonth],
+    queryFn: () => getMonthlyLedger(selectedMonth, "brand"),
+  });
+  const ledgerMap = useMemo(() => {
+    const map = new Map<string, any>();
+    for (const g of rentLedger.data?.rows ?? []) {
+      for (const it of g.contracts ?? []) {
+        if (it.contractType === "品牌方合同" && it.brandId != null && it.landlordId != null) {
+          map.set(`${it.brandId}-${it.landlordId}`, it);
+        }
+      }
+    }
+    return map;
+  }, [rentLedger.data]);
 
   // ─── 年份选项 ───
   const yearOptions = useMemo(() => {
@@ -98,8 +122,8 @@ export default function Brands() {
           return start.getFullYear() <= year && end.getFullYear() >= year;
         });
 
-        // 该品牌的电表
-        const brandMeters = meterList.filter((m: any) => m.brandId === brand.id);
+        // 该品牌的电表（v3：只统计关联了场地的"实表"，与 Meters 页口径一致；未关联场地的空表不计入）
+        const brandMeters = meterList.filter((m: any) => m.brandId === brand.id && m.landlordId != null);
         const meterIds = new Set(brandMeters.map((m: any) => m.id));
         const brandCabinets = cabinetList.filter((c: any) => meterIds.has(c.meterId));
 
@@ -124,6 +148,7 @@ export default function Brands() {
               elecCollectKwh: 0, elecCollectAmount: 0, elecCollectNet: 0, elecProfit: 0,
               elecPayStatus: "", elecCollectStatus: "",
               rentIncome: null,
+              venueCostMonth: null, venueMonthlyRent: 0, rentTax: 0, rentProfit: 0, netProfit: 0,
             });
           }
           const site = siteMap.get(lid)!;
@@ -147,6 +172,7 @@ export default function Brands() {
               elecCollectKwh: 0, elecCollectAmount: 0, elecCollectNet: 0, elecProfit: 0,
               elecPayStatus: "", elecCollectStatus: "",
               rentIncome: null,
+              venueCostMonth: null, venueMonthlyRent: 0, rentTax: 0, rentProfit: 0, netProfit: 0,
             });
           }
         }
@@ -174,9 +200,19 @@ export default function Brands() {
             if (elecRecord.collectStatus) site.elecCollectStatus = elecRecord.collectStatus;
           }
           site.elecProfit = Math.round((site.elecCollectNet - site.elecPayAmount) * 100) / 100;
+
+          // 场地成本平摊（Rent 页同一口径：场地月租 × 品牌柜数 ÷ 该月在期品牌总柜数）
+          const ledger = ledgerMap.get(`${brand.id}-${site.landlordId}`);
+          site.venueCostMonth = ledger?.venueShareMonth ?? null;
+          site.venueMonthlyRent = ledger?.venueContract?.monthlyRent ?? site.venueContract?.monthlyRent ?? 0;
+          site.rentTax = ledger?.rentTax ?? 0;
+          const rentIncomeAmt = Number(site.rentIncome?.monthlyRent) || 0;
+          site.rentProfit = Math.round((rentIncomeAmt - (site.venueCostMonth ?? 0) - site.rentTax) * 100) / 100;
+          site.netProfit = Math.round((site.elecProfit + site.rentProfit) * 100) / 100;
         }
 
-        const sites = [...siteMap.values()].sort((a, b) => a.landlordName.localeCompare(b.landlordName));
+        // 只展示有电表关联的场地（合同补充的无电表场地不显示）
+        const sites = [...siteMap.values()].filter((s: any) => s.meters.length > 0).sort((a, b) => a.landlordName.localeCompare(b.landlordName));
 
         // 品牌汇总
         const summary = {
@@ -192,11 +228,17 @@ export default function Brands() {
           totalElecCollectNet: sites.reduce((s, g) => s + g.elecCollectNet, 0),
           totalElecProfit: sites.reduce((s, g) => s + g.elecProfit, 0),
           totalRentIncome: sites.reduce((s, g) => s + (Number(g.rentIncome?.monthlyRent) || 0), 0),
+          // 场地成本平摊合计（当月）+ 租金税费 + 净利润（电费利润 + 租金利润）
+          totalVenueCost: sites.reduce((s, g) => s + (g.venueCostMonth ?? 0), 0),
+          totalRentTax: sites.reduce((s, g) => s + g.rentTax, 0),
+          totalNetProfit: sites.reduce((s, g) => s + g.netProfit, 0),
         };
 
         return { ...brand, sites, summary };
-      });
-  }, [brands.data, contracts.data, meters.data, cabinets.data, electricity.data, rentIncomeList, keyword, year]);
+      })
+      // 只显示在 meters 中关联了电表（实表）的品牌
+      .filter((b: any) => b.summary.meterCount > 0);
+  }, [brands.data, contracts.data, meters.data, cabinets.data, electricity.data, rentIncomeList, ledgerMap, keyword, year]);
 
   const toggleExpand = (id: number) => setExpandedId(prev => prev === id ? null : id);
 
@@ -247,8 +289,9 @@ export default function Brands() {
                   <span className="text-slate-500">{s.cabinetCount} 柜子</span>
                   <span className="text-rose-600">付款 <b className="tabular-nums">{fmtMoney(s.totalElecPayAmount)}</b></span>
                   <span className="text-emerald-600">收款 <b className="tabular-nums">{fmtMoney(s.totalElecCollectNet)}</b></span>
-                  <span className={s.totalElecProfit >= 0 ? "text-emerald-600" : "text-rose-600"}>
-                    利润 <b className="tabular-nums">{fmtMoney(s.totalElecProfit)}</b>
+                  <span className="text-amber-600">场地成本 <b className="tabular-nums">{fmtMoney(s.totalVenueCost)}</b></span>
+                  <span className={s.totalNetProfit >= 0 ? "text-emerald-600" : "text-rose-600"}>
+                    利润 <b className="tabular-nums">{fmtMoney(s.totalNetProfit)}</b>
                   </span>
                 </div>
               </div>
@@ -257,7 +300,7 @@ export default function Brands() {
               {isExpanded && (
                 <div className="border-t px-5 py-4 space-y-4">
                   {/* 品牌概览卡片 */}
-                  <div className="grid grid-cols-2 gap-3 lg:grid-cols-6">
+                  <div className="grid grid-cols-2 gap-3 lg:grid-cols-8">
                     <div className="rounded-lg border bg-slate-50 px-3 py-2">
                       <div className="text-[10px] text-slate-400">场地数量</div>
                       <div className="text-lg font-semibold tabular-nums">{s.siteCount}</div>
@@ -278,9 +321,17 @@ export default function Brands() {
                       <div className="text-[10px] text-blue-600">月租金收入</div>
                       <div className="text-lg font-semibold tabular-nums text-blue-700">{fmtMoney(s.totalRentIncome || s.totalMonthlyRent)}</div>
                     </div>
+                    <div className="rounded-lg border bg-amber-50 px-3 py-2">
+                      <div className="text-[10px] text-amber-600">场地成本（当月平摊）</div>
+                      <div className="text-lg font-semibold tabular-nums text-amber-700">{fmtMoney(s.totalVenueCost)}</div>
+                    </div>
                     <div className={`rounded-lg border px-3 py-2 ${s.totalElecProfit >= 0 ? "bg-emerald-50" : "bg-rose-50"}`}>
                       <div className={`text-[10px] ${s.totalElecProfit >= 0 ? "text-emerald-600" : "text-rose-500"}`}>电费利润</div>
                       <div className={`text-lg font-semibold tabular-nums ${s.totalElecProfit >= 0 ? "text-emerald-700" : "text-rose-600"}`}>{fmtMoney(s.totalElecProfit)}</div>
+                    </div>
+                    <div className={`rounded-lg border px-3 py-2 ${s.totalNetProfit >= 0 ? "bg-emerald-50" : "bg-rose-50"}`}>
+                      <div className={`text-[10px] ${s.totalNetProfit >= 0 ? "text-emerald-600" : "text-rose-500"}`}>净利润（含租金-场地成本）</div>
+                      <div className={`text-lg font-semibold tabular-nums ${s.totalNetProfit >= 0 ? "text-emerald-700" : "text-rose-600"}`}>{fmtMoney(s.totalNetProfit)}</div>
                     </div>
                   </div>
 
@@ -297,7 +348,8 @@ export default function Brands() {
                         <div className="flex items-center gap-4 text-xs">
                           <span className="text-rose-600">付款 {fmtMoney(site.elecPayAmount)}</span>
                           <span className="text-emerald-600">收款 {fmtMoney(site.elecCollectNet)}</span>
-                          <span className={site.elecProfit >= 0 ? "text-emerald-600" : "text-rose-600"}>利润 {fmtMoney(site.elecProfit)}</span>
+                          <span className="text-amber-600">场地成本 {fmtMoney(site.venueCostMonth ?? 0)}</span>
+                          <span className={site.netProfit >= 0 ? "text-emerald-600" : "text-rose-600"}>利润 {fmtMoney(site.netProfit)}</span>
                         </div>
                       </div>
 
@@ -334,6 +386,7 @@ export default function Brands() {
                               <div className="px-3 py-2 space-y-1 text-xs">
                                 <div className="flex justify-between"><span className="text-slate-500">电费单价</span><span className="font-medium">{site.venueContract.electricityPrice ? `${fmtNum(site.venueContract.electricityPrice)} 元/度` : "-"}</span></div>
                                 <div className="flex justify-between"><span className="text-slate-500">月租金</span><span className="font-medium">{site.venueContract.monthlyRent ? fmtMoney(site.venueContract.monthlyRent) : "-"}</span></div>
+                                <div className="flex justify-between"><span className="text-slate-500">平摊场地成本（当月）</span><span className="font-medium text-rose-600">{site.venueCostMonth != null ? fmtMoney(site.venueCostMonth) : "-"}</span></div>
                                 <div className="flex justify-between"><span className="text-slate-500">付款方式</span><span>{site.venueContract.payMethod ?? "-"}</span></div>
                                 <div className="flex justify-between"><span className="text-slate-500">合同期限</span><span>{fmtDate(site.venueContract.startDate)} ~ {fmtDate(site.venueContract.endDate)}</span></div>
                                 <div className="flex justify-between"><span className="text-slate-500">状态</span><StatusBadge status={site.venueContract.status} /></div>

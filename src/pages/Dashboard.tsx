@@ -31,7 +31,7 @@ export default function Dashboard() {
 
   const expiring = (contracts.data ?? []).filter((c: any) => c.status === "临期" || c.status === "已到期");
   const md = monthlyDetail.data;
-  const totalProfit = data.elecProfit + data.rentIncomeTotal - data.rentCostTotal - data.opExpenseTotal;
+  const totalProfit = data.netProfitTotal ?? (data.elecProfit + data.rentIncomeTotal - data.rentCostTotal - data.opExpenseTotal);
 
   // 明细展开行组件
   const ExpandRow = ({ open, onToggle, title, summary, children }: any) => (
@@ -174,9 +174,9 @@ export default function Dashboard() {
       {/* 核心指标（全量累计） */}
       <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
         <StatCard label="品牌组合" value={`${data.stationCount}`} sub={`运营中 ${data.activeStations} · 电表 ${data.meterCount}`} icon={Building2} tone="blue" />
-        <StatCard label="净利润（元）" value={fmtMoney(totalProfit)} sub="电费+租金-运营费用" icon={TrendingUp} tone="green" />
-        <StatCard label="电费差价利润（元）" value={fmtMoney(data.elecProfit)} sub={`收款 ${fmtMoney(data.elecCollect)} / 付款 ${fmtMoney(data.elecPay)}`} icon={Zap} />
-        <StatCard label="场租差价利润（元）" value={fmtMoney(data.rentIncomeTotal - data.rentCostTotal)} sub={`收入 ${fmtMoney(data.rentIncomeTotal)} / 成本 ${fmtMoney(data.rentCostTotal)}`} icon={Home} />
+        <StatCard label="净利润（元）" value={fmtMoney(totalProfit)} sub="电费+租金(已扣税)-运营费用" icon={TrendingUp} tone="green" />
+        <StatCard label="电费差价利润（元）" value={fmtMoney(data.elecProfit)} sub={`收款(不含税) ${fmtMoney(data.elecCollect)} / 付款 ${fmtMoney(data.elecPay)}`} icon={Zap} />
+        <StatCard label="场租差价利润（元）" value={fmtMoney(data.rentProfitTotal ?? (data.rentIncomeTotal - data.rentCostTotal))} sub={`收入 ${fmtMoney(data.rentIncomeTotal)} / 成本 ${fmtMoney(data.rentCostTotal)}（已扣税 ${fmtMoney(data.rentTaxTotal ?? 0)}）`} icon={Home} />
       </div>
 
       {/* 费用与预警 */}
