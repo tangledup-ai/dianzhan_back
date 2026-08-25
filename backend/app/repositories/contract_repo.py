@@ -43,7 +43,14 @@ def list_contracts(brand_id: int = None, landlord_id: int = None, station_id: in
                     AND m.brand_id IS NOT NULL
                     AND m.meter_no NOT LIKE 'TEST%%'
                 ) t
-              ) AS total_brand_cabinets
+              ) AS total_brand_cabinets,
+              -- 该场地下所有收入合同（品牌方合同）的计费柜数总和（动态：品牌方合同柜数调整时自动跟随）
+              (
+                SELECT COALESCE(SUM(v.cabinets_count), 0) FROM contracts v
+                WHERE v.landlord_id = c.landlord_id
+                  AND v.contract_type = '品牌方合同'
+                  AND v.cabinets_count IS NOT NULL
+              ) AS income_cabinets_total
             FROM contracts c
             LEFT JOIN brands b ON c.brand_id = b.id
             LEFT JOIN landlords l ON c.landlord_id = l.id
@@ -116,6 +123,17 @@ def create_contract(data: dict):
     conn = get_connection()
     cur = get_dict_cursor(conn)
     try:
+        # 唯一场地合同校验：同一个场地方只能有一个场地合同
+        contract_type = data.get("contractType", "场地合同")
+        landlord_id = data.get("landlordId")
+        if contract_type == "场地合同" and landlord_id:
+            cur.execute("""
+                SELECT id FROM contracts
+                WHERE contract_type = '场地合同' AND landlord_id = %s
+            """, (landlord_id,))
+            if cur.fetchone():
+                raise ValueError("该场地方已存在场地合同，一个场地方只能有一份场地合同")
+
         cur.execute("""
             INSERT INTO contracts
             (landlord_id, brand_id, entity_id, contract_type,
@@ -126,9 +144,9 @@ def create_contract(data: dict):
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING *
         """, (
-            data.get("landlordId"), data.get("brandId"),
+            landlord_id, data.get("brandId"),
             data.get("entityId"),
-            data.get("contractType", "场地合同"),
+            contract_type,
             data.get("electricityPrice"), data.get("rentAmount"),
             data.get("cabinetsCount"), data.get("unitMonthlyRent"), data.get("monthlyRent"),
             data.get("rentCalcMethod", "按柜子数量"),
@@ -150,19 +168,20 @@ def create_contract(data: dict):
         ))
         conn.commit()
         contract = cur.fetchone()
-        # 生成收付款分期（按 pay_method 拆期）
+        # 生成收付款分期（按 pay_method 拆期）；失败不再静默，打印日志便于排查
         try:
             from .contract_schedule_repo import generate_schedules
             generate_schedules(
                 contract_id=contract["id"],
-                contract_type=data.get("contractType", "场地合同"),
+                contract_type=contract_type,
                 pay_method=data.get("payMethod") or "月付",
                 start_date=data.get("startDate"),
                 end_date=data.get("endDate"),
                 monthly_rent=data.get("monthlyRent"),
             )
-        except Exception:
-            pass
+        except Exception as e:
+            import logging
+            logging.error(f"generate_schedules error for contract {contract['id']}: {e}, data={data}")
         return contract
     finally:
         cur.close()
@@ -173,6 +192,12 @@ def update_contract(contract_id: int, data: dict):
     conn = get_connection()
     cur = get_dict_cursor(conn)
     try:
+        # 读取更新前的合同（用于唯一场地合同校验）
+        cur.execute("SELECT contract_type, landlord_id FROM contracts WHERE id = %s", (contract_id,))
+        before = cur.fetchone()
+        if not before:
+            return None
+
         field_map = {
             "landlordId": "landlord_id", "brandId": "brand_id", "entityId": "entity_id",
             "contractType": "contract_type",
@@ -202,6 +227,18 @@ def update_contract(contract_id: int, data: dict):
                 updates.append(f"{db_field} = %s"); values.append(data[key])
         if not updates:
             return None
+
+        # 唯一场地合同校验：若更新后是场地合同（或保持场地合同），同 landlord 只能有一份
+        new_type = data.get("contractType", before["contract_type"])
+        new_landlord = data.get("landlordId", before["landlord_id"])
+        if new_type == "场地合同" and new_landlord:
+            cur.execute("""
+                SELECT id FROM contracts
+                WHERE contract_type = '场地合同' AND landlord_id = %s AND id != %s
+            """, (new_landlord, contract_id))
+            if cur.fetchone():
+                raise ValueError("该场地方已存在场地合同，一个场地方只能有一份场地合同")
+
         values.append(contract_id)
         cur.execute(f"UPDATE contracts SET {', '.join(updates)} WHERE id = %s RETURNING *", values)
         updated = cur.fetchone()
@@ -217,8 +254,9 @@ def update_contract(contract_id: int, data: dict):
                 end_date=updated.get("end_date"),
                 monthly_rent=updated.get("monthly_rent"),
             )
-        except Exception:
-            pass
+        except Exception as e:
+            import logging
+            logging.error(f"generate_schedules error for contract {contract_id}: {e}")
         return updated
     finally:
         cur.close()

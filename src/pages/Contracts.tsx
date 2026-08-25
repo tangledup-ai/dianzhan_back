@@ -490,7 +490,7 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
   const blank = {
     landlordId: "", brandId: "", contractType: defaultType || "场地合同",
     electricityPrice: "", rentAmount: "", cabinetsCount: "", unitMonthlyRent: "", monthlyRent: "",
-    rentCalcMethod: "按柜子数量", payMethod: "", rentAdvanceDays: "0",
+    rentCalcMethod: defaultType === "品牌方合同" ? "按柜子数量" : "固定价格", payMethod: "", rentAdvanceDays: "0",
     region: "", address: "", latitude: "", longitude: "", payEntity: "",
     startDate: "", endDate: "",
     taxEnabled: false, taxRate: "0.01", postTaxElectricityPrice: "",
@@ -518,6 +518,14 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
     const cabinetCount = (cabinets.data ?? []).filter((c: any) => meterIds.has(c.meterId)).length;
     return cabinetCount;
   }, [f.landlordId, f.brandId, meters.data, cabinets.data]);
+
+  // 该场地下所有收入合同（品牌方合同）的计费柜数总和（动态：品牌方合同柜数调整时自动跟随）
+  const incomeCabinetsTotal = useMemo(() => {
+    if (!f.landlordId) return 0;
+    return (contracts.data ?? [])
+      .filter((c: any) => c.landlordId === Number(f.landlordId) && c.contractType === "品牌方合同")
+      .reduce((sum: number, c: any) => sum + (Number(c.cabinetsCount) || 0), 0);
+  }, [f.landlordId, contracts.data]);
 
   // 当自动计算的柜子数变化时，更新表单
   useEffect(() => {
@@ -566,6 +574,18 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
     }
   }, [f.rentCalcMethod, f.unitMonthlyRent, f.cabinetsCount]);
 
+  // 场地合同「按柜子数量」：每柜场地成本 × 该场地下收入合同计费柜数总和（动态）
+  useEffect(() => {
+    if (f.contractType === "场地合同" && f.rentCalcMethod === "按柜子数量" && f.unitMonthlyRent && incomeCabinetsTotal > 0) {
+      const calculated = Number(f.unitMonthlyRent) * incomeCabinetsTotal;
+      setF((prev) => ({
+        ...prev,
+        monthlyRent: String(calculated),
+        rentAmount: String(Math.round(calculated * 12 * 100) / 100),
+      }));
+    }
+  }, [f.contractType, f.rentCalcMethod, f.unitMonthlyRent, incomeCabinetsTotal]);
+
   // 年租金和月租金互算（在输入时直接计算，避免循环依赖）
   const handleMonthlyRentChange = (v: string) => {
     setF((prev) => {
@@ -595,7 +615,7 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
         contractType: record.contractType ?? "场地合同",
         electricityPrice: record.electricityPrice ? String(record.electricityPrice) : "", rentAmount: record.rentAmount ? String(record.rentAmount) : "",
         cabinetsCount: record.cabinetsCount ? String(record.cabinetsCount) : "", unitMonthlyRent: record.unitMonthlyRent ? String(record.unitMonthlyRent) : "",
-        rentCalcMethod: record.rent_calc_method || "按柜子数量",
+        rentCalcMethod: record.rent_calc_method || (record.contractType === "品牌方合同" ? "按柜子数量" : "固定价格"),
         monthlyRent: record.monthlyRent ? String(record.monthlyRent) : "", payMethod: record.payMethod ?? "",
         rentAdvanceDays: record.rentAdvanceDays != null ? String(record.rentAdvanceDays) : "0",
         region: record.region ?? "", address: record.address ?? "",
@@ -630,6 +650,16 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
   const submit = () => {
     if (!f.landlordId) { toast.error("请选择场地方"); return; }
     if (f.contractType === "品牌方合同" && !f.landlordId) { toast.error("品牌方合同必须关联场地方"); return; }
+    // 唯一场地合同校验：同一个场地方只能有一个场地合同
+    if (f.contractType === "场地合同") {
+      const dup = (contracts.data ?? []).find((c: any) =>
+        c.landlordId === Number(f.landlordId) && c.contractType === "场地合同" && c.id !== record?.id
+      );
+      if (dup) {
+        toast.error(`该场地方已存在场地合同（${dup.landlordName || ""}），一个场地方只能有一份场地合同`);
+        return;
+      }
+    }
     // 计算税后电费单价（统一口径：税费 = 收入 × 税率 → 税后单价 = 税前单价 × (1 − 税率)）
     const taxEnabled = f.taxEnabled;
     const taxRate = taxEnabled ? Number(f.taxRate) : null;
@@ -734,8 +764,42 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
           <FormSection title="租金与费用">
             {f.contractType === "场地合同" && (
               <>
-                <Field label="年租金（元）"><NumInput value={f.rentAmount} onChange={handleRentAmountChange} /></Field>
-                <Field label="月租金（元）"><NumInput value={f.monthlyRent} onChange={handleMonthlyRentChange} /></Field>
+                <Field label="场地租金计费方式">
+                  <SelectInput value={f.rentCalcMethod} onChange={set("rentCalcMethod")}
+                    options={[{ value: "固定价格", label: "固定金额" }, { value: "按柜子数量", label: "按柜子数量（收入合同柜数×每柜成本）" }]} />
+                </Field>
+                {f.rentCalcMethod === "按柜子数量" && (
+                  <>
+                    <Field label="每柜场地成本（元/月）">
+                      <NumInput value={f.unitMonthlyRent} onChange={set("unitMonthlyRent")} placeholder="如：300" />
+                    </Field>
+                    <div>
+                      <span className="mb-1 block text-xs font-medium text-slate-500">
+                        计费柜数（来自收入合同）
+                        <span className="block text-[10px] font-normal text-slate-400">= 该场地下所有品牌方合同（收入合同）的计费柜数总和，动态跟随</span>
+                      </span>
+                      <div className="flex h-9 items-center rounded-md border border-slate-200 bg-slate-50 px-3 text-sm font-semibold tabular-nums text-slate-700">
+                        {incomeCabinetsTotal > 0 ? `${incomeCabinetsTotal} 柜` : (f.landlordId ? "0 柜（暂无收入合同或未填柜数）" : "请先选择场地方")}
+                      </div>
+                    </div>
+                  </>
+                )}
+                <Field label={f.rentCalcMethod === "按柜子数量" ? "月租金（元）" : "月租金（元）"}>
+                  <NumInput
+                    value={f.monthlyRent}
+                    onChange={handleMonthlyRentChange}
+                    disabled={f.rentCalcMethod === "按柜子数量"}
+                    placeholder={f.rentCalcMethod === "按柜子数量" ? `每柜成本 × ${incomeCabinetsTotal} 柜 = 自动计算` : "请输入"}
+                  />
+                </Field>
+                <Field label="年租金（元）">
+                  <NumInput
+                    value={f.rentAmount}
+                    onChange={handleRentAmountChange}
+                    disabled={f.rentCalcMethod === "按柜子数量"}
+                    placeholder={f.rentCalcMethod === "按柜子数量" ? "自动计算（月租 × 12）" : "请输入"}
+                  />
+                </Field>
                 <Field label="电费单价（元/度）"><NumInput value={f.electricityPrice} onChange={set("electricityPrice")} placeholder="0.65" /></Field>
                 <Field label="场地租金付款方式">
                   <SelectInput value={f.payMethod} onChange={set("payMethod")}

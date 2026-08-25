@@ -597,7 +597,7 @@ SELECT
     COALESCE(ARRAY_AGG(c.id) FILTER (WHERE c.contract_type = '品牌方合同'), '{}'::INTEGER[]) AS brand_contract_ids
 FROM landlords l
 LEFT JOIN contracts c ON c.landlord_id = l.id
-GROUP BY l.id;
+GROUP BY l.id, l.name, l.contact, l.phone, l.region, l.address, l.latitude, l.longitude;
 COMMENT ON VIEW landlord_site_summary IS '场地维度实时聚合（租金成本/收入/合同清单），只读不落缓存列';
 
 -- 场地月度经营汇总视图：跨表关联（电费台账 + 合同月租 + 运营费用 + 分红）
@@ -765,7 +765,7 @@ LEFT JOIN dividend_shares ds ON ds.dividend_id IS NOT NULL
 LEFT JOIN dividend_records d ON ds.dividend_id = d.id AND d.period BETWEEN pr.p_start AND pr.p_end
 LEFT JOIN shareholders sh ON p.beneficiary_type = '股东' AND sh.id = p.beneficiary_id
 LEFT JOIN introducers i ON p.beneficiary_type = '商务' AND i.id = p.beneficiary_id
-GROUP BY p.beneficiary_type, p.beneficiary_id, COALESCE(sh.name, i.name), p.settlement_period,
+GROUP BY p.beneficiary_type, p.beneficiary_id, sh.name, i.name, p.settlement_period,
          p.landlord_count, pr.p_start, pr.p_end, pr.next_period, pr.next_date;
 COMMENT ON VIEW dividend_settlement_schedule IS '分红结算周期视图（v3：landlord 配置表）：受益人 × 周期 的下次结算期/日期 + 待结算/已结算金额';
 
