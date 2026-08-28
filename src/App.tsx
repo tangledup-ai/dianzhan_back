@@ -16,6 +16,7 @@ import Approvals from "@/pages/Approvals";
 import Meters from "@/pages/Meters";
 import Directory from "@/pages/Directory";
 import Alerts from "@/pages/Alerts";
+import Settings from "@/pages/Settings";
 
 // 登录守卫：未登录跳转 /login
 function RequireAuth({ children }: { children: React.ReactNode }) {
@@ -64,6 +65,7 @@ function AppRoutes() {
         <Route path="/meters" element={<Meters />} />
         <Route path="/directory" element={<Directory />} />
         <Route path="/alerts" element={<Alerts />} />
+        <Route path="/settings" element={<Settings />} />
         <Route path="*" element={<Navigate to={isShareholder ? "/shareholders" : "/"} replace />} />
       </Route>
     </Routes>

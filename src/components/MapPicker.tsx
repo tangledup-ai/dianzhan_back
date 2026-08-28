@@ -1,42 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { MapPin } from "lucide-react";
-
-const MAP_KEY = "VS3BZ-TIXCV-RJ2PQ-5YUEE-UZDEV-MHFQD";
-
-let mapLoading = false;
-let mapLoaded = false;
-
-function loadMapSDK(): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (mapLoaded && (window as any).qq?.maps) {
-      resolve();
-      return;
-    }
-    if (mapLoading) {
-      const check = setInterval(() => {
-        if (mapLoaded && (window as any).qq?.maps) {
-          clearInterval(check);
-          resolve();
-        }
-      }, 100);
-      return;
-    }
-    mapLoading = true;
-    (window as any).initQQMap = () => {
-      mapLoaded = true;
-      mapLoading = false;
-      resolve();
-    };
-    const script = document.createElement("script");
-    script.src = `https://map.qq.com/api/js?v=2.exp&key=${MAP_KEY}&callback=initQQMap`;
-    script.async = true;
-    script.onerror = () => {
-      mapLoading = false;
-      reject(new Error("地图SDK加载失败"));
-    };
-    document.head.appendChild(script);
-  });
-}
+import { loadMapSDK } from "@/lib/qqMap";
 
 interface MapPickerProps {
   latitude?: number | null;

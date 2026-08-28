@@ -11,7 +11,8 @@ from pathlib import Path
 from .config import PORT
 from .infra.database import init_database
 from .api import directory, stations, meters, cabinets, electricity, rent, dividends, approvals, contracts, overview, meter_energy, alerts, contract_schedules, auth
-from .api import mp_auth, mp_snapshot, mp_approvals, mp_finance
+from .api import mp_auth, mp_snapshot, mp_approvals, mp_finance, mp_ai
+from .api import system_config
 from .jobs.scheduler import start_scheduler, stop_scheduler, get_scheduler_status
 from .jobs.sync_meters import full_sync
 
@@ -89,6 +90,7 @@ app.include_router(meter_energy.router)
 app.include_router(alerts.router)
 app.include_router(contract_schedules.router)
 app.include_router(auth.router)
+app.include_router(system_config.router)
 
 # ── 小程序子应用 ──────────────────────────────────────────────
 mp_app = FastAPI(
@@ -101,6 +103,8 @@ mp_app.include_router(mp_auth.router)
 mp_app.include_router(mp_snapshot.router)
 mp_app.include_router(mp_approvals.router)
 mp_app.include_router(mp_finance.router)
+mp_app.include_router(mp_ai.router)
+mp_app.include_router(system_config.mp_router)
 
 # 挂载到 /mp 路径，Swagger 文档地址: /mp/docs
 app.mount("/mp", mp_app)

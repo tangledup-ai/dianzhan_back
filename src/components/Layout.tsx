@@ -1,7 +1,7 @@
 import { NavLink, Outlet, useLocation, useNavigate } from "react-router";
 import {
   LayoutDashboard, Building2, Zap, Home as HomeIcon, Tag, Landmark,
-  MapPin, Users, FileText, Gauge, FolderCog, BatteryCharging, FileCheck2, LogOut, AlertTriangle,
+  MapPin, Users, FileText, Gauge, FolderCog, BatteryCharging, FileCheck2, LogOut, AlertTriangle, Settings as SettingsIcon,
 } from "lucide-react";
 import { useAuth } from "@/providers/auth";
 
@@ -19,10 +19,11 @@ const NAV = [
   { to: "/meters", label: "智慧电表", icon: Gauge },
   { to: "/alerts", label: "异常预警", icon: AlertTriangle },
   { to: "/directory", label: "基础档案", icon: FolderCog },
+  { to: "/settings", label: "系统设置", icon: SettingsIcon },
 ];
 
-// 股东账号隐藏：经营总览/品牌方/公司主体/场地方/审批中心/基础档案/异常预警（无关或涉全局）
-const SHAREHOLDER_HIDDEN = new Set(["/", "/brands", "/entities", "/landlords", "/approvals", "/directory", "/alerts"]);
+// 股东账号隐藏：经营总览/品牌方/公司主体/场地方/审批中心/基础档案/异常预警/系统设置（无关或涉全局）
+const SHAREHOLDER_HIDDEN = new Set(["/", "/brands", "/entities", "/landlords", "/approvals", "/directory", "/alerts", "/settings"]);
 
 const ROLE_LABEL: Record<string, string> = {
   boss: "老板",
@@ -35,7 +36,7 @@ const TITLES: Record<string, string> = {
   "/": "经营总览", "/stations": "场地数据", "/electricity": "电费台账", "/rent": "场租台账",
   "/brands": "品牌方看板", "/entities": "公司主体看板", "/landlords": "场地方（业主）看板",
   "/shareholders": "股东分红", "/contracts": "合同管理", "/approvals": "审批中心",
-  "/meters": "智慧电表", "/directory": "基础档案", "/alerts": "异常预警",
+  "/meters": "智慧电表", "/directory": "基础档案", "/alerts": "异常预警", "/settings": "系统设置",
 };
 
 export default function Layout() {

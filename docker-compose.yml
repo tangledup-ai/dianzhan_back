@@ -5,7 +5,7 @@ services:
     build: ./backend
     container_name: battery-swap-v2-backend
     ports:
-      - "3002:3001"
+      - "3001:3001"
     environment:
       # v2 真实库：huandian_v2（39 表，与 database_init.sql 一致）——勿连 dianzhan-test（另一个项目的旧库）
       - DATABASE_URL=postgresql://quant:quant-speed123@host.docker.internal:5432/huandian_v2
@@ -27,7 +27,7 @@ services:
       dockerfile: Dockerfile.frontend
     container_name: battery-swap-v2-frontend
     ports:
-      - "8086:80"
+      - "8085:80"
     depends_on:
       - backend
     restart: unless-stopped
