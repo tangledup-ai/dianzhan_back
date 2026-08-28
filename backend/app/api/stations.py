@@ -11,16 +11,30 @@ router = APIRouter(prefix="/api/stations", tags=["场地电表"], default_respon
 
 @router.get("/landlord-locations")
 async def get_landlord_locations():
-    """v3：获取所有场地方的位置信息（用于地图标注；landlords.address/latitude/longitude）"""
+    """v3：获取所有场地方的位置信息（用于地图标注）
+
+    坐标来源优先级：场地方的场地合同地图选点（contracts.latitude/longitude）
+    > landlords.latitude/longitude。合同上选了点，该场地及其电表均用该坐标。
+    """
     from ..infra.database import get_connection, get_dict_cursor
     conn = get_connection()
     cur = get_dict_cursor(conn)
     try:
         cur.execute("""
-            SELECT id, name, address, latitude, longitude
-            FROM landlords
-            WHERE latitude IS NOT NULL AND longitude IS NOT NULL
-            ORDER BY id
+            SELECT l.id, l.name,
+                   COALESCE(c.latitude, l.latitude) AS latitude,
+                   COALESCE(c.longitude, l.longitude) AS longitude,
+                   COALESCE(c.address, l.address) AS address
+            FROM landlords l
+            LEFT JOIN LATERAL (
+                SELECT latitude, longitude, address
+                FROM contracts
+                WHERE landlord_id = l.id AND contract_type = '场地合同'
+                ORDER BY id DESC LIMIT 1
+            ) c ON TRUE
+            WHERE COALESCE(c.latitude, l.latitude) IS NOT NULL
+              AND COALESCE(c.longitude, l.longitude) IS NOT NULL
+            ORDER BY l.id
         """)
         rows = cur.fetchall()
         # 状态派生：有正常电表 → 运营中；有电表 → 筹建中；否则已关停
