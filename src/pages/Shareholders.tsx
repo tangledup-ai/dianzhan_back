@@ -2,7 +2,7 @@ import { useState, useMemo, useEffect, useCallback, useRef } from "react";
 import { useQuery, useQueries, useMutation, useQueryClient } from "@tanstack/react-query";
 import { listShareholders, listIntroducers, createShareholder } from "@/api/directory";
 import { getStationBoard } from "@/api/overview";
-import { listDividends, listShareholderConfigs, listIntroducerConfigs, deleteShareholderConfig, deleteIntroducerConfig, calculateDividend, createDividend, shareholderSummary, saveShareholderConfig, saveIntroducerConfig, submitDividend } from "@/api/dividends";
+import { listDividends, listShareholderConfigs, listIntroducerConfigs, deleteShareholderConfig, deleteIntroducerConfig, calculateDividend, createDividend, refreshDividends, shareholderSummary, saveShareholderConfig, saveIntroducerConfig, submitDividend } from "@/api/dividends";
 import { listExpenses, saveExpense, deleteExpense } from "@/api/rent";
 import { exportXlsxWithTitle, exportXlsxWithTitles } from "@/lib/export";
 import { MonthPicker } from "@/components/MonthPicker";
@@ -940,6 +940,17 @@ export default function Shareholders() {
     onError: (e: any) => toast.error(e.response?.data?.detail || e.message || "提交失败"),
   });
 
+  // 手动重算：按最新上游数据（合同/电表/柜子/台账/运营费用）重算当前场地的分红记录（所有状态）
+  const refreshMutation = useMutation({
+    mutationFn: () => refreshDividends({ landlordId: landlordId! }),
+    onSuccess: (r: any) => {
+      qc.invalidateQueries({ queryKey: ["dividends"] });
+      qc.invalidateQueries({ queryKey: ["dividendPreview"] });
+      toast.success(`已重算 ${r?.refreshed ?? 0} 条分红记录`);
+    },
+    onError: (e: any) => toast.error(e.response?.data?.detail || e.message || "重算失败"),
+  });
+
   // ── 运营费用（当前选中月 = periodEnd）──
   const expenses = useQuery({
     queryKey: ["opExpenses", landlordId, periodEnd],
@@ -1365,6 +1376,14 @@ export default function Shareholders() {
                     </button>
                     <button onClick={() => setAddDividendOpen(true)} className="rounded-md bg-emerald-600 px-2 py-1 text-[11px] text-white hover:bg-emerald-700">
                       生成分红记录
+                    </button>
+                    <button
+                      onClick={() => { if (!landlordId) { toast.error("请先选择场地方"); return; } refreshMutation.mutate(); }}
+                      disabled={refreshMutation.isPending}
+                      className="rounded-md bg-amber-50 border border-amber-200 px-2 py-1 text-[11px] text-amber-700 hover:bg-amber-100 disabled:opacity-50"
+                      title="按最新的合同、电表、台账数据重算本场地的分红记录（所有状态）"
+                    >
+                      {refreshMutation.isPending ? "重算中…" : "重算记录"}
                     </button>
                   </div>
                 </div>

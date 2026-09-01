@@ -204,13 +204,15 @@ async def snapshot(user: dict = Depends(get_current_user)):
             }
 
         # 获取柜子数量（只统计已归属 landlord+brand 的实表；v3：按 场地×品牌 分组）
+        # 口径与合同/分红一致：每块电表至少 1 柜（max(1, 实际柜子数)），不是电表数
         cur.execute("""
-            SELECT landlord_id, brand_id, COUNT(*) as cnt
-            FROM meters
-            WHERE landlord_id IS NOT NULL AND brand_id IS NOT NULL AND meter_no NOT LIKE 'TEST%'
+            SELECT landlord_id, brand_id,
+                   SUM(GREATEST(1, (SELECT COUNT(*) FROM cabinets cab WHERE cab.meter_id = m.id))) AS cnt
+            FROM meters m
+            WHERE m.landlord_id IS NOT NULL AND m.brand_id IS NOT NULL AND m.meter_no NOT LIKE 'TEST%'
             GROUP BY landlord_id, brand_id
         """)
-        station_meter_count = {(r["landlord_id"], r["brand_id"]): r["cnt"] for r in cur.fetchall()}
+        station_meter_count = {(r["landlord_id"], r["brand_id"]): int(r["cnt"] or 0) for r in cur.fetchall()}
 
         # 构建站点列表（v3：一行 = 一个 场地×品牌 组合；raw_stations 已按组合去重）
         entity_name = entities[0] if entities else ""

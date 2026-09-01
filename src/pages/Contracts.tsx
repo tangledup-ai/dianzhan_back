@@ -506,25 +506,32 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
   const cabinets = useQuery({ queryKey: ["allCabinets"], queryFn: () => listCabinets(), enabled: open });
   const contracts = useQuery({ queryKey: ["contracts"], queryFn: () => listContracts(), enabled: open });
 
-  // 根据选中的场地方和品牌方，自动计算柜子数量
+  // 计费柜数自动计算：匹配(场地方+品牌方)的电表，每块电表至少 1 柜（max(1, 实际柜子数)），
+  // 排除 TEST 前缀电表——与后端 live_cabinets_count 口径一致
   const autoCabinetCount = useMemo(() => {
     if (!f.landlordId || !f.brandId) return null;
     // 找到匹配的电表
     const matchedMeters = (meters.data ?? []).filter((m: any) =>
       m.landlordId === Number(f.landlordId) && m.brandId === Number(f.brandId)
+      && !String(m.meterNo || "").startsWith("TEST")
     );
     const meterIds = new Set(matchedMeters.map((m: any) => m.id));
-    // 计算这些电表下的柜子总数
-    const cabinetCount = (cabinets.data ?? []).filter((c: any) => meterIds.has(c.meterId)).length;
-    return cabinetCount;
+    // 这些电表下的实际柜子数
+    const cabByMeter = new Map<number, number>();
+    (cabinets.data ?? []).forEach((c: any) => {
+      if (meterIds.has(c.meterId)) cabByMeter.set(c.meterId, (cabByMeter.get(c.meterId) || 0) + 1);
+    });
+    // 每块电表至少计 1 柜
+    return matchedMeters.reduce((sum: number, m: any) => sum + Math.max(1, cabByMeter.get(m.id) || 0), 0);
   }, [f.landlordId, f.brandId, meters.data, cabinets.data]);
 
-  // 该场地下所有收入合同（品牌方合同）的计费柜数总和（动态：品牌方合同柜数调整时自动跟随）
+  // 该场地下所有收入合同（品牌方合同）的计费柜数总和（实时：与品牌方合同行同口径，
+  // 优先后端实时统计 liveCabinetsCount，电表归属变更后自动跟随；存储 cabinetsCount 仅兜底）
   const incomeCabinetsTotal = useMemo(() => {
     if (!f.landlordId) return 0;
     return (contracts.data ?? [])
       .filter((c: any) => c.landlordId === Number(f.landlordId) && c.contractType === "品牌方合同")
-      .reduce((sum: number, c: any) => sum + (Number(c.cabinetsCount) || 0), 0);
+      .reduce((sum: number, c: any) => sum + (Number(c.liveCabinetsCount ?? c.cabinetsCount) || 0), 0);
   }, [f.landlordId, contracts.data]);
 
   // 当自动计算的柜子数变化时，更新表单
@@ -535,7 +542,8 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
   }, [autoCabinetCount]);
 
   // 承担场地成本实时计算：场地合同月租金总和 ÷ 该场地所有品牌计费柜数总和 × 本品牌计费柜数
-  // 与后端 contract_repo / dividend_calc 口径一致；分母含无合同品牌的电表柜数，不计 TEST 电表
+  // 口径与后端 contract_repo live_cabinets_count/total_brand_cabinets 一致：
+  // 每块电表按 1 柜计（即 GREATEST(1,柜数)），仅排除 TEST 前缀电表；签了合同但无电表的品牌分摊为 0
   const venueCostLive = useMemo(() => {
     if (!f.landlordId || !f.brandId) return null;
     const landlordId = Number(f.landlordId);
@@ -547,20 +555,18 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
       .reduce((sum: number, c: any) => sum + Number(c.monthlyRent || 0), 0);
     if (!venueMonthlyRent) return null;
 
-    // 2) 该场地下电表 → 柜子（排除 TEST 电表）
+    // 2) 该场地下已归属品牌的电表（排除 TEST 前缀，与后端 NOT LIKE 'TEST%' 一致）
     const siteMeters = (meters.data ?? []).filter(
-      (m: any) => m.landlordId === landlordId && !String(m.meterNo || "").toUpperCase().includes("TEST")
+      (m: any) => m.landlordId === landlordId && m.brandId != null && !String(m.meterNo || "").startsWith("TEST")
     );
-    const meterById = new Map<number, any>(siteMeters.map((m: any) => [m.id, m]));
-    const siteCabs = (cabinets.data ?? []).filter((c: any) => meterById.has(c.meterId));
 
-    // 3) 本品牌柜数 / 该场地所有品牌电表柜数总和
-    const liveCabs = siteCabs.filter((c: any) => meterById.get(c.meterId)?.brandId === brandId).length;
-    const totalCabs = siteCabs.filter((c: any) => meterById.get(c.meterId)?.brandId != null).length;
+    // 3) 本品牌电表数 / 该场地所有品牌电表数（每表计 1 柜）
+    const liveCabs = siteMeters.filter((m: any) => m.brandId === brandId).length;
+    const totalCabs = siteMeters.length;
     if (!totalCabs) return null;
 
     return Math.round((venueMonthlyRent / totalCabs) * liveCabs * 100) / 100;
-  }, [f.landlordId, f.brandId, contracts.data, meters.data, cabinets.data]);
+  }, [f.landlordId, f.brandId, contracts.data, meters.data]);
 
   // 当使用"按柜子数量"方式时，自动计算场地月租金，并同步年租金 = 月租金 × 12
   useEffect(() => {
@@ -701,7 +707,7 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
       deposit: f.deposit ? Number(f.deposit) : null,
       firstMonthRent: f.firstMonthRent ? Number(f.firstMonthRent) : null,
       rentRefund: f.rentRefund ? Number(f.rentRefund) : null,
-      earlyEndDate: f.rentRefund && Number(f.rentRefund) > 0 ? (f.earlyEndDate || new Date().toISOString().slice(0, 10)) : null,
+      earlyEndDate: f.earlyEndDate || (f.rentRefund && Number(f.rentRefund) > 0 ? new Date().toISOString().slice(0, 10) : null),
       rentTaxEnabled,
       rentTaxRate,
       postTaxRentPrice,
@@ -776,10 +782,10 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
                     <div>
                       <span className="mb-1 block text-xs font-medium text-slate-500">
                         计费柜数（来自收入合同）
-                        <span className="block text-[10px] font-normal text-slate-400">= 该场地下所有品牌方合同（收入合同）的计费柜数总和，动态跟随</span>
+                        <span className="block text-[10px] font-normal text-slate-400">= 该场地下品牌方合同覆盖品牌的电表实时统计（电表管理里关联后自动跟随）</span>
                       </span>
                       <div className="flex h-9 items-center rounded-md border border-slate-200 bg-slate-50 px-3 text-sm font-semibold tabular-nums text-slate-700">
-                        {incomeCabinetsTotal > 0 ? `${incomeCabinetsTotal} 柜` : (f.landlordId ? "0 柜（暂无收入合同或未填柜数）" : "请先选择场地方")}
+                        {incomeCabinetsTotal > 0 ? `${incomeCabinetsTotal} 柜` : (f.landlordId ? "0 柜（暂无收入合同，或电表未关联到该场地的品牌）" : "请先选择场地方")}
                       </div>
                     </div>
                   </>
@@ -872,19 +878,18 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
               <Field label="电费收款单价（税前·元/度）"><NumInput value={f.electricityPrice} onChange={set("electricityPrice")} placeholder="1.20" /></Field>
               <Field label="场地租金收款方式">
                 <SelectInput value={f.payMethod} onChange={set("payMethod")}
-                  options={[{ value: "", label: "请选择" }, { value: "月付", label: "月付" }, { value: "季付", label: "季付" }, { value: "半年付", label: "半年付" }, { value: "年付", label: "年付" }]} />
+                  options={[{ value: "", label: "请选择" }, { value: "月付", label: "月收" }, { value: "季付", label: "季收" }, { value: "半年付", label: "半年收" }, { value: "年付", label: "年收" }]} />
               </Field>
               <Field label="押金（元）"><NumInput value={f.deposit} onChange={set("deposit")} placeholder="0" /></Field>
               <Field label="首月场地租金（元）"><NumInput value={f.firstMonthRent} onChange={set("firstMonthRent")} placeholder="按整月算则留空" /></Field>
               <Field label="场地费退款（元）"><NumInput value={f.rentRefund} onChange={set("rentRefund")} placeholder="0" /></Field>
-              {f.rentRefund && Number(f.rentRefund) > 0 && (
-                <Field label="合同提前结束日期">
-                  <DateInput
-                    value={f.earlyEndDate || new Date().toISOString().slice(0, 10)}
-                    onChange={set("earlyEndDate")}
-                  />
-                </Field>
-              )}
+              <Field label="合同提前结束日期">
+                <DateInput
+                  value={f.earlyEndDate || ""}
+                  onChange={set("earlyEndDate")}
+                />
+                <span className="mt-0.5 block text-[10px] font-normal text-slate-400">提前终止合同时填写；填了退款但未选日期时默认按今天算。留空 = 按原合同到期</span>
+              </Field>
             </>
           )}
           </FormSection>

@@ -289,11 +289,19 @@ async def create_meter(data: dict):
         await auto_generate_for_meter(result.get("meter_no") or data.get("meterNo"))
     except Exception:
         pass  # 自动生成失败不影响电表保存（可手动点「自动生成」）
+    # 分红联动：电表归属影响场地成本分摊，重算该场地已有分红记录（失败不影响保存）
+    try:
+        from ..domain.dividend_refresh import refresh_dividend_records
+        refresh_dividend_records(result.get("landlord_id"))
+    except Exception:
+        pass
     return result
 
 
 @router.put("/{meter_id}")
 async def update_meter(meter_id: int, data: dict):
+    # 归属变更会同时影响新旧两个场地的分红分摊，先记下旧归属
+    old_meter = meter_repo.get_meter(meter_id)
     try:
         result = meter_repo.update_meter(meter_id, data)
     except ValueError as e:
@@ -306,10 +314,25 @@ async def update_meter(meter_id: int, data: dict):
         await auto_generate_for_meter(result.get("meter_no") or data.get("meterNo"))
     except Exception:
         pass  # 自动生成失败不影响电表保存（可手动点「自动生成」）
+    # 分红联动：重算新旧场地的已有分红记录（失败不影响保存）
+    try:
+        from ..domain.dividend_refresh import refresh_dividend_records
+        lids = {old_meter.get("landlord_id") if old_meter else None, result.get("landlord_id")}
+        for lid in lids:
+            refresh_dividend_records(lid)
+    except Exception:
+        pass
     return result
 
 
 @router.delete("/{meter_id}")
 async def delete_meter(meter_id: int):
+    old_meter = meter_repo.get_meter(meter_id)
     meter_repo.delete_meter(meter_id)
+    # 分红联动：重算原场地已有分红记录（失败不影响删除）
+    try:
+        from ..domain.dividend_refresh import refresh_dividend_records
+        refresh_dividend_records(old_meter.get("landlord_id") if old_meter else None)
+    except Exception:
+        pass
     return {"ok": True}

@@ -30,6 +30,12 @@ async def create_contract(data: dict):
         await auto_generate_for_landlord(result.get("landlord_id") or data.get("landlordId"))
     except Exception:
         pass  # 自动生成失败不影响合同保存（可手动点「自动生成」）
+    # 分红联动：合同变更后重算该场地已有分红记录（失败不影响合同保存）
+    try:
+        from ..domain.dividend_refresh import refresh_dividend_records
+        refresh_dividend_records(result.get("landlord_id") or data.get("landlordId"))
+    except Exception:
+        pass
     return result
 
 
@@ -365,10 +371,22 @@ async def update_contract(contract_id: int, data: dict):
         await auto_generate_for_landlord(result.get("landlord_id") or data.get("landlordId"))
     except Exception:
         pass  # 自动生成失败不影响合同保存（可手动点「自动生成」）
+    # 分红联动：合同变更后重算该场地已有分红记录（失败不影响合同保存）
+    try:
+        from ..domain.dividend_refresh import refresh_dividend_records
+        refresh_dividend_records(result.get("landlord_id") or data.get("landlordId"))
+    except Exception:
+        pass
     return result
 
 
 @router.delete("/{contract_id}")
 async def delete_contract(contract_id: int):
-    contract_repo.delete_contract(contract_id)
+    landlord_id = contract_repo.delete_contract(contract_id)
+    # 分红联动：合同删除后重算该场地已有分红记录（失败不影响删除）
+    try:
+        from ..domain.dividend_refresh import refresh_dividend_records
+        refresh_dividend_records(landlord_id)
+    except Exception:
+        pass
     return {"ok": True}

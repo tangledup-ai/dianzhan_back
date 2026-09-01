@@ -64,9 +64,12 @@ def payment_due_months(start_date, end_date, pay_method, rent_advance_days=0):
 
 
 def generate_schedules(contract_id: int, contract_type: str, pay_method: str,
-                       start_date, end_date, monthly_rent):
+                       start_date, end_date, monthly_rent, first_month_rent=None):
     """为合同生成/重建分期记录（先删旧，再生成）。
 
+    - 调用方需传"生效截止日"：提前结束的合同应传 early_end_date，使分期止于废弃月。
+    - 填了首月场地租金（first_month_rent）时，包含合同首月的那一期金额
+      = 首月租金 + 该期其余月份 × 月租，其余期仍为 月租 × 期长月数。
     修复 #7：重建时按 seq 保留旧分期的财务状态（已付款/已到账、付款日期、发票、备注），
     避免合同改价/改付款方式后重建丢失已标记的收付款状态。
     返回生成条数。
@@ -81,6 +84,10 @@ def generate_schedules(contract_id: int, contract_type: str, pay_method: str,
     months = _PERIOD_MONTHS.get(pay_method, 1)
     amount = round(float(monthly_rent or 0) * months, 2)
     periods = _split_periods(start_date, end_date, months)
+    # 首月场地租金所在期（按月判断）：该期金额单独计算
+    first_ym = ""
+    if first_month_rent and start_date:
+        first_ym = start_date.strftime("%Y%m")
 
     table = "rent_payment_schedule" if contract_type == "场地合同" else "rent_income_schedule"
 
@@ -95,6 +102,10 @@ def generate_schedules(contract_id: int, contract_type: str, pay_method: str,
 
         cur.execute(f"DELETE FROM {table} WHERE contract_id = %s", (contract_id,))
         for i, (ps, pe) in enumerate(periods, start=1):
+            period_amount = amount
+            if first_ym and ps.strftime("%Y%m") == first_ym:
+                n = (pe.year * 12 + pe.month) - (ps.year * 12 + ps.month) + 1
+                period_amount = round(float(first_month_rent) + float(monthly_rent or 0) * (n - 1), 2)
             old = old_rows.get(i, {})
             cur.execute(f"""
                 INSERT INTO {table} (contract_id, seq, period_start, period_end, amount, status, pay_date, invoice, remark)
@@ -108,7 +119,7 @@ def generate_schedules(contract_id: int, contract_type: str, pay_method: str,
                     invoice = EXCLUDED.invoice,
                     remark = EXCLUDED.remark
             """, (
-                contract_id, i, ps, pe, amount,
+                contract_id, i, ps, pe, period_amount,
                 old.get("status") or ("未付款" if table == "rent_payment_schedule" else "未到账"),
                 old.get("pay_date"), old.get("invoice"), old.get("remark"),
             ))

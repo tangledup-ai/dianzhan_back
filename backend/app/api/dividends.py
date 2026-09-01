@@ -66,6 +66,24 @@ async def calculate_dividend(data: dict, request: Request):
     return result
 
 
+@router.post("/refresh")
+async def refresh_dividends(data: dict, request: Request):
+    """手动重算：某场地方（可选限定月份）的分红记录按最新上游数据重算（所有状态一律重算）。"""
+    from ..domain.dividend_refresh import refresh_dividend_records
+    from ..infra.period import to_compact
+    landlord_id = data.get("landlordId")
+    if not landlord_id:
+        raise HTTPException(400, "landlordId 必填")
+
+    # 股东：只能重算关联场地的分红
+    allowed = scope_landlord_ids(request)
+    if allowed is not None and int(landlord_id) not in allowed:
+        raise HTTPException(403, "无权重算该场地分红")
+
+    period = to_compact(data["period"]) if data.get("period") else None
+    return refresh_dividend_records(int(landlord_id), [period] if period else None)
+
+
 # ─── 分红记录 ───────────────────────────────────────────────
 
 @router.get("")

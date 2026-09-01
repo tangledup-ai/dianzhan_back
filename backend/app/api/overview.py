@@ -42,14 +42,26 @@ async def overview(request: Request):
         station_stats = cur.fetchone()
 
         # 电表数量 / 总换电柜数量（v3：电表直接挂 landlord_id，不再经 stations）
+        # 柜数口径：每块电表至少 1 柜（max(1, 实际柜子数)），与合同/分红一致
         if allowed is not None:
             cur.execute("SELECT COUNT(*) as total FROM meters WHERE landlord_id = ANY(%s::int[]) AND meter_no NOT LIKE 'TEST%'", (allowed,))
             meter_count = cur.fetchone()["total"]
-            cur.execute("SELECT COUNT(*) as total FROM cabinets cab JOIN meters m ON cab.meter_id = m.id WHERE m.landlord_id = ANY(%s::int[]) AND m.meter_no NOT LIKE 'TEST%'", (allowed,))
+            cur.execute("""
+                SELECT COALESCE(SUM(GREATEST(1, cab_cnt)), 0) as total FROM (
+                    SELECT m.id, (SELECT COUNT(*) FROM cabinets cab WHERE cab.meter_id = m.id) AS cab_cnt
+                    FROM meters m
+                    WHERE m.landlord_id = ANY(%s::int[]) AND m.meter_no NOT LIKE 'TEST%'
+                ) t
+            """, (allowed,))
         else:
             cur.execute("SELECT COUNT(*) as total FROM meters WHERE meter_no NOT LIKE 'TEST%'")
             meter_count = cur.fetchone()["total"]
-            cur.execute("SELECT COUNT(*) as total FROM cabinets cab JOIN meters m ON cab.meter_id = m.id WHERE m.meter_no NOT LIKE 'TEST%'")
+            cur.execute("""
+                SELECT COALESCE(SUM(GREATEST(1, cab_cnt)), 0) as total FROM (
+                    SELECT m.id, (SELECT COUNT(*) FROM cabinets cab WHERE cab.meter_id = m.id) AS cab_cnt
+                    FROM meters m WHERE m.meter_no NOT LIKE 'TEST%'
+                ) t
+            """)
         cabinet_count = cur.fetchone()["total"]
 
         # 品牌方、公司主体、场地方、股东、介绍人数量

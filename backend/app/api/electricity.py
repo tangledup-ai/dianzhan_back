@@ -228,6 +228,13 @@ async def create_electricity(data: dict):
     for d in detail_rows:
         electricity_repo.create_meter_detail(record["id"], d["meterId"], d)
 
+    # 分红联动：电费台账是分红收入/成本的输入，重算该场地该月的分红记录（失败不影响保存）
+    try:
+        from ..domain.dividend_refresh import refresh_dividend_records
+        refresh_dividend_records(landlord_id, [period])
+    except Exception:
+        pass
+
     return record
 
 
@@ -283,12 +290,32 @@ async def update_electricity(record_id: int, data: dict):
     result = electricity_repo.update_record(record_id, data)
     if not result:
         raise HTTPException(400, "无更新内容")
+    # 分红联动：重算新旧「场地×月份」的分红记录（period/场地可能被修改）（失败不影响保存）
+    try:
+        from ..domain.dividend_refresh import refresh_dividend_records
+        seen = set()
+        for lid, p in [(record.get("landlord_id"), record.get("period")),
+                       (result.get("landlord_id"), result.get("period"))]:
+            key = (lid, p)
+            if lid and p and key not in seen:
+                seen.add(key)
+                refresh_dividend_records(lid, [p])
+    except Exception:
+        pass
     return result
 
 
 @router.delete("/{record_id:int}")
 async def delete_electricity(record_id: int):
+    record = electricity_repo.get_record(record_id)
     electricity_repo.delete_record(record_id)
+    # 分红联动：重算被删记录的「场地×月份」分红记录（失败不影响删除）
+    try:
+        from ..domain.dividend_refresh import refresh_dividend_records
+        if record and record.get("landlord_id") and record.get("period"):
+            refresh_dividend_records(record["landlord_id"], [record["period"]])
+    except Exception:
+        pass
     return {"ok": True}
 
 
@@ -495,6 +522,14 @@ async def generate_electricity(data: dict):
                 created.append(record_id)
 
         conn.commit()
+
+        # 分红联动：台账生成/更新后，重算涉及场地该月的分红记录（失败不影响台账生成）
+        try:
+            from ..domain.dividend_refresh import refresh_dividend_records
+            for lid in landlord_ids:
+                refresh_dividend_records(lid, [period])
+        except Exception:
+            pass
 
         return {
             "created": len(created),

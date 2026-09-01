@@ -220,6 +220,21 @@ def list_records(station_id: int = None, period: str = None, type_: str = None, 
         conn.close()
 
 
+def list_periods(landlord_id: int) -> list:
+    """该场地方已有分红记录的月份（6 位 YYYYMM，升序）"""
+    conn = get_connection()
+    cur = get_dict_cursor(conn)
+    try:
+        cur.execute(
+            "SELECT DISTINCT period FROM dividend_records WHERE landlord_id = %s ORDER BY period",
+            (landlord_id,)
+        )
+        return [r["period"] for r in cur.fetchall()]
+    finally:
+        cur.close()
+        conn.close()
+
+
 def get_record(record_id: int):
     conn = get_connection()
     cur = get_dict_cursor(conn)

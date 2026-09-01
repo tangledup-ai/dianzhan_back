@@ -33,6 +33,10 @@ export const getDividend = (id: number) =>
 export const createDividend = (data: any) =>
   client.post("/dividends", data).then(r => r.data);
 
+// 手动重算：按最新上游数据（合同/电表/柜子/台账/运营费用）重算某场地的分红记录（仅未结算/已驳回）
+export const refreshDividends = (data: { landlordId: number; period?: string }) =>
+  client.post("/dividends/refresh", data).then(r => r.data);
+
 export const submitDividend = (id: number, data: any) =>
   client.post(`/dividends/${id}/submit`, data).then(r => r.data);
 

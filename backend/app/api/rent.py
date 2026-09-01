@@ -1,6 +1,5 @@
 from fastapi import APIRouter, HTTPException, Query, Request
 from ..repositories import rent_repo, dividend_repo
-from ..domain.dividend_calc import dividend_calculator
 from ..infra.auth_scope import scope_landlord_ids
 from ..infra.period import to_compact
 from .base import CamelJSONResponse
@@ -67,60 +66,13 @@ async def get_excel_data(stationName: str = Query(None)):
 
 
 def _update_dividend_records(landlord_id: int, period: str):
-    """运营费用变更后：更新该场地该月的分红记录（v3 按 场地×品牌 重算）"""
-    if not landlord_id or not period:
-        return
+    """运营费用变更后：更新该场地该月的分红记录。
 
-    # period 统一为 6 位，与 dividend_records.period 存储格式一致
-    period = to_compact(period)
-
-    # 查找该场地该月的分红记录
-    records = dividend_repo.list_records(landlord_id=landlord_id, period=period)
-    if not records:
-        return
-
-    for record in records:
-        # 重新计算分红（按记录的 brand 维度；整场地记录 brand_id 为空）
-        calc = dividend_calculator.calculate(landlord_id, record.get("brand_id"), period)
-        if not calc:
-            continue
-
-        # 更新分红记录
-        dividend_repo.update_record(record["id"], {
-            "elecIncome": calc["income"]["elecIncome"]["total"],
-            "rentIncome": calc["income"]["rentIncome"]["total"],
-            "totalIncome": calc["income"]["totalIncome"],
-            "elecCost": calc["cost"]["elecCost"],
-            "rentCost": calc["cost"]["rentCost"],
-            "opExpense": calc["cost"]["opExpense"],
-            "bizDividendCost": calc["cost"]["bizDividendCost"],
-            "totalCost": calc["cost"]["totalCost"],
-            "profit": calc["profit"],
-        })
-
-        # 更新分红明细
-        dividend_repo.delete_shares(record["id"])
-        dividend_type = record.get("type", "股东分红")
-        if dividend_type == "商务分红":
-            for d in calc["bizDividends"]:
-                dividend_repo.create_share(record["id"], {
-                    "introducerId": d["introducerId"],
-                    "brandId": d.get("brandId"),
-                    "mode": d["mode"],
-                    "ratio": d.get("ratio"),
-                    "fixedAmount": d.get("fixedAmount"),
-                    "amount": d["amount"],
-                })
-        else:
-            for d in calc["shareholderDividends"]:
-                dividend_repo.create_share(record["id"], {
-                    "shareholderId": d["shareholderId"],
-                    "brandId": d.get("brandId"),
-                    "mode": d["mode"],
-                    "ratio": d.get("ratio"),
-                    "fixedAmount": d.get("fixedAmount"),
-                    "amount": d["amount"],
-                })
+    具体重算逻辑统一在 domain/dividend_refresh.refresh_dividend_records
+    （合同/电表/柜子/台账变更共用同一入口，含审批状态保护）。
+    """
+    from ..domain.dividend_refresh import refresh_dividend_records
+    refresh_dividend_records(landlord_id, [period] if period else None)
 
 
 # ─── 场地费月台账（Rent 页核心，v2 重设计）──────────────────
@@ -181,6 +133,21 @@ async def monthly_ledger(request: Request, period: str = Query(..., description=
         """, (year_end_s, year_start_s))
         year_contracts = cur.fetchall()
 
+        # 实时计费柜数：{landlord_id: {brand_id: 柜数}}。口径与合同列表 live_cabinets_count 一致：
+        # 按 landlord+brand 匹配电表，每表 GREATEST(1, 其下柜子数)，排除 TEST 开头电表。
+        # 场租分摊不读 contracts.cabinets_count 存储快照（电表后关联品牌时快照不会更新）
+        cur.execute("""
+            SELECT m.landlord_id, m.brand_id,
+                   SUM(GREATEST(1, (SELECT COUNT(*) FROM cabinets cab WHERE cab.meter_id = m.id))) AS cabs
+            FROM meters m
+            WHERE m.landlord_id IS NOT NULL AND m.brand_id IS NOT NULL
+              AND m.meter_no NOT LIKE 'TEST%'
+            GROUP BY m.landlord_id, m.brand_id
+        """)
+        live_brand_cabs: dict = {}
+        for r in cur.fetchall():
+            live_brand_cabs.setdefault(r["landlord_id"], {})[r["brand_id"]] = float(r["cabs"] or 0)
+
         # 全部期次（付款/收款）：用于「逐年付款/到账情况」（不再按月过滤）
         cur.execute("""
             SELECT contract_id, status, period_start, period_end, amount
@@ -211,6 +178,12 @@ async def monthly_ledger(request: Request, period: str = Query(..., description=
                 agg[y][0] += 1
         return [{"year": y, "paid": agg[y][0], "total": agg[y][1]} for y in sorted(agg.keys())]
 
+    def _live_cabs(lid, bid) -> float:
+        """(场地, 品牌) 的实时计费柜数；未匹配到电表为 0（不落快照兜底）"""
+        if lid is None or bid is None:
+            return 0.0
+        return float(live_brand_cabs.get(lid, {}).get(bid, 0.0))
+
     def _contract_item(c: dict) -> dict:
         """合同明细项：月租 + 税费 + 该月分期状态 + 年租金/押金/单台/负责人 + 逐年付款情况"""
         monthly = float(c["monthly_rent"] or 0)
@@ -239,6 +212,7 @@ async def monthly_ledger(request: Request, period: str = Query(..., description=
             "annualRent": round(annual, 2),
             "unitMonthlyRent": float(c["unit_monthly_rent"]) if c.get("unit_monthly_rent") is not None else None,
             "cabinetsCount": float(c["cabinets_count"]) if c.get("cabinets_count") is not None else None,
+            "liveCabinetsCount": _live_cabs(c["landlord_id"], c.get("brand_id")) if is_income else None,
             "deposit": float(c["deposit"]) if c.get("deposit") is not None else None,
             "inputCost": float(c["input_cost"]) if c.get("input_cost") is not None else None,
             "rentTax": rent_tax,
@@ -306,13 +280,12 @@ async def monthly_ledger(request: Request, period: str = Query(..., description=
         return s <= me and e >= ms
 
     def _month_brand_cabs(lid: int, ym: str) -> float:
-        """该场地 ym 月所有在期品牌合同的计费柜数之和（用全年合同计算）"""
-        return sum(
-            float(c.get("cabinets_count") or 0) for c in year_contracts
-            if c["contract_type"] == "品牌方合同"
-            and c["landlord_id"] == lid
-            and _covers_month(c, ym)
-        )
+        """该场地 ym 月在期品牌合同覆盖品牌的实时计费柜数之和（同品牌多份合同不重复计）"""
+        brand_ids = {c.get("brand_id") for c in year_contracts
+                     if c["contract_type"] == "品牌方合同"
+                     and c["landlord_id"] == lid
+                     and _covers_month(c, ym)}
+        return sum(_live_cabs(lid, bid) for bid in brand_ids)
 
     def _venue_share_annual(lid: int, brand_id: int, brand_cabs: float) -> float:
         """该品牌 year 年承担的场地成本（逐月累计：场地月租 × 品牌柜数 / 该月在期总柜数）"""
@@ -362,7 +335,7 @@ async def monthly_ledger(request: Request, period: str = Query(..., description=
         for item in g["contracts"]:
             if item["contractType"] != "品牌方合同":
                 continue
-            brand_cabs = float(item["cabinetsCount"] or 0)
+            brand_cabs = _live_cabs(item["landlordId"], item["brandId"])
             venue_share_annual = _venue_share_annual(venue_lid, item["brandId"], brand_cabs) if venue_lid else 0.0
             # 当月平摊场地成本 = 场地月租 × 该品牌柜数 ÷ 该月在期品牌总柜数（与 Rent 页年度口径同一算法）
             venue_monthly = float(venue["monthlyRent"]) if venue else 0.0
@@ -414,7 +387,7 @@ async def monthly_ledger(request: Request, period: str = Query(..., description=
         venue_annual = float(venue["annualRent"]) if venue else 0.0
         gy["unitCostAnnual"] = round(venue_annual / avg_month_cabs, 2) if venue and avg_month_cabs > 0 else None
         for item in gy["brands"]:
-            brand_cabs = float(item["cabinetsCount"] or 0)
+            brand_cabs = _live_cabs(item["landlordId"], item["brandId"])
             item["venueContract"] = venue
             item["venueShareAnnual"] = _venue_share_annual(venue_lid, item["brandId"], brand_cabs) if venue_lid else 0.0
             item["unitCostAnnual"] = gy["unitCostAnnual"]

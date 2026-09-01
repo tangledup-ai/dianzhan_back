@@ -44,12 +44,21 @@ def list_contracts(brand_id: int = None, landlord_id: int = None, station_id: in
                     AND m.meter_no NOT LIKE 'TEST%%'
                 ) t
               ) AS total_brand_cabinets,
-              -- 该场地下所有收入合同（品牌方合同）的计费柜数总和（动态：品牌方合同柜数调整时自动跟随）
+              -- 该场地下所有收入合同（品牌方合同）的计费柜数总和（实时：与 live_cabinets_count 同口径，
+              -- 按品牌方合同覆盖的品牌统计 meters→cabinets；电表归属变更后自动跟随，不读 cabinets_count 存储快照）
               (
-                SELECT COALESCE(SUM(v.cabinets_count), 0) FROM contracts v
-                WHERE v.landlord_id = c.landlord_id
-                  AND v.contract_type = '品牌方合同'
-                  AND v.cabinets_count IS NOT NULL
+                SELECT COALESCE(SUM(GREATEST(1, cab_cnt)), 0) FROM (
+                  SELECT m.id, (SELECT COUNT(*) FROM cabinets cab WHERE cab.meter_id = m.id) AS cab_cnt
+                  FROM meters m
+                  WHERE m.landlord_id = c.landlord_id
+                    AND m.brand_id IN (
+                      SELECT v.brand_id FROM contracts v
+                      WHERE v.landlord_id = c.landlord_id
+                        AND v.contract_type = '品牌方合同'
+                        AND v.brand_id IS NOT NULL
+                    )
+                    AND m.meter_no NOT LIKE 'TEST%%'
+                ) t
               ) AS income_cabinets_total
             FROM contracts c
             LEFT JOIN brands b ON c.brand_id = b.id
@@ -176,8 +185,9 @@ def create_contract(data: dict):
                 contract_type=contract_type,
                 pay_method=data.get("payMethod") or "月付",
                 start_date=data.get("startDate"),
-                end_date=data.get("endDate"),
+                end_date=data.get("earlyEndDate") or data.get("endDate"),
                 monthly_rent=data.get("monthlyRent"),
+                first_month_rent=data.get("firstMonthRent"),
             )
         except Exception as e:
             import logging
@@ -221,9 +231,17 @@ def update_contract(contract_id: int, data: dict):
             "postTaxRentPrice": "post_tax_rent_price",
             "remark": "remark"
         }
+        # 这三个字段允许显式清空：前端清空输入框提交 null/空串 表示"撤销该设置"
+        # （如撤销提前结束/场地费退款/首月场地租金），其余字段保持跳过 null 的行为
+        CLEARABLE_FIELDS = {"firstMonthRent", "rentRefund", "earlyEndDate"}
         updates, values = [], []
         for key, db_field in field_map.items():
-            if key in data and data[key] is not None:
+            if key not in data:
+                continue
+            if key in CLEARABLE_FIELDS:
+                updates.append(f"{db_field} = %s")
+                values.append(data[key] if data[key] not in (None, "") else None)
+            elif data[key] is not None:
                 updates.append(f"{db_field} = %s"); values.append(data[key])
         if not updates:
             return None
@@ -251,8 +269,9 @@ def update_contract(contract_id: int, data: dict):
                 contract_type=updated.get("contract_type", "场地合同"),
                 pay_method=updated.get("pay_method") or "月付",
                 start_date=updated.get("start_date"),
-                end_date=updated.get("end_date"),
+                end_date=updated.get("early_end_date") or updated.get("end_date"),
                 monthly_rent=updated.get("monthly_rent"),
+                first_month_rent=updated.get("first_month_rent"),
             )
         except Exception as e:
             import logging
@@ -267,12 +286,15 @@ def delete_contract(contract_id: int):
     conn = get_connection()
     cur = conn.cursor()
     try:
-        # 先删合同的分期记录，再删合同（避免孤儿分期）
+        # 先取场地方（用于删除后刷新分红记录），再删合同的分期记录与合同本身（避免孤儿分期）
+        cur.execute("SELECT landlord_id FROM contracts WHERE id = %s", (contract_id,))
+        row = cur.fetchone()
+        landlord_id = row[0] if row else None
         cur.execute("DELETE FROM rent_payment_schedule WHERE contract_id = %s", (contract_id,))
         cur.execute("DELETE FROM rent_income_schedule WHERE contract_id = %s", (contract_id,))
         cur.execute("DELETE FROM contracts WHERE id = %s", (contract_id,))
         conn.commit()
-        return True
+        return landlord_id
     finally:
         cur.close()
         conn.close()

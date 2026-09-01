@@ -93,7 +93,7 @@ function YearlyTable({ yearlyRows, yearLabels }: { yearlyRows: any[]; yearLabels
                 </thead>
                 <tbody>
                   {brands.map((c: any, idx: number) => {
-                    const cabinets = c.cabinetsCount != null ? Number(c.cabinetsCount) : 1;
+                    const cabinets = Number(c.liveCabinetsCount ?? c.cabinetsCount ?? 0);
                     const unitMonthly = c.unitMonthlyRent != null ? Number(c.unitMonthlyRent) : null;
                     const unitAnnual = unitMonthly != null ? Math.round(unitMonthly * 12 * 100) / 100 : null;
                     const taxRate = c.rentTaxRate != null ? c.rentTaxRate : 0;
@@ -143,7 +143,7 @@ function YearlyTable({ yearlyRows, yearLabels }: { yearlyRows: any[]; yearLabels
                             </td>
                           );
                         })}
-                        <td className="px-2 py-1.5 text-right tabular-nums font-medium text-slate-700">{c.cabinetsCount != null ? `${fmtNum(c.cabinetsCount)} 柜` : "—"}</td>
+                        <td className="px-2 py-1.5 text-right tabular-nums font-medium text-slate-700">{(c.liveCabinetsCount ?? c.cabinetsCount) != null ? `${fmtNum(c.liveCabinetsCount ?? c.cabinetsCount)} 柜` : "—"}</td>
                         <td className="px-2 py-1.5 text-right tabular-nums">{unitMonthly != null ? fmtMoney(unitMonthly) : "—"}</td>
                         <td className="px-2 py-1.5 text-right tabular-nums">{unitAnnual != null ? fmtMoney(unitAnnual) : "—"}</td>
                         <td className="px-2 py-1.5 text-right tabular-nums text-emerald-600">{venueRentGross != null ? fmtMoney(venueRentGross) : "—"}</td>
@@ -701,7 +701,7 @@ export default function Rent() {
       const payStatus = (venue.yearStatus ?? []).map((ys: any) => `${ys.year}:${ys.paid}/${ys.total}`).join(" ");
       brands.forEach((c: any, idx: number) => {
         seq++;
-        const cabinets = c.cabinetsCount != null ? Number(c.cabinetsCount) : 1;
+        const cabinets = Number(c.liveCabinetsCount ?? c.cabinetsCount ?? 0);
         const unitMonthly = c.unitMonthlyRent != null ? Number(c.unitMonthlyRent) : null;
         const unitAnnual = unitMonthly != null ? Math.round(unitMonthly * 12 * 100) / 100 : null;
         const taxRate = c.rentTaxRate != null ? c.rentTaxRate : 0;

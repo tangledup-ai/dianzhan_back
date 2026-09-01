@@ -1,9 +1,32 @@
 """分红计算器（v3：场地(landlord)+品牌(brand) 直挂，无站点层）"""
-from datetime import date
+from datetime import date, timedelta
 from ..repositories import (
     electricity_repo, rent_repo, dividend_repo, meter_repo
 )
 from ..infra.database import get_connection, get_dict_cursor
+
+
+def _covers_month(period_year: int, period_month: int, c: dict) -> bool:
+    """合同是否覆盖该计算月：start <= 月末 且 (early_end 或 end) >= 月初。
+
+    无任何起止日期视为长期有效；提前结束（early_end_date）后的月份不参与计算。
+    提前结束当月仍算覆盖（退款计入该月）。
+    """
+    def _compact(v) -> str:
+        return str(v)[:10].replace("-", "") if v else ""
+
+    start = _compact(c.get("start_date"))
+    end = _compact(c.get("early_end_date") or c.get("end_date"))
+    if not start and not end:
+        return True
+    nm_y, nm_m = (period_year + 1, 1) if period_month == 12 else (period_year, period_month + 1)
+    month_end = (date(nm_y, nm_m, 1) - timedelta(days=1)).strftime("%Y%m%d")
+    month_start = f"{period_year:04d}{period_month:02d}01"
+    if start and start > month_end:
+        return False
+    if end and end < month_start:
+        return False
+    return True
 
 
 class DividendCalculator:
@@ -32,14 +55,8 @@ class DividendCalculator:
         # 0. 取该场地（或该品牌）实表电表读数（v3：直挂 landlord，无站点）
         total_kwh, meter_details = self._get_meter_kwh(landlord_id, period, brand_id)
 
-        # 整场地各品牌柜数（用于场地成本/运营费按品牌分摊）
+        # 整场地各品牌柜数（用于场地成本/运营费按品牌分摊；每电表至少 1 柜）
         landlord_brand_cabs, landlord_total_cabs = self._get_landlord_cabinet_totals(landlord_id)
-        # 本次计算涉及品牌的柜数（品牌柜数 ≤ 整场地柜数；品牌=该场地该品牌）
-        meter_brand_cabs = {}
-        for d in meter_details:
-            bid = d.get("brand_id")
-            if bid is not None:
-                meter_brand_cabs[int(bid)] = meter_brand_cabs.get(int(bid), 0) + int(d.get("cabinet_count") or 1)
 
         # 1. 获取该场地的合同（计算电费单价和租金）
         contracts = self._get_contracts(landlord_id)
@@ -56,6 +73,8 @@ class DividendCalculator:
             period_year, period_month = int(period[:4]), int(period[4:])
 
         for c in contracts:
+            if not _covers_month(period_year, period_month, c):
+                continue  # 未开始 / 已提前结束的合同不参与该月计算
             if c["contract_type"] == "场地合同":
                 if c["monthly_rent"]:
                     rent_cost += float(c["monthly_rent"])
@@ -257,19 +276,19 @@ class DividendCalculator:
         if brand_id is not None:
             brand_contracts = [c for c in brand_contracts if c["brand_id"] == brand_id]
 
-        # 按品牌汇总电表度数 和 电表柜数（每电表至少 1 柜）
+        # 按品牌汇总电表度数（柜数统一用 landlord_brand_cabs：每电表 GREATEST(1,柜数)，与合同列表/场租页同口径）
         brand_kwh = {}
-        brand_cabinets = {}
         for d in meter_details:
             bid = d.get("brand_id")
             if bid:
                 brand_kwh[bid] = brand_kwh.get(bid, 0) + float(d.get("kwh") or 0)
-                brand_cabinets[bid] = brand_cabinets.get(bid, 0) + int(d.get("cabinet_count") or 1)
         landlord_total_brand_cabs = sum(landlord_brand_cabs.values()) or 1  # 整场地品牌柜数（场地成本/运营费按此分摊）
 
         for c in brand_contracts:
+            if not _covers_month(period_year, period_month, c):
+                continue  # 未开始 / 已提前结束的品牌合同不参与该月 P&L
             bid = c["brand_id"]
-            cabs = brand_cabinets.get(bid, 0) or 1
+            cabs = int(landlord_brand_cabs.get(bid, 0))  # 签了合同但无电表的品牌 = 0 柜，不参与分摊（保证各品牌分摊之和=场地成本）
             kwh = brand_kwh.get(bid, 0)
             # 电费收入（不含税：价内税口径与台账 collect_net 一致——税 = 含税收入 × 税率）
             b_info = brand_elec_map.get(bid, {})

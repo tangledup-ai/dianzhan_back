@@ -23,6 +23,17 @@ def list_cabinets(meter_id: int = None):
         conn.close()
 
 
+def get_cabinet(cabinet_id: int):
+    conn = get_connection()
+    cur = get_dict_cursor(conn)
+    try:
+        cur.execute("SELECT * FROM cabinets WHERE id = %s", (cabinet_id,))
+        return cur.fetchone()
+    finally:
+        cur.close()
+        conn.close()
+
+
 def create_cabinet(data: dict):
     conn = get_connection()
     cur = get_dict_cursor(conn)
