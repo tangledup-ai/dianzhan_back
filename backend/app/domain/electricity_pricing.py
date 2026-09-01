@@ -51,31 +51,41 @@ def resolve_prices(contracts: list) -> dict:
     pay_price_conflict = len(set(site_prices)) > 1
 
     # ── 收款单价：按品牌匹配 ──
+    # brand_id 为空的品牌方合同 = 「全品牌合同」，其单价仅对共享电表（无品牌）生效，
+    # 存放在独立的 shared_price 字段，不进入 brand_prices（避免被误当作某品牌的兜底单价）。
     brand_prices = {}
+    shared_price = None
     for c in brand_contracts:
         bid = c.get("brand_id")
-        if bid is None:
-            continue
-        price = c.get("electricity_price")
-        brand_prices[int(bid)] = {
-            "price": float(price) if price is not None else None,
+        info = {
+            "price": float(c.get("electricity_price")) if c.get("electricity_price") is not None else None,
             "tax_rate": float(c.get("tax_rate") or 0.01),
             "tax_enabled": bool(c.get("tax_enabled")),
             "post_tax": float(c["post_tax_electricity_price"]) if c.get("post_tax_electricity_price") is not None else None,
         }
+        if bid is None:
+            if shared_price is None:
+                shared_price = info
+            continue
+        brand_prices[int(bid)] = info
 
     return {
         "pay_price": pay_price,
         "pay_price_conflict": pay_price_conflict,
         "brand_prices": brand_prices,
+        "shared_price": shared_price,
     }
 
 
 def brand_collect_price(brand_id, pricing: dict):
-    """取某品牌电表的收款单价（税前）。无该品牌合同 → None（收入为 0）。"""
+    """取某品牌电表的收款单价（税前）。
+
+    brand_id=None → 共享电表，取「全品牌合同」单价；无该品牌合同/无全品牌合同 → None（收入为 0）。
+    """
     if brand_id is None:
-        return None
-    info = pricing.get("brand_prices", {}).get(int(brand_id))
+        info = pricing.get("shared_price")
+    else:
+        info = pricing.get("brand_prices", {}).get(int(brand_id))
     if not info:
         return None
     return info["price"]

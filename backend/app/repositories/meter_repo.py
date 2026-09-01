@@ -16,7 +16,9 @@ def list_meters(station_id: int = None, brand_id: int = None, landlord_id: int =
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         cur.execute(f"""
             SELECT m.*, l.name as station_name, b.name as brand_name, l.name as landlord_name,
-                   e.name as entity_name
+                   e.name as entity_name,
+                   CASE WHEN EXISTS (SELECT 1 FROM meter_devices md WHERE md.address = m.meter_no)
+                        THEN 'synced' ELSE 'manual' END AS source
             FROM meters m
             LEFT JOIN brands b ON m.brand_id = b.id
             LEFT JOIN landlords l ON m.landlord_id = l.id
@@ -107,8 +109,9 @@ def update_meter(meter_id: int, data: dict):
         for key, db_field in field_map.items():
             if key not in data:
                 continue
-            # entityId 允许显式 null（解除关联清空）；其余字段 null 则跳过
-            if key == "entityId":
+            # entityId/brandId 允许显式 null（解除主体关联 / 开启「所有品牌共用」清空品牌）；
+            # 其余字段 null 则跳过
+            if key in ("entityId", "brandId"):
                 updates.append(f"{db_field} = %s")
                 values.append(data[key])
             elif data[key] is not None:

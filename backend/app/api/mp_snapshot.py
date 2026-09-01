@@ -203,14 +203,16 @@ async def snapshot(user: dict = Depends(get_current_user)):
                 "kwhTotal": float(r["kwh_total"]),
             }
 
-        # 获取柜子数量（只统计已归属 landlord+brand 的实表；v3：按 场地×品牌 分组）
+        # 获取柜子数量（统计已归属 landlord+brand 的实表；共享电表计入 brand_id 为空的组，供全品牌合同站点卡使用）
         # 口径与合同/分红一致：每块电表至少 1 柜（max(1, 实际柜子数)），不是电表数
         cur.execute("""
-            SELECT landlord_id, brand_id,
+            SELECT m.landlord_id, m.brand_id,
                    SUM(GREATEST(1, (SELECT COUNT(*) FROM cabinets cab WHERE cab.meter_id = m.id))) AS cnt
             FROM meters m
-            WHERE m.landlord_id IS NOT NULL AND m.brand_id IS NOT NULL AND m.meter_no NOT LIKE 'TEST%'
-            GROUP BY landlord_id, brand_id
+            WHERE m.landlord_id IS NOT NULL
+              AND (m.brand_id IS NOT NULL OR m.tag = '共享电表')
+              AND m.meter_no NOT LIKE 'TEST%'
+            GROUP BY m.landlord_id, m.brand_id
         """)
         station_meter_count = {(r["landlord_id"], r["brand_id"]): int(r["cnt"] or 0) for r in cur.fetchall()}
 

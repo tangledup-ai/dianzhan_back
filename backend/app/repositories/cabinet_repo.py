@@ -13,7 +13,7 @@ def list_cabinets(meter_id: int = None):
             SELECT c.*, m.meter_no, m.meter_name, b.name as brand_name
             FROM cabinets c
             LEFT JOIN meters m ON c.meter_id = m.id
-            LEFT JOIN brands b ON c.brand_id = b.id
+            LEFT JOIN brands b ON m.brand_id = b.id
             {where}
             ORDER BY c.id
         """, values)
@@ -39,12 +39,12 @@ def create_cabinet(data: dict):
     cur = get_dict_cursor(conn)
     try:
         cur.execute("""
-            INSERT INTO cabinets (meter_id, cabinet_no, cabinet_type, brand_id, remark)
-            VALUES (%s, %s, %s, %s, %s)
+            INSERT INTO cabinets (meter_id, cabinet_no, cabinet_type, remark)
+            VALUES (%s, %s, %s, %s)
             RETURNING *
         """, (
             data.get("meterId"), data.get("cabinetNo"),
-            data.get("cabinetType", "普通柜"), data.get("brandId"), data.get("remark")
+            data.get("cabinetType", "普通柜"), data.get("remark")
         ))
         conn.commit()
         return cur.fetchone()
@@ -59,7 +59,7 @@ def update_cabinet(cabinet_id: int, data: dict):
     try:
         field_map = {
             "meterId": "meter_id", "cabinetNo": "cabinet_no",
-            "cabinetType": "cabinet_type", "brandId": "brand_id", "remark": "remark"
+            "cabinetType": "cabinet_type", "remark": "remark"
         }
         updates, values = [], []
         for key, db_field in field_map.items():

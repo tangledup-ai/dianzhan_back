@@ -8,6 +8,7 @@ import { triggerSync, saveMeterReading, getMeterReadings } from "@/api/meterEner
 import { StatusBadge } from "@/components/Stat";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Switch } from "@/components/ui/switch";
 import { Field, NumInput, TextInput, SelectInput, inputCls } from "@/components/fields";
 import { exportXlsx } from "@/lib/export";
 import { fmtNum } from "@/lib/format";
@@ -136,7 +137,9 @@ export default function Meters() {
       m.meterName?.includes(keyword) || m.landlordName?.includes(keyword)
     );
     if (landlordId) data = data.filter((m: any) => m.landlordId === Number(landlordId));
-    if (brandId) data = data.filter((m: any) => m.brandId === Number(brandId));
+    if (brandId) data = brandId === "shared"
+      ? data.filter((m: any) => m.tag === "共享电表")
+      : data.filter((m: any) => m.brandId === Number(brandId));
     if (tag) data = data.filter((m: any) => m.tag === tag);
     return data;
   }, [meters.data, keyword, landlordId, brandId, tag]);
@@ -217,7 +220,7 @@ export default function Meters() {
     exportXlsx(`电表台账_${new Date().toISOString().slice(0, 10)}`, [{
       name: "电表台账",
       rows: rows.map((m: any) => ({
-        场地方: m.landlordName ?? "", 品牌方: m.brandName ?? "", 电表编号: m.meterNo,
+        场地方: m.landlordName ?? "", 品牌方: m.brandName ?? (m.tag === "共享电表" ? "全品牌共享" : ""), 电表编号: m.meterNo,
         电表名称: m.meterName ?? "", 标签: m.tag ?? "合作商电表", 采集器号: m.collectorId ?? "",
         互感器倍数: fmtNum(m.transformerRatio), 状态: m.status,
       })),
@@ -263,6 +266,7 @@ export default function Meters() {
         </select>
         <select className={`${inputCls} w-40`} value={brandId} onChange={(e) => setBrandId(e.target.value)}>
           <option value="">全部品牌方</option>
+          <option value="shared">共享电表（全品牌）</option>
           {(brands.data ?? []).map((b: any) => <option key={b.id} value={String(b.id)}>{b.name}</option>)}
         </select>
         <select className={`${inputCls} w-36`} value={tag} onChange={(e) => setTag(e.target.value)}>
@@ -451,10 +455,15 @@ function MeterCard({ meter, isExpanded, onToggle, onEdit, onDelete, onReading, h
           <div>
             <div className="flex items-center gap-2">
               <span className="font-mono text-sm font-medium">{meter.meterNo}</span>
-              <span className="text-xs text-slate-500">{meter.brandName ?? "未设置品牌"}</span>
+              <span className={`text-xs ${!meter.brandName && meter.tag === "共享电表" ? "font-medium text-purple-600" : "text-slate-500"}`}>
+                {meter.brandName ?? (meter.tag === "共享电表" ? "全品牌共享" : "未设置品牌")}
+              </span>
               <span className={`rounded-full px-2 py-0.5 text-[10px] ${meter.tag === "民用电表" ? "bg-amber-100 text-amber-700" : meter.tag === "共享电表" ? "bg-purple-100 text-purple-700" : "bg-blue-100 text-blue-700"}`}>
                 {meter.tag ?? "合作商电表"}
               </span>
+              {meter.source === "synced" && (
+                <span className="rounded-full bg-teal-100 px-2 py-0.5 text-[10px] text-teal-700" title="已接入第三方电表平台（天雀）同步读数">第三方</span>
+              )}
               <StatusBadge status={meter.status} />
             </div>
             <div className="text-[11px] text-slate-400">{meter.meterName ?? ""}</div>
@@ -555,6 +564,16 @@ function MeterForm({ open, onClose, record }: { open: boolean; onClose: () => vo
 
   const set = (k: string) => (v: string) => setF((p) => ({ ...p, [k]: v }));
 
+  // 全品牌共享：标签=共享电表 即视为共享，开关与「标签」下拉双向联动
+  const isShared = f.tag === "共享电表";
+  const toggleShared = (on: boolean) => {
+    setF((p) => ({
+      ...p,
+      tag: on ? "共享电表" : (p.tag === "共享电表" ? "合作商电表" : p.tag),
+      brandId: on ? "" : p.brandId,
+    }));
+  };
+
   const save = useMutation({
     mutationFn: (data: any) => record ? updateMeter(record.id, data) : createMeter(data),
     onSuccess: async () => {
@@ -573,7 +592,7 @@ function MeterForm({ open, onClose, record }: { open: boolean; onClose: () => vo
   const submit = () => {
     if (!f.meterNo.trim()) { toast.error("请填写电表编号"); return; }
     save.mutate({
-      brandId: f.brandId ? Number(f.brandId) : null,
+      brandId: !isShared && f.brandId ? Number(f.brandId) : null,
       landlordId: f.landlordId ? Number(f.landlordId) : null,
       entityId: f.entityId ? Number(f.entityId) : null,
       meterNo: f.meterNo.trim(),
@@ -597,9 +616,25 @@ function MeterForm({ open, onClose, record }: { open: boolean; onClose: () => vo
           <div className="-mt-2 text-[11px] text-slate-400">
             v3：电表直接归属场地方 + 品牌方（不再经站点）。
           </div>
+          {/* 全品牌共享开关：场地内所有品牌共用一块电表时开启，无需选择品牌方 */}
+          <div className="flex items-center gap-3 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5">
+            <Switch checked={isShared} onCheckedChange={toggleShared} />
+            <div>
+              <div className="text-sm text-slate-700">所有品牌共用此电表</div>
+              <div className="text-[11px] text-slate-400">
+                开启后无需选择品牌方（标签自动记为「共享电表」），适用于场地内各品牌共用的总表
+              </div>
+            </div>
+          </div>
           <Field label="品牌方">
-            <SelectInput value={f.brandId} onChange={set("brandId")}
-              options={[{ value: "", label: "未指定" }, ...(brands.data ?? []).map((b: any) => ({ value: String(b.id), label: b.name }))]} />
+            {isShared ? (
+              <div className="rounded-md border border-purple-200 bg-purple-50 px-2.5 py-1.5 text-sm text-purple-700">
+                全部品牌方共用（无需选择）
+              </div>
+            ) : (
+              <SelectInput value={f.brandId} onChange={set("brandId")}
+                options={[{ value: "", label: "未指定" }, ...(brands.data ?? []).map((b: any) => ({ value: String(b.id), label: b.name }))]} />
+            )}
           </Field>
           <Field label="报税公司主体">
             <SelectInput value={f.entityId} onChange={set("entityId")}

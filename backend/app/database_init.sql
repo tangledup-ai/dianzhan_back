@@ -142,11 +142,10 @@ CREATE TABLE IF NOT EXISTS cabinets (
     meter_id INTEGER NOT NULL REFERENCES meters(id),
     cabinet_no VARCHAR(100),
     cabinet_type VARCHAR(50) DEFAULT '普通柜',
-    brand_id INTEGER REFERENCES brands(id),
     remark TEXT,
     created_at TIMESTAMP DEFAULT NOW()
 );
-COMMENT ON TABLE cabinets IS '柜子（物理资产，挂电表下）；计费柜数=实时统计本表，不落合同';
+COMMENT ON TABLE cabinets IS '柜子（物理资产，挂电表下）；计费柜数=实时统计本表，不落合同；品牌归属经 meter 派生（brand_id 列已于 2026-09 退役）';
 
 -- ══════════ 4. 电表·接入域（第三方缓存，只写不读业务）══════════
 
@@ -312,6 +311,9 @@ CREATE TABLE IF NOT EXISTS contracts (
     rent_refund NUMERIC(12,2),
     early_end_date DATE,
     deposit NUMERIC(12,2),
+    deposit_refund_amount NUMERIC(12,2),
+    deposit_refund_date DATE,
+    deposit_refund_approval_id INTEGER,
     -- ⑤ 期次/付款组
     pay_method VARCHAR(50),
     rent_advance_days INTEGER NOT NULL DEFAULT 0,
@@ -334,9 +336,24 @@ COMMENT ON TABLE contracts IS '合同台账（商务量唯一主源）：场地�
 COMMENT ON COLUMN contracts.contract_type IS '合同类型：场地合同 / 品牌方合同（全系统分流键）';
 COMMENT ON COLUMN contracts.electricity_price IS '电费单价（元/度）：场地合同=付款单价，品牌方合同=收款单价';
 COMMENT ON COLUMN contracts.monthly_rent IS '月租金（元/月）：场地合同=付业主；品牌方合同=品牌方应付';
-COMMENT ON COLUMN contracts.cabinets_count IS 'DEPRECATED 参考快照：计费柜数以 meters→cabinets 实时统计为准';
+COMMENT ON COLUMN contracts.cabinets_count IS 'DEPRECATED(2026-09)：计费柜数唯一源=实时统计 meters→cabinets（live_cabinets_count），本列仅历史回显，不再写入';
+COMMENT ON COLUMN contracts.deposit_refund_amount IS '押金退还金额（场地费退款审批通过时回写）';
+COMMENT ON COLUMN contracts.deposit_refund_date IS '押金退还日期（审批通过时回写）';
+COMMENT ON COLUMN contracts.deposit_refund_approval_id IS '关联的场地费退款审批单';
 COMMENT ON COLUMN contracts.pay_status IS 'DEPRECATED：业务读分期推导值';
 COMMENT ON COLUMN contracts.partner IS 'DEPRECATED 无用列（无代码写入），收尾删除';
+
+CREATE TABLE IF NOT EXISTS contract_audit_log (
+    id SERIAL PRIMARY KEY,
+    contract_id INTEGER NOT NULL,
+    action VARCHAR(16) NOT NULL,
+    changes JSONB,
+    operator VARCHAR(64),
+    created_at TIMESTAMP DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_contract_audit_contract
+    ON contract_audit_log (contract_id, created_at DESC);
+COMMENT ON TABLE contract_audit_log IS '合同变更审计：action=create/update/delete；update 时 changes={字段:{from,to}}，create/delete 为合同快照';
 
 CREATE TABLE IF NOT EXISTS rent_payment_schedule (
     id SERIAL PRIMARY KEY,
@@ -396,6 +413,7 @@ CREATE TABLE IF NOT EXISTS electricity_records (
     collect_net NUMERIC(14,2),
     collect_status VARCHAR(20) DEFAULT '未到账',
     profit NUMERIC(14,2),
+    data_source VARCHAR(16) DEFAULT 'auto',
     remark TEXT,
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW(),
@@ -548,6 +566,7 @@ CREATE TABLE IF NOT EXISTS approval_requests (
     urge_count INTEGER DEFAULT 0,
     landlord_id INTEGER REFERENCES landlords(id),
     dividend_record_id INTEGER REFERENCES dividend_records(id),
+    contract_id INTEGER REFERENCES contracts(id),
     period VARCHAR(10),
     electricity_amount NUMERIC(14,2),
     rent_amount NUMERIC(14,2),

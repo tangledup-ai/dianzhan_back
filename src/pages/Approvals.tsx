@@ -170,6 +170,7 @@ function StationApprovalDetail({ req }: { req: any }) {
         <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${
           req.bizType === "电费付款" ? "bg-amber-100 text-amber-700" :
           req.bizType === "场地费付款" ? "bg-orange-100 text-orange-700" :
+          req.bizType === "场地费退款" ? "bg-rose-100 text-rose-700" :
           "bg-blue-100 text-blue-700"
         }`}>
           {req.bizType}

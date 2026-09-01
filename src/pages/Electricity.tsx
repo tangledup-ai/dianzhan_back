@@ -568,8 +568,15 @@ export default function Electricity() {
                                             <td className="px-2 py-1.5">
                                               <div className="font-medium text-slate-700">{d.meterName ?? d.stationName ?? "—"}</div>
                                               <div className="font-mono text-[10px] text-slate-400">{d.meterNo}{d.meterName ? ` · ${d.meterName}` : ""}</div>
+                                              {d.dataSource === "manual" && (
+                                                <span className="mt-0.5 inline-block rounded bg-amber-100 px-1 text-[10px] text-amber-700">已人工修改</span>
+                                              )}
                                             </td>
-                                            {hasBrandDimension && <td className="px-2 py-1.5 tabular-nums">{d.brandName ?? "—"}</td>}
+                                            {hasBrandDimension && (
+                                              <td className={`px-2 py-1.5 tabular-nums ${!d.brandName ? "font-medium text-purple-600" : ""}`}>
+                                                {d.brandName ?? "全品牌共享"}
+                                              </td>
+                                            )}
                                             {hasTransformerRatio && <td className="px-2 py-1.5 tabular-nums">{fmtNum(d.transformerRatio)}</td>}
                                             <td className="px-2 py-1.5 tabular-nums">{fmtNum(d.kwh ?? d.payKwh)}</td>
                                             <td className="border-x px-2 py-1.5 text-right tabular-nums">{d.payUnitPrice != null ? fmtNum(d.payUnitPrice) : "—"}</td>

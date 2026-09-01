@@ -61,14 +61,20 @@ def get_record_by_station_period(station_id: int, period: str):
 
 
 def get_record_by_landlord_brand_period(landlord_id: int, brand_id, period: str):
-    """v3：按 场地×品牌×月 取台账记录"""
+    """v3：按 场地×品牌×月 取台账记录（brand_id=None 匹配品牌为空的共享电表记录）"""
     conn = get_connection()
     cur = get_dict_cursor(conn)
     try:
-        cur.execute(
-            "SELECT * FROM electricity_records WHERE landlord_id = %s AND brand_id = %s AND period = %s",
-            (landlord_id, brand_id, period)
-        )
+        if brand_id is None:
+            cur.execute(
+                "SELECT * FROM electricity_records WHERE landlord_id = %s AND brand_id IS NULL AND period = %s",
+                (landlord_id, period)
+            )
+        else:
+            cur.execute(
+                "SELECT * FROM electricity_records WHERE landlord_id = %s AND brand_id = %s AND period = %s",
+                (landlord_id, brand_id, period)
+            )
         return cur.fetchone()
     finally:
         cur.close()
@@ -102,8 +108,8 @@ def create_record(data: dict):
              pay_kwh, pay_unit_price, pay_amount, pay_status,
              collect_start_date, collect_start_reading, collect_end_date, collect_end_reading,
              collect_kwh, collect_unit_price, collect_amount, tax_rate, collect_net, collect_status,
-             profit, remark)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+             profit, remark, data_source)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'manual')
             RETURNING *
         """, (
             data.get("landlordId"), data.get("brandId"), data.get("period"),
@@ -142,7 +148,8 @@ def update_record(record_id: int, data: dict):
             "collectKwh": "collect_kwh", "collectUnitPrice": "collect_unit_price",
             "collectAmount": "collect_amount", "taxRate": "tax_rate",
             "collectNet": "collect_net", "collectStatus": "collect_status",
-            "profit": "profit", "remark": "remark"
+            "profit": "profit", "remark": "remark",
+            "dataSource": "data_source"
         }
         updates, values = [], []
         for key, db_field in field_map.items():

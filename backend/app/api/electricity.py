@@ -23,7 +23,7 @@ def compute_landlord_ledger(cur, landlord_id: int, period: str):
         FROM meters m
         LEFT JOIN brands b ON m.brand_id = b.id
         WHERE m.landlord_id = %s AND m.meter_no NOT LIKE 'TEST%%'
-          AND m.brand_id IS NOT NULL
+          AND (m.brand_id IS NOT NULL OR m.tag = '共享电表')
         ORDER BY m.id
     """, (landlord_id,))
     meters = cur.fetchall()
@@ -64,7 +64,8 @@ def compute_landlord_ledger(cur, landlord_id: int, period: str):
         total_pay_kwh += actual_kwh
         total_collect_kwh += actual_kwh
 
-        brand_info = pricing["brand_prices"].get(int(m["brand_id"])) if m.get("brand_id") else None
+        # 共享电表（无品牌）取「全品牌合同」单价；无合同 → 收入为 0
+        brand_info = pricing["brand_prices"].get(int(m["brand_id"])) if m.get("brand_id") else pricing.get("shared_price")
         brand_price = brand_info["price"] if brand_info else None
         # 税费仅在启用税率且合同有税率时按「收入×税率」扣（税费 = 含税收入 × 税率）
         detail_rate = brand_info["tax_rate"] if (brand_info and brand_info.get("tax_enabled")) else None
@@ -248,6 +249,9 @@ async def update_electricity(record_id: int, data: dict):
     if data.get("period"):
         data["period"] = to_compact(data["period"])
 
+    # 人工编辑 → 数据来源标记为 manual（重新生成台账会置回 auto）
+    data["dataSource"] = "manual"
+
     # 如果有新的电表读数，重新计算
     if "meterDetails" in data and data["meterDetails"]:
         meter_details = data["meterDetails"]
@@ -333,13 +337,14 @@ async def generate_electricity(data: dict):
     conn = get_connection()
     cur = get_dict_cursor(conn)
     try:
-        # 1. 实表电表（v3：直挂 场地+品牌，无站点层）
+        # 1. 实表电表（v3：直挂 场地+品牌，无站点层；共享电表无品牌也参与，单独成组）
         cur.execute("""
             SELECT m.id, m.meter_no, m.landlord_id, m.brand_id, m.transformer_ratio,
                    b.name as brand_name
             FROM meters m
             LEFT JOIN brands b ON m.brand_id = b.id
-            WHERE m.landlord_id IS NOT NULL AND m.brand_id IS NOT NULL
+            WHERE m.landlord_id IS NOT NULL
+              AND (m.brand_id IS NOT NULL OR m.tag = '共享电表')
               AND m.meter_no NOT LIKE 'TEST%'
         """)
         meters = cur.fetchall()
@@ -402,9 +407,9 @@ async def generate_electricity(data: dict):
             pricing = resolve_prices(contracts)
             landlord_price = pricing["pay_price"]
 
-            # 只生成有合同的场地×品牌：无场地合同 且 该品牌无品牌方合同 → 不生成；有旧记录则删除
+            # 只生成有合同的场地×品牌：无场地合同 且（该品牌无品牌方合同 且 无全品牌合同）→ 不生成；有旧记录则删除
             has_site_contract = any(c.get("contract_type") == "场地合同" for c in contracts)
-            has_brand_contract = bid in pricing["brand_prices"]
+            has_brand_contract = (bid in pricing["brand_prices"]) if bid is not None else pricing.get("shared_price") is not None
             if not has_site_contract and not has_brand_contract:
                 if existing:
                     cur.execute("DELETE FROM electricity_meter_details WHERE electricity_id = %s", (existing["id"],))
@@ -412,11 +417,11 @@ async def generate_electricity(data: dict):
                 continue
 
             # 记录级税率：取第一个有品牌方合同的税率（仅作台账表头展示；明细金额按各品牌各自税率计算）
-            first_brand_info = next(iter(pricing["brand_prices"].values()), None)
+            first_brand_info = next(iter(pricing["brand_prices"].values()), None) or pricing.get("shared_price")
             tax_rate = float(first_brand_info["tax_rate"]) if first_brand_info else 0.01
 
-            # 记录级收款单价（表头展示用）：取该品牌合同单价
-            brand_info0 = pricing["brand_prices"].get(bid)
+            # 记录级收款单价（表头展示用）：取该品牌合同单价（共享组取全品牌合同单价）
+            brand_info0 = pricing["brand_prices"].get(bid) if bid is not None else pricing.get("shared_price")
             record_collect_price = brand_info0["price"] if brand_info0 else None
 
             # 计算度数（按电表分别匹配）
@@ -436,8 +441,8 @@ async def generate_electricity(data: dict):
                 total_pay_kwh += actual_kwh
                 total_collect_kwh += actual_kwh
 
-                # 收款单价：按电表品牌匹配（无对应品牌方合同的电表收入为 0）
-                brand_info = pricing["brand_prices"].get(int(m["brand_id"])) if m.get("brand_id") else None
+                # 收款单价：按电表品牌匹配；共享电表（无品牌）取「全品牌合同」单价，无合同 → 收入为 0
+                brand_info = pricing["brand_prices"].get(int(m["brand_id"])) if m.get("brand_id") else pricing.get("shared_price")
                 brand_price = brand_info["price"] if brand_info else None
                 # 税费仅在启用税率且合同有税率时按「收入×税率」扣（税费 = 含税收入 × 税率）
                 detail_rate = brand_info["tax_rate"] if (brand_info and brand_info.get("tax_enabled")) else None
@@ -468,12 +473,12 @@ async def generate_electricity(data: dict):
             profit = round(total_collect_net - total_pay_amount, 2)
 
             if existing:
-                # 更新已有记录（用同一个连接）
+                # 更新已有记录（用同一个连接）；重新生成 → 数据来源记为 auto
                 cur.execute("""
                     UPDATE electricity_records SET
                         pay_kwh=%s, pay_unit_price=%s, pay_amount=%s,
                         collect_kwh=%s, collect_unit_price=%s, collect_amount=%s,
-                        tax_rate=%s, collect_net=%s, profit=%s, updated_at=NOW()
+                        tax_rate=%s, collect_net=%s, profit=%s, data_source='auto', updated_at=NOW()
                     WHERE id=%s
                 """, (
                     round(total_pay_kwh, 2), float(landlord_price or 0), total_pay_amount,
@@ -495,12 +500,12 @@ async def generate_electricity(data: dict):
                     ))
                 updated.append(f"{lid}-{bid}")
             else:
-                # 新增记录（用同一个连接）
+                # 新增记录（用同一个连接）；系统生成 → 数据来源 auto
                 cur.execute("""
                     INSERT INTO electricity_records
                     (landlord_id, brand_id, period, pay_kwh, pay_unit_price, pay_amount, pay_status,
-                     collect_kwh, collect_unit_price, collect_amount, tax_rate, collect_net, collect_status, profit)
-                    VALUES (%s, %s, %s, %s, %s, %s, '未付款', %s, %s, %s, %s, %s, '未到账', %s)
+                     collect_kwh, collect_unit_price, collect_amount, tax_rate, collect_net, collect_status, profit, data_source)
+                    VALUES (%s, %s, %s, %s, %s, %s, '未付款', %s, %s, %s, %s, %s, '未到账', %s, 'auto')
                     RETURNING id
                 """, (
                     lid, bid, period, round(total_pay_kwh, 2), float(landlord_price or 0), total_pay_amount,
@@ -548,7 +553,8 @@ async def generate_electricity(data: dict):
 async def auto_generate_for_meter(meter_no: str) -> int:
     """电表归属变更后：对该电表有读数的所有月份，自动生成/更新台账（v3：按场地×品牌）。
 
-    仅在电表已归属（landlord+brand 非空）时生效；归属被解除后，重算会自动剔除该电表。
+    仅在电表已归属场地（landlord 非空）且 指定了品牌 或 标记为共享电表 时生效；
+    归属被解除后，重算会自动剔除该电表。
     """
     from ..infra.database import get_connection, get_dict_cursor
     conn = get_connection()
@@ -556,7 +562,8 @@ async def auto_generate_for_meter(meter_no: str) -> int:
     try:
         cur.execute("""
             SELECT landlord_id, brand_id FROM meters
-            WHERE meter_no = %s AND landlord_id IS NOT NULL AND brand_id IS NOT NULL
+            WHERE meter_no = %s AND landlord_id IS NOT NULL
+              AND (brand_id IS NOT NULL OR tag = '共享电表')
         """, (meter_no,))
         row = cur.fetchone()
         if not row:
@@ -582,7 +589,8 @@ async def auto_generate_for_landlord(landlord_id) -> int:
         cur.execute("""
             SELECT DISTINCT mm.month_period AS p FROM meter_monthly mm
             JOIN meters m ON m.meter_no = mm.address
-            WHERE m.landlord_id = %s AND m.brand_id IS NOT NULL AND m.meter_no NOT LIKE 'TEST%%'
+            WHERE m.landlord_id = %s AND (m.brand_id IS NOT NULL OR m.tag = '共享电表')
+              AND m.meter_no NOT LIKE 'TEST%%'
         """, (landlord_id,))
         periods = [r["p"] for r in cur.fetchall()]
     finally:
@@ -607,7 +615,8 @@ async def generate_all_ledger() -> int:
         cur.execute("""
             SELECT DISTINCT mm.month_period AS p FROM meter_monthly mm
             JOIN meters m ON m.meter_no = mm.address
-            WHERE m.landlord_id IS NOT NULL AND m.brand_id IS NOT NULL
+            WHERE m.landlord_id IS NOT NULL
+              AND (m.brand_id IS NOT NULL OR m.tag = '共享电表')
               AND m.meter_no NOT LIKE 'TEST%%'
         """)
         periods = [r["p"] for r in cur.fetchall()]
@@ -633,9 +642,9 @@ async def monthly_ledger(period: str, dim: str = "landlord"):
     cur = get_dict_cursor(conn)
     try:
         if dim == "brand":
-            # 品牌维度：按电费分表明细（每表有 付款/收款）按品牌聚合
+            # 品牌维度：按电费分表明细（每表有 付款/收款）按品牌聚合（共享电表无品牌，单独一组）
             cur.execute("""
-                SELECT m.brand_id AS key, COALESCE(b.name, '未指定品牌') AS name,
+                SELECT m.brand_id AS key, COALESCE(b.name, '全品牌共享') AS name,
                        COALESCE(SUM(d.kwh), 0) AS kwh,
                        COALESCE(SUM(d.pay_amount), 0) AS pay_amount,
                        COALESCE(SUM(d.collect_amount), 0) AS collect_amount,
@@ -651,20 +660,23 @@ async def monthly_ledger(period: str, dim: str = "landlord"):
             rows = cur.fetchall()
             # 品牌明细：该品牌该月的 电表行（含 互感器倍数/单价/金额/状态）
             for r in rows:
-                cur.execute("""
+                # 共享电表 brand_id 为 NULL，需用 IS NULL 匹配
+                brand_cond = "m.brand_id IS NULL" if r["key"] is None else "m.brand_id = %s"
+                brand_vals = (period,) if r["key"] is None else (period, r["key"])
+                cur.execute(f"""
                     SELECT m.meter_name AS station_name, m.meter_no, m.meter_name,
                            m.transformer_ratio,
                            m.brand_id, b.name AS brand_name,
                            d.kwh, d.pay_unit_price, d.pay_amount, d.collect_unit_price,
                            d.collect_amount, d.collect_net,
-                           e.pay_status, e.collect_status
+                           e.pay_status, e.collect_status, e.data_source
                     FROM electricity_meter_details d
                     JOIN electricity_records e ON e.id = d.electricity_id
                     JOIN meters m ON d.meter_id = m.id
                     LEFT JOIN brands b ON m.brand_id = b.id
-                    WHERE e.period = %s AND m.brand_id = %s
+                    WHERE e.period = %s AND {brand_cond}
                     ORDER BY m.meter_name, m.meter_no
-                """, (period, r["key"]))
+                """, brand_vals)
                 r["details"] = cur.fetchall()
         else:
             # 场地维度：台账按 landlord 聚合（v3 直挂）
@@ -694,7 +706,7 @@ async def monthly_ledger(period: str, dim: str = "landlord"):
                            m.brand_id, b.name AS brand_name,
                            d.kwh, d.pay_unit_price, d.pay_amount, d.collect_unit_price,
                            d.collect_amount, d.collect_net,
-                           e.pay_status, e.collect_status
+                           e.pay_status, e.collect_status, e.data_source
                     FROM electricity_meter_details d
                     JOIN electricity_records e ON e.id = d.electricity_id
                     JOIN meters m ON d.meter_id = m.id
@@ -809,7 +821,7 @@ async def export_ledger(request: Request, period: str, dim: str = "landlord"):
 
         # 分组键：dim=brand 按品牌，否则按场地
         if dim == "brand":
-            group = r.get("brand_name") or "未指定品牌"
+            group = r.get("brand_name") or "全品牌共享"
             group_key = f"brand-{r.get('brand_id') or 0}"
             collect_company = r.get("entity_name") or group  # 收款公司：实体优先，兜底品牌
         else:

@@ -134,13 +134,15 @@ async def monthly_ledger(request: Request, period: str = Query(..., description=
         year_contracts = cur.fetchall()
 
         # 实时计费柜数：{landlord_id: {brand_id: 柜数}}。口径与合同列表 live_cabinets_count 一致：
-        # 按 landlord+brand 匹配电表，每表 GREATEST(1, 其下柜子数)，排除 TEST 开头电表。
+        # 按 landlord+brand 匹配电表，每表 GREATEST(1, 其下柜子数)，排除 TEST 开头电表；
+        # 共享电表（brand_id 为空且标签=共享电表）单列在 brand_id=None 组，供全品牌合同（brandId 为空）分摊使用。
         # 场租分摊不读 contracts.cabinets_count 存储快照（电表后关联品牌时快照不会更新）
         cur.execute("""
             SELECT m.landlord_id, m.brand_id,
                    SUM(GREATEST(1, (SELECT COUNT(*) FROM cabinets cab WHERE cab.meter_id = m.id))) AS cabs
             FROM meters m
-            WHERE m.landlord_id IS NOT NULL AND m.brand_id IS NOT NULL
+            WHERE m.landlord_id IS NOT NULL
+              AND (m.brand_id IS NOT NULL OR m.tag = '共享电表')
               AND m.meter_no NOT LIKE 'TEST%'
             GROUP BY m.landlord_id, m.brand_id
         """)
@@ -179,8 +181,9 @@ async def monthly_ledger(request: Request, period: str = Query(..., description=
         return [{"year": y, "paid": agg[y][0], "total": agg[y][1]} for y in sorted(agg.keys())]
 
     def _live_cabs(lid, bid) -> float:
-        """(场地, 品牌) 的实时计费柜数；未匹配到电表为 0（不落快照兜底）"""
-        if lid is None or bid is None:
+        """(场地, 品牌) 的实时计费柜数；未匹配到电表为 0（不落快照兜底）。
+        bid=None 表示全品牌合同 → 对应场地内共享电表组（tag=共享电表）。"""
+        if lid is None:
             return 0.0
         return float(live_brand_cabs.get(lid, {}).get(bid, 0.0))
 

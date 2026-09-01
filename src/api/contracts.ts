@@ -12,6 +12,10 @@ export const updateContract = (id: number, data: any) =>
 export const deleteContract = (id: number) =>
   client.delete(`/contracts/${id}`).then(r => r.data);
 
+// 合同变更审计记录（倒序，最多 50 条）
+export const getContractAudit = (id: number) =>
+  client.get(`/contracts/${id}/audit`).then(r => r.data);
+
 // 从 Excel 导入合同（参考"场地信息关联表"格式：sheet1 场地合同信息 + 品牌收款合同信息）
 export const importContractsExcel = (file: File) => {
   const formData = new FormData();

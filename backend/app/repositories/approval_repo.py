@@ -117,8 +117,8 @@ def create_request(data: dict):
         cur.execute("""
             INSERT INTO approval_requests
             (biz_type, title, reason, amount, applicant, attachments, flow_nodes, status, dividend_record_id,
-             landlord_id, period, electricity_amount, rent_amount)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, '审批中', %s, %s, %s, %s, %s)
+             landlord_id, period, electricity_amount, rent_amount, contract_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, '审批中', %s, %s, %s, %s, %s, %s)
             RETURNING *
         """, (
             data.get("bizType"), data.get("title"), data.get("reason"),
@@ -129,6 +129,7 @@ def create_request(data: dict):
             data.get("landlordId"),
             data.get("period"), data.get("electricityAmount"),
             data.get("rentAmount"),
+            data.get("contractId"),
         ))
         request = cur.fetchone()
 
@@ -172,6 +173,18 @@ def apply_payment_links(cur, request: dict):
     biz = request.get("biz_type") or ""
     landlord_id = request.get("landlord_id")
     period = request.get("period")  # YYYY-MM 或 YYYYMM
+
+    # ── 场地费退款 → 回写合同押金退还（押金退还金额 = 审批总额 − 场地费退款部分）──
+    if biz == "场地费退款" and request.get("contract_id"):
+        try:
+            deposit_part = float(request.get("amount") or 0) - float(request.get("rent_amount") or 0)
+        except (TypeError, ValueError):
+            deposit_part = 0
+        cur.execute("""
+            UPDATE contracts
+            SET deposit_refund_amount = %s, deposit_refund_date = CURRENT_DATE, deposit_refund_approval_id = %s
+            WHERE id = %s
+        """, (deposit_part, request["id"], request["contract_id"]))
 
     # ── 场地费付款 → 联动付款分期 ──
     if "场地费" in biz and landlord_id and period:

@@ -22,8 +22,12 @@ async def list_contracts(request: Request, brandId: int = None, landlordId: int 
 
 
 @router.post("", status_code=201)
-async def create_contract(data: dict):
-    result = contract_repo.create_contract(data)
+async def create_contract(data: dict, request: Request):
+    operator = (getattr(request.state, "current_user", None) or {}).get("name")
+    try:
+        result = contract_repo.create_contract(data, operator)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     # 动态生成：合同保存后，自动生成该场地所有实表电表有读数月份的台账
     from .electricity import auto_generate_for_landlord
     try:
@@ -126,6 +130,88 @@ def _find_brand_id(name: str) -> int | None:
         cur.close()
         conn.close()
 
+def _find_entity_id(name: str) -> int | None:
+    if not name:
+        return None
+    conn = get_connection()
+    cur = get_dict_cursor(conn)
+    try:
+        cur.execute("SELECT id FROM entities WHERE name = %s", (name,))
+        row = cur.fetchone()
+        return row["id"] if row else None
+    finally:
+        cur.close()
+        conn.close()
+
+def _get_or_create_entity(name: str) -> int:
+    """按名称找公司主体（entities），不存在则创建"""
+    conn = get_connection()
+    cur = get_dict_cursor(conn)
+    try:
+        cur.execute("SELECT id FROM entities WHERE name = %s", (name,))
+        row = cur.fetchone()
+        if row:
+            return row["id"]
+        cur.execute("INSERT INTO entities (name) VALUES (%s) RETURNING id", (name,))
+        conn.commit()
+        return cur.fetchone()["id"]
+    finally:
+        cur.close()
+        conn.close()
+
+
+# ─── Excel 导入列映射 ────────────────────────────────────────
+# 优先按表头名解析列位（兼容 2026-09 新版模板：B 列新增「公司收款主体」、
+# 删除备注/承担成本列）；无表头时回退到旧版固定列位。
+_IMPORT_COLS = {
+    "ct_venue":          (0,  ["合同类型(场地)"]),
+    "entity_name":       (None, ["公司收款主体", "公司主体"]),
+    "landlord_name":     (1,  ["场地方"]),
+    "region":            (2,  ["区域"]),
+    "address":           (3,  ["地址"]),
+    "rent_amount":       (4,  ["场地年租金(元)", "场地年租金"]),
+    "monthly_rent":      (5,  ["场地月租金(元)", "场地月租金"]),
+    "elec_pay_price":    (6,  ["电费单价(元/度)", "电费单价"]),
+    "pay_method_venue":  (7,  ["场地租金付款方式"]),
+    "deposit_venue":     (8,  ["场地押金(元)", "场地押金"]),
+    "rent_advance_days": (9,  ["场地租金提前支付(天)", "场地租金提前支付"]),
+    "start_date_venue":  (10, ["场地合同开始日期"]),
+    "end_date_venue":    (11, ["场地合同结束日期"]),
+    "remark_venue":      (12, ["备注"]),
+    "ct_brand":          (13, ["合同类型(品牌)"]),
+    "brand_name":        (14, ["品牌方"]),
+    "rent_calc_method":  (15, ["计费方式"]),
+    "unit_monthly_rent": (16, ["单柜场地月租金(元)", "单柜场地月租金"]),
+    "cabinets_count":    (17, ["计费柜数"]),
+    "brand_monthly_rent": (18, ["品牌场地月租金(元)", "品牌场地月租金"]),
+    "brand_rent_amount": (19, ["品牌合同年租金(元)", "品牌合同年租金"]),
+    "brand_elec_price":  (21, ["电费收款单价(税前·元/度)", "电费收款单价"]),
+    "pay_method_brand":  (22, ["场地租金收款方式"]),
+    "deposit_brand":     (23, ["品牌押金(元)", "品牌押金"]),
+    "first_month_rent":  (24, ["首月场地租金(元)", "首月场地租金"]),
+    "rent_refund":       (25, ["场地费退款(元)", "场地费退款"]),
+    "elec_tax_pct":      (26, ["电费税率（%）", "电费税率(%)"]),
+    "rent_tax_pct":      (27, ["场地费税率（%）", "场地费税率(%)"]),
+    "start_date_brand":  (28, ["品牌合同开始日期"]),
+    "end_date_brand":    (29, ["品牌合同结束日期"]),
+    "remark_brand":      (30, ["品牌备注", "备注"]),
+}
+
+
+def _resolve_import_cols(header_row) -> dict:
+    """按表头行解析列索引；表头缺失的键回退到旧版固定列位"""
+    header_map = {}
+    if header_row:
+        for i, h in enumerate(header_row):
+            if h is not None and str(h).strip():
+                header_map[str(h).strip()] = i
+    known = sum(1 for _, names in _IMPORT_COLS.values() for n in names if n in header_map)
+    resolved = {}
+    for key, (fallback, names) in _IMPORT_COLS.items():
+        idx = next((header_map[n] for n in names if n in header_map), None)
+        resolved[key] = idx if idx is not None else (fallback if known >= 3 else fallback)
+    return resolved
+
 
 # ─── Excel 导入端点（必须在 /{contract_id} 之前）─────────────
 
@@ -133,10 +219,10 @@ def _find_brand_id(name: str) -> int | None:
 async def import_contracts(request: Request, file: UploadFile = File(...)):
     """Import contracts from Excel file（场地信息关联表 测试2 格式）
 
-    列布局（sheet1）：
-      场地合同 A~M：类型/场地方/区域/地址/年租金/月租金(可空→年/12)/电费单价/付款方式/押金/提前天数/开始/结束/备注
-      品牌合同 N~AE：类型/品牌方/计费方式/单柜月租/柜数/品牌月租(可空)/品牌年租(可空)/承担成本(忽略)/
-                     电费收款单价/收款方式/押金/首月租金/退款/电费税率%/场地费税率%/开始/结束/备注
+    列布局（sheet「收付款合同」，第 3 行为表头，按列名解析、兼容新旧模板）：
+      场地合同：类型/公司收款主体/场地方/区域/地址/年租金/月租金(可空→年/12)/电费单价/付款方式/押金/提前天数/开始/结束[/备注]
+      品牌合同：类型/品牌方/计费方式/单柜月租/柜数/品牌月租(可空)/品牌年租(可空)/电费收款单价/收款方式/押金/首月租金/退款/电费税率%/场地费税率%/开始/结束
+    「公司收款主体」→ 公司主体（entities，不存在自动创建），写入场地与品牌合同的 entity_id。
     品牌合同无"关联场地"列：按顺序关联前一行场地合同对应的场地方。
     """
     if not file.filename.endswith(('.xlsx', '.xls')):
@@ -160,12 +246,22 @@ async def import_contracts(request: Request, file: UploadFile = File(...)):
     if len(rows) < 4:
         raise HTTPException(400, "Excel文件数据不足，至少需要4行")
 
+    # 列位解析：第 3 行为表头（按列名匹配，兼容新旧模板）；无表头回退旧版固定列位
+    cols = _resolve_import_cols(rows[2] if len(rows) > 2 else None)
+
+    def _cell(row, key):
+        i = cols.get(key)
+        if i is None or i >= len(row):
+            return None
+        return row[i]
+
     results = {
         "imported": 0,
         "skipped": 0,
         "errors": [],
         "created_landlords": [],
         "created_brands": [],
+        "created_entities": [],
     }
 
     current_landlord_id = None
@@ -173,38 +269,47 @@ async def import_contracts(request: Request, file: UploadFile = File(...)):
 
     for row_idx, row in enumerate(rows[3:], start=4):
         try:
-            ct_venue = _str(row[0])   # A 合同类型(场地)
-            landlord_name = _str(row[1])  # B 场地方
-            region = _str(row[2])     # C 区域
-            address = _str(row[3])    # D 地址
-            rent_amount = _num(row[4])   # E 场地年租金
-            monthly_rent = _num(row[5])  # F 场地月租金（可空 → 年/12）
-            elec_pay_price = _num(row[6])  # G 电费付款单价
-            pay_method_venue = _str(row[7])  # H 场地租金付款方式
-            deposit_venue = _num(row[8])  # I 场地押金
-            rent_advance_days = _num(row[9])  # J 提前支付天数
-            start_date_venue = _parse_date(row[10])  # K
-            end_date_venue = _parse_date(row[11])  # L
-            remark_venue = _str(row[12])  # M
+            ct_venue = _str(_cell(row, "ct_venue"))          # 合同类型(场地)
+            entity_name = _str(_cell(row, "entity_name"))    # 公司收款主体 → 公司主体
+            landlord_name = _str(_cell(row, "landlord_name"))  # 场地方
+            region = _str(_cell(row, "region"))              # 区域
+            address = _str(_cell(row, "address"))            # 地址
+            rent_amount = _num(_cell(row, "rent_amount"))    # 场地年租金
+            monthly_rent = _num(_cell(row, "monthly_rent"))  # 场地月租金（可空 → 年/12）
+            elec_pay_price = _num(_cell(row, "elec_pay_price"))  # 电费付款单价
+            pay_method_venue = _str(_cell(row, "pay_method_venue"))  # 场地租金付款方式
+            deposit_venue = _num(_cell(row, "deposit_venue"))  # 场地押金
+            rent_advance_days = _num(_cell(row, "rent_advance_days"))  # 提前支付天数
+            start_date_venue = _parse_date(_cell(row, "start_date_venue"))
+            end_date_venue = _parse_date(_cell(row, "end_date_venue"))
+            remark_venue = _str(_cell(row, "remark_venue"))
 
-            ct_brand = _str(row[13])   # N 合同类型(品牌)
-            brand_name = _str(row[14])  # O 品牌方
-            rent_calc_method = _str(row[15])  # P 计费方式
-            unit_monthly_rent = _num(row[16])  # Q 单柜场地月租金
-            cabinets_count = _num(row[17])  # R 计费柜数
-            brand_monthly_rent = _num(row[18])  # S 品牌场地月租金（可空）
-            brand_rent_amount = _num(row[19])  # T 品牌合同年租金（可空）
-            # row[20] U 承担场地成本（分摊计算值，忽略）
-            brand_elec_price = _num(row[21])  # V 电费收款单价
-            pay_method_brand = _str(row[22])  # W 场地租金收款方式
-            deposit_brand = _num(row[23])  # X 品牌押金
-            first_month_rent = _num(row[24])  # Y 首月场地租金
-            rent_refund = _num(row[25])  # Z 场地费退款
-            elec_tax_pct = _num(row[26])  # AA 电费税率(%)
-            rent_tax_pct = _num(row[27])  # AB 场地费税率(%)
-            start_date_brand = _parse_date(row[28])  # AC
-            end_date_brand = _parse_date(row[29])  # AD
-            remark_brand = _str(row[30])  # AE
+            ct_brand = _str(_cell(row, "ct_brand"))          # 合同类型(品牌)
+            brand_name = _str(_cell(row, "brand_name"))      # 品牌方
+            rent_calc_method = _str(_cell(row, "rent_calc_method"))  # 计费方式
+            unit_monthly_rent = _num(_cell(row, "unit_monthly_rent"))  # 单柜场地月租金
+            cabinets_count = _num(_cell(row, "cabinets_count"))  # 计费柜数
+            brand_monthly_rent = _num(_cell(row, "brand_monthly_rent"))  # 品牌场地月租金（可空）
+            brand_rent_amount = _num(_cell(row, "brand_rent_amount"))  # 品牌合同年租金（可空）
+            brand_elec_price = _num(_cell(row, "brand_elec_price"))  # 电费收款单价
+            pay_method_brand = _str(_cell(row, "pay_method_brand"))  # 场地租金收款方式
+            deposit_brand = _num(_cell(row, "deposit_brand"))  # 品牌押金
+            first_month_rent = _num(_cell(row, "first_month_rent"))  # 首月场地租金
+            rent_refund = _num(_cell(row, "rent_refund"))    # 场地费退款
+            elec_tax_pct = _num(_cell(row, "elec_tax_pct"))  # 电费税率(%)
+            rent_tax_pct = _num(_cell(row, "rent_tax_pct"))  # 场地费税率(%)
+            start_date_brand = _parse_date(_cell(row, "start_date_brand"))
+            end_date_brand = _parse_date(_cell(row, "end_date_brand"))
+            remark_brand = _str(_cell(row, "remark_brand"))
+
+            # 公司收款主体 → 公司主体（entities，不存在则自动创建）
+            entity_id = None
+            if entity_name:
+                entity_id = _find_entity_id(entity_name)
+                if entity_id is None:
+                    entity_id = _get_or_create_entity(entity_name)
+                    if entity_name not in results["created_entities"]:
+                        results["created_entities"].append(entity_name)
 
             is_venue = ct_venue and "场地" in ct_venue
             is_brand = ct_brand and "品牌" in ct_brand
@@ -252,6 +357,7 @@ async def import_contracts(request: Request, file: UploadFile = File(...)):
                         contract_data = {
                             "contractType": "场地合同",
                             "landlordId": landlord_id,
+                            "entityId": entity_id,
                             "region": region,
                             "address": address,
                             "rentAmount": rent_amount,
@@ -264,7 +370,7 @@ async def import_contracts(request: Request, file: UploadFile = File(...)):
                             "endDate": end_date_venue,
                             "remark": remark_venue,
                         }
-                        contract_repo.create_contract(contract_data)
+                        contract_repo.create_contract(contract_data, operator="Excel导入")
                         results["imported"] += 1
 
             if is_brand:
@@ -329,6 +435,7 @@ async def import_contracts(request: Request, file: UploadFile = File(...)):
                     "contractType": "品牌方合同",
                     "landlordId": landlord_id,
                     "brandId": brand_id,
+                    "entityId": entity_id,
                     "rentCalcMethod": rcm,
                     "unitMonthlyRent": unit_monthly_rent,
                     "cabinetsCount": cabinets_count,
@@ -349,7 +456,7 @@ async def import_contracts(request: Request, file: UploadFile = File(...)):
                     "endDate": end_date_brand,
                     "remark": remark_brand,
                 }
-                contract_repo.create_contract(contract_data)
+                contract_repo.create_contract(contract_data, operator="Excel导入")
                 results["imported"] += 1
 
         except Exception as e:
@@ -361,8 +468,12 @@ async def import_contracts(request: Request, file: UploadFile = File(...)):
 # ─── 合同 CRUD ──────────────────────────────────────────────
 
 @router.put("/{contract_id}")
-async def update_contract(contract_id: int, data: dict):
-    result = contract_repo.update_contract(contract_id, data)
+async def update_contract(contract_id: int, data: dict, request: Request):
+    operator = (getattr(request.state, "current_user", None) or {}).get("name")
+    try:
+        result = contract_repo.update_contract(contract_id, data, operator)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     if not result:
         raise HTTPException(404, "合同不存在")
     # 动态生成：合同变更后，自动生成该场地所有实表电表有读数月份的台账
@@ -381,8 +492,9 @@ async def update_contract(contract_id: int, data: dict):
 
 
 @router.delete("/{contract_id}")
-async def delete_contract(contract_id: int):
-    landlord_id = contract_repo.delete_contract(contract_id)
+async def delete_contract(contract_id: int, request: Request):
+    operator = (getattr(request.state, "current_user", None) or {}).get("name")
+    landlord_id = contract_repo.delete_contract(contract_id, operator)
     # 分红联动：合同删除后重算该场地已有分红记录（失败不影响删除）
     try:
         from ..domain.dividend_refresh import refresh_dividend_records
@@ -390,3 +502,9 @@ async def delete_contract(contract_id: int):
     except Exception:
         pass
     return {"ok": True}
+
+
+@router.get("/{contract_id}/audit")
+async def get_contract_audit(contract_id: int):
+    """合同变更审计记录（倒序，最多 50 条）"""
+    return contract_repo.list_audit(contract_id)

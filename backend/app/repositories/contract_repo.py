@@ -1,5 +1,28 @@
+import json
 from datetime import date
 from ..infra.database import get_connection, get_dict_cursor
+
+
+def _log_contract_audit(cur, contract_id: int, action: str, changes: dict, operator: str = None):
+    """写合同变更审计日志（与业务写入同事务提交）"""
+    cur.execute(
+        "INSERT INTO contract_audit_log (contract_id, action, changes, operator) VALUES (%s, %s, %s, %s)",
+        (contract_id, action, json.dumps(changes, ensure_ascii=False, default=str), operator),
+    )
+
+
+def list_audit(contract_id: int, limit: int = 50):
+    conn = get_connection()
+    cur = get_dict_cursor(conn)
+    try:
+        cur.execute(
+            "SELECT * FROM contract_audit_log WHERE contract_id = %s ORDER BY created_at DESC, id DESC LIMIT %s",
+            (contract_id, limit),
+        )
+        return cur.fetchall()
+    finally:
+        cur.close()
+        conn.close()
 
 
 def list_contracts(brand_id: int = None, landlord_id: int = None, station_id: int = None, contract_type: str = None, keyword: str = None,
@@ -27,8 +50,14 @@ def list_contracts(brand_id: int = None, landlord_id: int = None, station_id: in
                 SELECT COALESCE(SUM(GREATEST(1, cab_cnt)), 0) FROM (
                   SELECT m.id, (SELECT COUNT(*) FROM cabinets cab WHERE cab.meter_id = m.id) AS cab_cnt
                   FROM meters m
-                  WHERE m.landlord_id = c.landlord_id AND m.brand_id = c.brand_id
+                  WHERE m.landlord_id = c.landlord_id
                     AND m.meter_no NOT LIKE 'TEST%%'
+                    AND (
+                      (c.brand_id IS NOT NULL AND m.brand_id = c.brand_id)
+                      -- 全品牌收入合同（无品牌）：匹配该场地的共享电表
+                      OR (c.contract_type = '品牌方合同' AND c.brand_id IS NULL
+                          AND m.brand_id IS NULL AND m.tag = '共享电表')
+                    )
                 ) t
               ) AS live_cabinets_count,
               (
@@ -40,24 +69,36 @@ def list_contracts(brand_id: int = None, landlord_id: int = None, station_id: in
                   SELECT m.id, (SELECT COUNT(*) FROM cabinets cab WHERE cab.meter_id = m.id) AS cab_cnt
                   FROM meters m
                   WHERE m.landlord_id = c.landlord_id
-                    AND m.brand_id IS NOT NULL
+                    AND (m.brand_id IS NOT NULL OR m.tag = '共享电表')
                     AND m.meter_no NOT LIKE 'TEST%%'
                 ) t
               ) AS total_brand_cabinets,
               -- 该场地下所有收入合同（品牌方合同）的计费柜数总和（实时：与 live_cabinets_count 同口径，
-              -- 按品牌方合同覆盖的品牌统计 meters→cabinets；电表归属变更后自动跟随，不读 cabinets_count 存储快照）
+              -- 按品牌方合同覆盖的品牌统计 meters→cabinets；全品牌收入合同额外覆盖场地内共享电表；
+              -- 电表归属变更后自动跟随，不读 cabinets_count 存储快照）
               (
                 SELECT COALESCE(SUM(GREATEST(1, cab_cnt)), 0) FROM (
                   SELECT m.id, (SELECT COUNT(*) FROM cabinets cab WHERE cab.meter_id = m.id) AS cab_cnt
                   FROM meters m
                   WHERE m.landlord_id = c.landlord_id
-                    AND m.brand_id IN (
-                      SELECT v.brand_id FROM contracts v
-                      WHERE v.landlord_id = c.landlord_id
-                        AND v.contract_type = '品牌方合同'
-                        AND v.brand_id IS NOT NULL
-                    )
                     AND m.meter_no NOT LIKE 'TEST%%'
+                    AND (
+                      m.brand_id IN (
+                        SELECT v.brand_id FROM contracts v
+                        WHERE v.landlord_id = c.landlord_id
+                          AND v.contract_type = '品牌方合同'
+                          AND v.brand_id IS NOT NULL
+                      )
+                      OR (
+                        m.brand_id IS NULL AND m.tag = '共享电表'
+                        AND EXISTS (
+                          SELECT 1 FROM contracts v2
+                          WHERE v2.landlord_id = c.landlord_id
+                            AND v2.contract_type = '品牌方合同'
+                            AND v2.brand_id IS NULL
+                        )
+                      )
+                    )
                 ) t
               ) AS income_cabinets_total
             FROM contracts c
@@ -107,8 +148,8 @@ def list_contracts(brand_id: int = None, landlord_id: int = None, station_id: in
                 r["days_left"] = None
                 r["status"] = "未知"
             # 计算品牌方合同承担的场地成本
-            # 口径：场地合同月租金总和 ÷ 该场地所有品牌计费柜数总和 × 本品牌计费柜数
-            # （与 dividend_calc.py 的分红按品牌场地成本一致；分母含无品牌方合同的品牌电表柜数，不计 TEST 电表）
+            # 口径：场地合同月租金总和 ÷ 该场地所有计费柜数总和（含共享电表，分红分摊口径不含共享）
+            #      × 本合同计费柜数；仅合同页展示用，不计 TEST 电表
             venue_rent = r.get("venue_monthly_rent")
             total_cabs = int(r.get("total_brand_cabinets") or 0)
             live_cabs = int(r.get("live_cabinets_count") or 0)
@@ -128,7 +169,21 @@ def list_contracts(brand_id: int = None, landlord_id: int = None, station_id: in
         conn.close()
 
 
-def create_contract(data: dict):
+def _validate_early_end(data: dict):
+    """填写了合同提前结束日期时，必须同时填写场地费退款金额（>0）"""
+    early = data.get("earlyEndDate")
+    if not early:
+        return
+    try:
+        refund = float(data.get("rentRefund") or 0)
+    except (TypeError, ValueError):
+        refund = 0
+    if refund <= 0:
+        raise ValueError("填写了合同提前结束日期时，必须同时填写场地费退款金额")
+
+
+def create_contract(data: dict, operator: str = None):
+    _validate_early_end(data)
     conn = get_connection()
     cur = get_dict_cursor(conn)
     try:
@@ -146,18 +201,18 @@ def create_contract(data: dict):
         cur.execute("""
             INSERT INTO contracts
             (landlord_id, brand_id, entity_id, contract_type,
-             electricity_price, rent_amount, cabinets_count, unit_monthly_rent, monthly_rent,
+             electricity_price, rent_amount, unit_monthly_rent, monthly_rent,
              rent_calc_method, pay_method, rent_advance_days, region, address, latitude, longitude, pay_entity, start_date, end_date, pay_status,
              tax_enabled, tax_rate, post_tax_electricity_price, deposit, first_month_rent, rent_refund, early_end_date,
              rent_tax_enabled, rent_tax_rate, post_tax_rent_price, remark)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING *
         """, (
             landlord_id, data.get("brandId"),
             data.get("entityId"),
             contract_type,
             data.get("electricityPrice"), data.get("rentAmount"),
-            data.get("cabinetsCount"), data.get("unitMonthlyRent"), data.get("monthlyRent"),
+            data.get("unitMonthlyRent"), data.get("monthlyRent"),
             data.get("rentCalcMethod", "按柜子数量"),
             data.get("payMethod"), data.get("rentAdvanceDays", 0),
             data.get("region"), data.get("address"),
@@ -175,8 +230,10 @@ def create_contract(data: dict):
             data.get("postTaxRentPrice"),
             data.get("remark")
         ))
-        conn.commit()
         contract = cur.fetchone()
+        # 变更审计：合同创建快照（与业务写入同事务）
+        _log_contract_audit(cur, contract["id"], "create", {"snapshot": dict(contract)}, operator)
+        conn.commit()
         # 生成收付款分期（按 pay_method 拆期）；失败不再静默，打印日志便于排查
         try:
             from .contract_schedule_repo import generate_schedules
@@ -198,21 +255,32 @@ def create_contract(data: dict):
         conn.close()
 
 
-def update_contract(contract_id: int, data: dict):
+def update_contract(contract_id: int, data: dict, operator: str = None):
     conn = get_connection()
     cur = get_dict_cursor(conn)
     try:
-        # 读取更新前的合同（用于唯一场地合同校验）
-        cur.execute("SELECT contract_type, landlord_id FROM contracts WHERE id = %s", (contract_id,))
+        # 读取更新前的合同（用于唯一场地合同校验、提前结束/退款的合并校验、变更审计）
+        cur.execute("SELECT * FROM contracts WHERE id = %s", (contract_id,))
         before = cur.fetchone()
         if not before:
             return None
+
+        # 生效值校验：提前结束/退款属于可清空字段——显式传入（含 null/空串）以新值为准，否则沿用库中现值
+        eff_early = data["earlyEndDate"] if "earlyEndDate" in data else before.get("early_end_date")
+        eff_early = eff_early or None
+        eff_refund = data["rentRefund"] if "rentRefund" in data else before.get("rent_refund")
+        try:
+            eff_refund_num = float(eff_refund) if eff_refund not in (None, "") else 0
+        except (TypeError, ValueError):
+            eff_refund_num = 0
+        if eff_early and eff_refund_num <= 0:
+            raise ValueError("填写了合同提前结束日期时，必须同时填写场地费退款金额")
 
         field_map = {
             "landlordId": "landlord_id", "brandId": "brand_id", "entityId": "entity_id",
             "contractType": "contract_type",
             "electricityPrice": "electricity_price", "rentAmount": "rent_amount",
-            "cabinetsCount": "cabinets_count", "unitMonthlyRent": "unit_monthly_rent",
+            "unitMonthlyRent": "unit_monthly_rent",
             "monthlyRent": "monthly_rent", "rentCalcMethod": "rent_calc_method",
             "payMethod": "pay_method",
             "rentAdvanceDays": "rent_advance_days",
@@ -260,6 +328,14 @@ def update_contract(contract_id: int, data: dict):
         values.append(contract_id)
         cur.execute(f"UPDATE contracts SET {', '.join(updates)} WHERE id = %s RETURNING *", values)
         updated = cur.fetchone()
+        # 变更审计：记录修改字段（from → to），与业务写入同事务
+        changes = {}
+        for key, db_field in field_map.items():
+            old, new = before.get(db_field), updated.get(db_field)
+            if str(old) != str(new):
+                changes[key] = {"from": old, "to": new}
+        if changes:
+            _log_contract_audit(cur, contract_id, "update", changes, operator)
         conn.commit()
         # 修复 #7：合同月租/付款方式/起止日期变更后，重建收付款分期（generate_schedules 会按 seq 保留已付状态）
         try:
@@ -282,17 +358,19 @@ def update_contract(contract_id: int, data: dict):
         conn.close()
 
 
-def delete_contract(contract_id: int):
+def delete_contract(contract_id: int, operator: str = None):
     conn = get_connection()
-    cur = conn.cursor()
+    cur = get_dict_cursor(conn)
     try:
-        # 先取场地方（用于删除后刷新分红记录），再删合同的分期记录与合同本身（避免孤儿分期）
-        cur.execute("SELECT landlord_id FROM contracts WHERE id = %s", (contract_id,))
+        # 先取合同快照（变更审计）与场地方（用于删除后刷新分红记录），再删分期与合同本身（避免孤儿分期）
+        cur.execute("SELECT * FROM contracts WHERE id = %s", (contract_id,))
         row = cur.fetchone()
-        landlord_id = row[0] if row else None
+        landlord_id = row["landlord_id"] if row else None
         cur.execute("DELETE FROM rent_payment_schedule WHERE contract_id = %s", (contract_id,))
         cur.execute("DELETE FROM rent_income_schedule WHERE contract_id = %s", (contract_id,))
         cur.execute("DELETE FROM contracts WHERE id = %s", (contract_id,))
+        if row:
+            _log_contract_audit(cur, contract_id, "delete", {"snapshot": dict(row)}, operator)
         conn.commit()
         return landlord_id
     finally:

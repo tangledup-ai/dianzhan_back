@@ -1,6 +1,7 @@
 import { useMemo, useState, useEffect, useRef, type ReactNode } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { listContracts, createContract, updateContract, deleteContract, importContractsExcel } from "@/api/contracts";
+import { listContracts, createContract, updateContract, deleteContract, importContractsExcel, getContractAudit } from "@/api/contracts";
+import { createApproval } from "@/api/approvals";
 import { listBrands, listLandlords } from "@/api/directory";
 import { listMeters } from "@/api/meters";
 import { listCabinets } from "@/api/cabinets";
@@ -47,6 +48,25 @@ export default function Contracts() {
     mutationFn: deleteContract,
     onSuccess: () => { toast.success("已删除"); queryClient.invalidateQueries({ queryKey: ["contracts"] }); },
   });
+
+  // 场地费退款审批（品牌方合同提前终止且填了退款金额的行可见）
+  const [refundTarget, setRefundTarget] = useState<any>(null);
+  const handleRefundApproval = (p: { rentRefund: number; depositRefund: number; applicant: string; remark: string }) => {
+    if (!refundTarget) return;
+    createApproval({
+      bizType: "场地费退款",
+      title: `${refundTarget.landlordName ?? ""} ${refundTarget.brandName ?? ""} 提前终止退款`.trim(),
+      applicant: p.applicant,
+      amount: p.rentRefund + p.depositRefund,
+      reason: `品牌方合同提前于 ${fmtDate(refundTarget.earlyEndDate || refundTarget.endDate)} 结束；场地费退款 ${p.rentRefund} 元，押金退还 ${p.depositRefund} 元${p.remark ? `；备注：${p.remark}` : ""}`,
+      landlordId: refundTarget.landlordId,
+      rentAmount: p.rentRefund,
+      contractId: refundTarget.id,
+    }).then(() => {
+      toast.success("退款审批已提交，可在「审批中心」查看进度");
+      setRefundTarget(null);
+    }).catch((e: any) => toast.error(e.response?.data?.detail || e.message || "提交失败"));
+  };
 
   // ── Excel 导入合同 ──
   const fileRef = useRef<HTMLInputElement>(null);
@@ -151,7 +171,7 @@ export default function Contracts() {
           c.payEntity ?? "",
           c.landlordName || "",
           c.address || addrOf.get(c.landlordId) || "",
-          c.contractType === "品牌方合同" ? (c.brandName || "") : (c.partner || c.landlordName || ""),
+          c.contractType === "品牌方合同" ? (c.brandName || "全部品牌共享") : (c.partner || c.landlordName || ""),
           c.contractType,
           fmtDate(c.startDate, ""),
           fmtDate(c.earlyEndDate || c.endDate, ""),
@@ -370,7 +390,9 @@ export default function Contracts() {
                                   {isExpanded ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
                                 </button>
                               </td>
-                              <td className="px-3 py-2.5 font-medium">{c.brandName ?? "-"}</td>
+                              <td className="px-3 py-2.5 font-medium">
+                                {c.brandName || <span className="text-purple-600">全部品牌共享</span>}
+                              </td>
                               <td className="px-3 py-2.5 text-right tabular-nums">{c.unitMonthlyRent ? fmtMoney(c.unitMonthlyRent) : "-"}</td>
                               <td className="px-3 py-2.5 text-right tabular-nums">{(c.liveCabinetsCount ?? c.cabinetsCount) ? fmtNum(c.liveCabinetsCount ?? c.cabinetsCount) : "-"}</td>
                               <td className="px-3 py-2.5 text-right tabular-nums">{c.monthlyRent ? fmtMoney(c.monthlyRent) : "-"}</td>
@@ -396,6 +418,9 @@ export default function Contracts() {
                               <td className="max-w-[120px] truncate px-3 py-2.5 text-slate-500" title={c.remark ?? ""}>{c.remark ?? "-"}</td>
                               <td className="px-3 py-2.5">
                                 <div className="flex justify-center gap-0.5">
+                                  {Number(c.rentRefund) > 0 && (
+                                    <button className="rounded p-1 text-slate-400 hover:text-sky-600" title="提交场地费退款审批" onClick={() => setRefundTarget(c)}><FileText className="h-3.5 w-3.5" /></button>
+                                  )}
                                   <button className="rounded p-1 text-slate-400 hover:text-emerald-600" onClick={() => { setEditing(c); setFormType("品牌方合同"); setFormOpen(true); }}><Pencil className="h-3.5 w-3.5" /></button>
                                   <button className="rounded p-1 text-slate-400 hover:text-rose-500" onClick={() => window.confirm("删除？") && del.mutate(c.id)}><Trash2 className="h-3.5 w-3.5" /></button>
                                 </div>
@@ -405,7 +430,7 @@ export default function Contracts() {
                             {isExpanded && (
                               <tr key={`${c.id}-exp`} className="bg-slate-50/50">
                                 <td colSpan={17} className="px-4 py-3">
-                                  <ContractSchedule contractId={c.id} side="income" title={`${c.brandName || ""} 收款情况`} editable />
+                                  <ContractSchedule contractId={c.id} side="income" title={`${c.brandName || "全部品牌共享"} 收款情况`} editable />
                                 </td>
                               </tr>
                             )}
@@ -431,6 +456,20 @@ export default function Contracts() {
 
       <ContractForm open={formOpen} onClose={() => { setFormOpen(false); setEditing(null); }} record={editing} defaultType={formType} />
 
+      {/* 场地费退款审批弹窗（列表行入口） */}
+      <RefundApprovalDialog
+        open={!!refundTarget}
+        onClose={() => setRefundTarget(null)}
+        info={refundTarget ? {
+          landlordName: refundTarget.landlordName ?? "",
+          brandName: refundTarget.brandName ?? "",
+          endDate: fmtDate(refundTarget.earlyEndDate || refundTarget.endDate),
+          rentRefund: Number(refundTarget.rentRefund) || 0,
+          deposit: Number(refundTarget.deposit) || 0,
+        } : null}
+        onConfirm={handleRefundApproval}
+      />
+
       {/* Excel 导入结果 */}
       <Dialog open={importResult !== null} onOpenChange={(o) => !o && setImportResult(null)}>
         <DialogContent className="max-w-md">
@@ -440,10 +479,11 @@ export default function Contracts() {
               <span className="rounded-full bg-emerald-100 px-2.5 py-1 font-medium text-emerald-700">成功导入 {importResult?.imported ?? 0} 条</span>
               <span className="rounded-full bg-slate-100 px-2.5 py-1 font-medium text-slate-600">跳过 {importResult?.skipped ?? 0} 条</span>
             </div>
-            {((importResult?.created_landlords ?? []).length > 0 || (importResult?.created_brands ?? []).length > 0) && (
+            {((importResult?.created_landlords ?? []).length > 0 || (importResult?.created_brands ?? []).length > 0 || (importResult?.created_entities ?? []).length > 0) && (
               <div className="rounded-lg border border-amber-100 bg-amber-50/60 px-3 py-2">
                 <div className="mb-1 font-medium text-amber-700">自动新建（Excel 中不存在的基础档案）</div>
                 <div className="text-slate-600">
+                  {(importResult?.created_entities ?? []).length > 0 && <>公司主体：{importResult.created_entities.join("、")}<br /></>}
                   {(importResult?.created_landlords ?? []).length > 0 && <>场地方：{importResult.created_landlords.join("、")}<br /></>}
                   {(importResult?.created_brands ?? []).length > 0 && <>品牌方：{importResult.created_brands.join("、")}</>}
                 </div>
@@ -485,6 +525,67 @@ function FormSection({ title, children }: { title: string; children: ReactNode }
   );
 }
 
+// ─── 场地费退款审批弹窗 ───
+function RefundApprovalDialog({ open, onClose, info, onConfirm, saving }: {
+  open: boolean;
+  onClose: () => void;
+  info: { landlordName: string; brandName: string; endDate: string; rentRefund: number; deposit: number } | null;
+  onConfirm: (p: { rentRefund: number; depositRefund: number; applicant: string; remark: string }) => void;
+  saving?: boolean;
+}) {
+  const [rentRefund, setRentRefund] = useState("");
+  const [depositRefund, setDepositRefund] = useState("");
+  const [applicant, setApplicant] = useState("");
+  const [remark, setRemark] = useState("");
+  useEffect(() => {
+    if (open && info) {
+      setRentRefund(String(info.rentRefund ?? 0));
+      setDepositRefund(String(info.deposit ?? 0));
+      setRemark("");
+      try { setApplicant(JSON.parse(localStorage.getItem("dsh_user") || "{}").name || ""); } catch { setApplicant(""); }
+    }
+  }, [open, info]);
+  const total = (Number(rentRefund) || 0) + (Number(depositRefund) || 0);
+  return (
+    <Dialog open={open} onOpenChange={(o) => !o && onClose()}>
+      <DialogContent className="!max-w-lg">
+        <DialogHeader><DialogTitle>提交场地费退款审批</DialogTitle></DialogHeader>
+        <div className="space-y-3">
+          <div className="space-y-1 rounded-md bg-slate-50 px-3 py-2 text-xs text-slate-600">
+            <div>场地方 / 品牌方：{info?.landlordName || "-"} · {info?.brandName || "-"}</div>
+            <div>合同提前结束日期：{info?.endDate || "—"}</div>
+            <div>合同押金：{info ? fmtMoney(info.deposit) : "-"}（默认全额退还，可按协商结果修改）</div>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <Field label="场地费退款（元）"><NumInput value={rentRefund} onChange={setRentRefund} placeholder="0" /></Field>
+            <Field label="押金退还（元）"><NumInput value={depositRefund} onChange={setDepositRefund} placeholder="0" /></Field>
+          </div>
+          <Field label="合计退款（元）">
+            <div className="flex h-9 items-center rounded-md border border-slate-200 bg-slate-50 px-3 text-sm font-semibold tabular-nums text-slate-700">{fmtMoney(total)}</div>
+          </Field>
+          <Field label="经办人"><TextInput value={applicant} onChange={setApplicant} placeholder="经办人姓名" /></Field>
+          <Field label="备注（供审核人员参考）">
+            <textarea
+              className={inputCls + " w-full"}
+              rows={3}
+              value={remark}
+              onChange={(e) => setRemark(e.target.value)}
+              placeholder="如：退租原因、扣款说明、协商结果等"
+            />
+          </Field>
+          <div className="flex justify-end gap-2 pt-1">
+            <Button variant="outline" onClick={onClose}>取消</Button>
+            <Button className="bg-emerald-600 hover:bg-emerald-700" disabled={saving || total <= 0}
+              onClick={() => onConfirm({ rentRefund: Number(rentRefund) || 0, depositRefund: Number(depositRefund) || 0, applicant: applicant.trim() || "经办人", remark: remark.trim() })}>
+              提交审批
+            </Button>
+          </div>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 // ─── 合同表单 ───
 function ContractForm({ open, onClose, record, defaultType }: { open: boolean; onClose: () => void; record?: any; defaultType?: string }) {
   const blank = {
@@ -505,14 +606,22 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
   const meters = useQuery({ queryKey: ["meters"], queryFn: () => listMeters(), enabled: open });
   const cabinets = useQuery({ queryKey: ["allCabinets"], queryFn: () => listCabinets(), enabled: open });
   const contracts = useQuery({ queryKey: ["contracts"], queryFn: () => listContracts(), enabled: open });
+  const audit = useQuery({
+    queryKey: ["contractAudit", record?.id],
+    queryFn: () => getContractAudit(record.id),
+    enabled: open && !!record?.id,
+  });
 
   // 计费柜数自动计算：匹配(场地方+品牌方)的电表，每块电表至少 1 柜（max(1, 实际柜子数)），
-  // 排除 TEST 前缀电表——与后端 live_cabinets_count 口径一致
+  // 排除 TEST 前缀电表——与后端 live_cabinets_count 口径一致；
+  // 收入合同不指定品牌（空 / "shared"）= 全品牌合同，匹配该场地的共享电表（无品牌且标签=共享电表）
   const autoCabinetCount = useMemo(() => {
-    if (!f.landlordId || !f.brandId) return null;
+    if (!f.landlordId || f.contractType !== "品牌方合同") return null;
+    const isShared = !f.brandId || f.brandId === "shared";
     // 找到匹配的电表
     const matchedMeters = (meters.data ?? []).filter((m: any) =>
-      m.landlordId === Number(f.landlordId) && m.brandId === Number(f.brandId)
+      m.landlordId === Number(f.landlordId)
+      && (isShared ? (!m.brandId && m.tag === "共享电表") : m.brandId === Number(f.brandId))
       && !String(m.meterNo || "").startsWith("TEST")
     );
     const meterIds = new Set(matchedMeters.map((m: any) => m.id));
@@ -523,7 +632,7 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
     });
     // 每块电表至少计 1 柜
     return matchedMeters.reduce((sum: number, m: any) => sum + Math.max(1, cabByMeter.get(m.id) || 0), 0);
-  }, [f.landlordId, f.brandId, meters.data, cabinets.data]);
+  }, [f.landlordId, f.brandId, f.contractType, meters.data, cabinets.data]);
 
   // 该场地下所有收入合同（品牌方合同）的计费柜数总和（实时：与品牌方合同行同口径，
   // 优先后端实时统计 liveCabinetsCount，电表归属变更后自动跟随；存储 cabinetsCount 仅兜底）
@@ -541,13 +650,15 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
     }
   }, [autoCabinetCount]);
 
-  // 承担场地成本实时计算：场地合同月租金总和 ÷ 该场地所有品牌计费柜数总和 × 本品牌计费柜数
+  // 承担场地成本实时计算：场地合同月租金总和 ÷ 该场地所有计费柜数总和 × 本合同计费柜数
   // 口径与后端 contract_repo live_cabinets_count/total_brand_cabinets 一致：
-  // 每块电表按 1 柜计（即 GREATEST(1,柜数)），仅排除 TEST 前缀电表；签了合同但无电表的品牌分摊为 0
+  // 每块电表按 1 柜计（即 GREATEST(1,柜数)），仅排除 TEST 前缀电表；
+  // 场地总柜数含共享电表，全品牌合同（不指定品牌）按共享电表计
   const venueCostLive = useMemo(() => {
-    if (!f.landlordId || !f.brandId) return null;
+    if (!f.landlordId || f.contractType !== "品牌方合同") return null;
     const landlordId = Number(f.landlordId);
-    const brandId = Number(f.brandId);
+    const isShared = !f.brandId || f.brandId === "shared";
+    const brandId = isShared ? null : Number(f.brandId);
 
     // 1) 该场地方所有「场地合同」月租金之和
     const venueMonthlyRent = (contracts.data ?? [])
@@ -555,18 +666,20 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
       .reduce((sum: number, c: any) => sum + Number(c.monthlyRent || 0), 0);
     if (!venueMonthlyRent) return null;
 
-    // 2) 该场地下已归属品牌的电表（排除 TEST 前缀，与后端 NOT LIKE 'TEST%' 一致）
+    // 2) 该场地下已归属品牌的电表 + 共享电表（排除 TEST 前缀，与后端 NOT LIKE 'TEST%' 一致）
     const siteMeters = (meters.data ?? []).filter(
-      (m: any) => m.landlordId === landlordId && m.brandId != null && !String(m.meterNo || "").startsWith("TEST")
+      (m: any) => m.landlordId === landlordId && (m.brandId != null || m.tag === "共享电表") && !String(m.meterNo || "").startsWith("TEST")
     );
 
-    // 3) 本品牌电表数 / 该场地所有品牌电表数（每表计 1 柜）
-    const liveCabs = siteMeters.filter((m: any) => m.brandId === brandId).length;
+    // 3) 本合同覆盖电表数 / 该场地总电表数（每表计 1 柜）
+    const liveCabs = isShared
+      ? siteMeters.filter((m: any) => !m.brandId).length
+      : siteMeters.filter((m: any) => m.brandId === brandId).length;
     const totalCabs = siteMeters.length;
     if (!totalCabs) return null;
 
     return Math.round((venueMonthlyRent / totalCabs) * liveCabs * 100) / 100;
-  }, [f.landlordId, f.brandId, contracts.data, meters.data]);
+  }, [f.landlordId, f.brandId, f.contractType, contracts.data, meters.data]);
 
   // 当使用"按柜子数量"方式时，自动计算场地月租金，并同步年租金 = 月租金 × 12
   useEffect(() => {
@@ -617,7 +730,9 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
     if (!open) return;
     if (record) {
       setF({
-        landlordId: record.landlordId ? String(record.landlordId) : "", brandId: record.brandId ? String(record.brandId) : "",
+        landlordId: record.landlordId ? String(record.landlordId) : "",
+        // 品牌方合同未指定品牌 = 全品牌合同（覆盖场地内共享电表），下拉首项即此选项
+        brandId: record.brandId ? String(record.brandId) : "",
         contractType: record.contractType ?? "场地合同",
         electricityPrice: record.electricityPrice ? String(record.electricityPrice) : "", rentAmount: record.rentAmount ? String(record.rentAmount) : "",
         cabinetsCount: record.cabinetsCount ? String(record.cabinetsCount) : "", unitMonthlyRent: record.unitMonthlyRent ? String(record.unitMonthlyRent) : "",
@@ -653,7 +768,7 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
     onError: (e: any) => toast.error(e.message),
   });
 
-  const submit = () => {
+  const submit = (afterSave?: () => void) => {
     if (!f.landlordId) { toast.error("请选择场地方"); return; }
     if (f.contractType === "品牌方合同" && !f.landlordId) { toast.error("品牌方合同必须关联场地方"); return; }
     // 唯一场地合同校验：同一个场地方只能有一个场地合同
@@ -682,13 +797,19 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
       ? Math.round((monthlyRent * (1 - rentTaxRate)) * 100) / 100
       : null;
 
+    // 填了提前结束日期必须同时填写场地费退款金额（后端同样校验）
+    if (f.earlyEndDate && !(f.rentRefund && Number(f.rentRefund) > 0)) {
+      toast.error("填写了合同提前结束日期，必须同时填写场地费退款金额");
+      return;
+    }
+
     save.mutate({
       landlordId: f.landlordId ? Number(f.landlordId) : null,
-      brandId: f.brandId ? Number(f.brandId) : null,
+      brandId: f.brandId && f.brandId !== "shared" ? Number(f.brandId) : null,
       contractType: f.contractType,
       electricityPrice: elecPrice,
       rentAmount: f.rentAmount ? Number(f.rentAmount) : null,
-      cabinetsCount: f.cabinetsCount ? Number(f.cabinetsCount) : null,
+      // cabinetsCount 已退役（2026-09）：计费柜数唯一源=实时统计，不再写入存储快照
       unitMonthlyRent: f.unitMonthlyRent ? Number(f.unitMonthlyRent) : null,
       rentCalcMethod: f.rentCalcMethod,
       monthlyRent: f.monthlyRent ? Number(f.monthlyRent) : null,
@@ -712,10 +833,33 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
       rentTaxRate,
       postTaxRentPrice,
       remark: f.remark || null,
+    }, { onSuccess: () => { afterSave?.(); } });
+  };
+
+  // 弹窗内：保存当前合同并提交场地费退款审批（仅已保存的合同可用）
+  const [refundApprovalOpen, setRefundApprovalOpen] = useState(false);
+  const handleRefundApprovalConfirm = (p: { rentRefund: number; depositRefund: number; applicant: string; remark: string }) => {
+    submit(() => {
+      const landlordName = (landlords.data ?? []).find((l: any) => l.id === Number(f.landlordId))?.name ?? "";
+      const brandName = (brands.data ?? []).find((b: any) => b.id === Number(f.brandId))?.name ?? "";
+      createApproval({
+        bizType: "场地费退款",
+        title: `${landlordName} ${brandName} 提前终止退款`.trim(),
+        applicant: p.applicant,
+        amount: p.rentRefund + p.depositRefund,
+        reason: `品牌方合同提前于 ${fmtDate(f.earlyEndDate || f.endDate)} 结束；场地费退款 ${p.rentRefund} 元，押金退还 ${p.depositRefund} 元${p.remark ? `；备注：${p.remark}` : ""}`,
+        landlordId: Number(f.landlordId),
+        rentAmount: p.rentRefund,
+        contractId: record.id,
+      }).then(() => {
+        toast.success("退款审批已提交，可在「审批中心」查看进度");
+        setRefundApprovalOpen(false);
+      }).catch((e: any) => toast.error(e.response?.data?.detail || e.message || "提交失败"));
     });
   };
 
   return (
+    <>
     <Dialog open={open} onOpenChange={(o) => !o && onClose()}>
       <DialogContent className="!max-w-7xl max-h-[90vh] overflow-y-auto">
         <DialogHeader><DialogTitle>{record ? "编辑合同" : "新增合同"}</DialogTitle></DialogHeader>
@@ -741,7 +885,11 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
                 </Field>
                 <Field label="品牌方">
                   <SelectInput value={f.brandId} onChange={set("brandId")}
-                    options={[{ value: "", label: "请选择品牌方" }, ...(brands.data ?? []).map((b: any) => ({ value: String(b.id), label: b.name }))]} />
+                    options={[
+                      // 首项即默认：不指定品牌 = 全品牌合同，计费柜数/电费收款按场地内共享电表计算
+                      { value: "", label: "全部品牌（共享电表）" },
+                      ...(brands.data ?? []).map((b: any) => ({ value: String(b.id), label: b.name })),
+                    ]} />
                 </Field>
                 <Field label="计费方式">
                   <SelectInput value={f.rentCalcMethod} onChange={set("rentCalcMethod")}
@@ -837,14 +985,14 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
                           <button
                             type="button"
                             className="inline-flex items-center gap-0.5 text-emerald-600 hover:text-emerald-700 hover:underline"
-                            onClick={() => { onClose(); window.location.href = `/meters?landlord=${f.landlordId}&brand=${f.brandId}&highlight=cabinet`; }}
+                            onClick={() => { onClose(); window.location.href = `/meters?landlord=${f.landlordId}&brand=${f.brandId || "shared"}&highlight=cabinet`; }}
                           >
                             去修改 <ExternalLink className="h-3 w-3" />
                           </button>
                         </div>
                       )}
                       {autoCabinetCount === null && !f.cabinetsCount && (
-                        <span className="text-xs text-slate-400">请先选择场地和品牌</span>
+                        <span className="text-xs text-slate-400">请先选择场地方</span>
                       )}
                     </div>
                   </div>
@@ -880,16 +1028,29 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
                 <SelectInput value={f.payMethod} onChange={set("payMethod")}
                   options={[{ value: "", label: "请选择" }, { value: "月付", label: "月收" }, { value: "季付", label: "季收" }, { value: "半年付", label: "半年收" }, { value: "年付", label: "年收" }]} />
               </Field>
-              <Field label="押金（元）"><NumInput value={f.deposit} onChange={set("deposit")} placeholder="0" /></Field>
-              <Field label="首月场地租金（元）"><NumInput value={f.firstMonthRent} onChange={set("firstMonthRent")} placeholder="按整月算则留空" /></Field>
-              <Field label="场地费退款（元）"><NumInput value={f.rentRefund} onChange={set("rentRefund")} placeholder="0" /></Field>
-              <Field label="合同提前结束日期">
-                <DateInput
-                  value={f.earlyEndDate || ""}
-                  onChange={set("earlyEndDate")}
-                />
-                <span className="mt-0.5 block text-[10px] font-normal text-slate-400">提前终止合同时填写；填了退款但未选日期时默认按今天算。留空 = 按原合同到期</span>
+              <Field label="押金（元）"><NumInput value={f.deposit} onChange={set("deposit")} placeholder="0" />
+                {!!Number(record?.depositRefundAmount) && (
+                  <span className="mt-0.5 block text-[11px] text-rose-600">
+                    已退押金 {fmtMoney(record.depositRefundAmount)} 元（{fmtDate(record.depositRefundDate)}）
+                  </span>
+                )}
               </Field>
+              <div className="col-span-4 grid grid-cols-3 items-end gap-3">
+                <Field label="首月场地租金（元）"><NumInput value={f.firstMonthRent} onChange={set("firstMonthRent")} placeholder="按整月算则留空" /></Field>
+                <Field label="场地费退款（元）"><NumInput value={f.rentRefund} onChange={set("rentRefund")} placeholder="0" /></Field>
+                <Field label="合同提前结束日期">
+                  <DateInput
+                    value={f.earlyEndDate || ""}
+                    onChange={set("earlyEndDate")}
+                  />
+                </Field>
+              </div>
+              {!!record?.id && Number(f.rentRefund) > 0 && (
+                <button type="button" onClick={() => setRefundApprovalOpen(true)}
+                  className="col-span-4 -mt-2 text-right text-[11px] font-medium text-sky-600 hover:text-sky-700">
+                  提交场地费退款审批（保存合同并送审批）→
+                </button>
+              )}
             </>
           )}
           </FormSection>
@@ -982,12 +1143,49 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
             <Field label="结束日期"><DateInput value={f.endDate} onChange={set("endDate")} /></Field>
             <Field label="备注"><TextInput value={f.remark} onChange={set("remark")} /></Field>
           </FormSection>
+
+          {/* 变更审计：谁在什么时候改了什么 */}
+          {record?.id && (
+            <FormSection title="变更记录">
+              <div className="col-span-4 max-h-40 space-y-1 overflow-y-auto rounded-md bg-slate-50/70 p-2 text-xs">
+                {(audit.data ?? []).length === 0 && <div className="text-slate-400">暂无变更记录</div>}
+                {(audit.data ?? []).map((a: any) => (
+                  <div key={a.id} className="leading-5">
+                    <span className="text-slate-400">{fmtDate((a.createdAt || "").slice(0, 10))} {(a.createdAt || "").slice(11, 16)}</span>
+                    <span className="mx-1 font-medium text-slate-600">{a.operator || "—"}</span>
+                    <span className={`rounded px-1 ${a.action === "create" ? "bg-emerald-100 text-emerald-700" : a.action === "delete" ? "bg-rose-100 text-rose-700" : "bg-blue-100 text-blue-700"}`}>
+                      {a.action === "create" ? "新建" : a.action === "delete" ? "删除" : "修改"}
+                    </span>
+                    {a.action === "update" && a.changes && (
+                      <span className="ml-1 text-slate-600">
+                        {Object.entries(a.changes).map(([k, v]: any) => `${k}: ${v?.from ?? "空"} → ${v?.to ?? "空"}`).join("；")}
+                      </span>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </FormSection>
+          )}
         </div>
         <div className="mt-4 flex justify-end gap-2">
           <Button variant="outline" onClick={onClose}>取消</Button>
-          <Button className="bg-emerald-600 hover:bg-emerald-700" disabled={save.isPending} onClick={submit}>保存</Button>
+          <Button className="bg-emerald-600 hover:bg-emerald-700" disabled={save.isPending} onClick={() => submit()}>保存</Button>
         </div>
       </DialogContent>
     </Dialog>
+    <RefundApprovalDialog
+      open={refundApprovalOpen}
+      onClose={() => setRefundApprovalOpen(false)}
+      info={{
+        landlordName: (landlords.data ?? []).find((l: any) => l.id === Number(f.landlordId))?.name ?? "",
+        brandName: (brands.data ?? []).find((b: any) => b.id === Number(f.brandId))?.name ?? "",
+        endDate: fmtDate(f.earlyEndDate || f.endDate),
+        rentRefund: Number(f.rentRefund) || 0,
+        deposit: Number(record?.deposit ?? 0),
+      }}
+      saving={save.isPending}
+      onConfirm={handleRefundApprovalConfirm}
+    />
+    </>
   );
 }
