@@ -62,12 +62,26 @@ def get_meter_by_no(meter_no: str):
         conn.close()
 
 
+def _check_meter_no_unique(cur, meter_no, exclude_id=None):
+    """电表编号唯一校验（DB 也有唯一约束，这里提前给出可读的错误信息）"""
+    if not meter_no:
+        return
+    if exclude_id is None:
+        cur.execute("SELECT meter_no FROM meters WHERE meter_no = %s", (meter_no,))
+    else:
+        cur.execute("SELECT meter_no FROM meters WHERE meter_no = %s AND id != %s", (meter_no, exclude_id))
+    row = cur.fetchone()
+    if row:
+        raise ValueError(f"电表编号 {meter_no} 已存在，不能重复使用")
+
+
 def create_meter(data: dict):
     conn = get_connection()
     cur = get_dict_cursor(conn)
     try:
         # v3：电表直挂 landlord/brand，不再经站点自动带 landlord（stationId 忽略）
         landlord_id = data.get("landlordId")
+        _check_meter_no_unique(cur, data.get("meterNo"))
 
         cur.execute("""
             INSERT INTO meters (brand_id, landlord_id, entity_id, meter_no, meter_name, collector_id, transformer_ratio, tag, remark)
@@ -119,6 +133,9 @@ def update_meter(meter_id: int, data: dict):
                 values.append(data[key])
         if not updates:
             return None
+        # 编号被修改时校验唯一（排除自身）
+        if "meterNo" in data and data["meterNo"]:
+            _check_meter_no_unique(cur, data["meterNo"], exclude_id=meter_id)
         values.append(meter_id)
         cur.execute(f"UPDATE meters SET {', '.join(updates)} WHERE id = %s RETURNING *", values)
         conn.commit()

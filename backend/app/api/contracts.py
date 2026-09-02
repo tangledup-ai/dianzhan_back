@@ -74,15 +74,19 @@ def _str(val) -> str | None:
     s = str(val).strip()
     return s if s else None
 
-def _get_or_create_landlord(name: str) -> int:
+def _get_or_create_landlord(name: str, contact: str = None) -> int:
     conn = get_connection()
     cur = get_dict_cursor(conn)
     try:
-        cur.execute("SELECT id FROM landlords WHERE name = %s", (name,))
+        cur.execute("SELECT id, contact FROM landlords WHERE name = %s", (name,))
         row = cur.fetchone()
         if row:
+            # 已存在的场地方：负责人为空时补填
+            if contact and not row.get("contact"):
+                cur.execute("UPDATE landlords SET contact = %s WHERE id = %s", (contact, row["id"]))
+                conn.commit()
             return row["id"]
-        cur.execute("INSERT INTO landlords (name) VALUES (%s) RETURNING id", (name,))
+        cur.execute("INSERT INTO landlords (name, contact) VALUES (%s, %s) RETURNING id", (name, contact))
         conn.commit()
         return cur.fetchone()["id"]
     finally:
@@ -166,7 +170,8 @@ def _get_or_create_entity(name: str) -> int:
 _IMPORT_COLS = {
     "ct_venue":          (0,  ["合同类型(场地)"]),
     "entity_name":       (None, ["公司收款主体", "公司主体"]),
-    "landlord_name":     (1,  ["场地方"]),
+    "landlord_name":     (3,  ["地址"]),
+    "venue_contact":     (1,  ["场地方"]),
     "region":            (2,  ["区域"]),
     "address":           (3,  ["地址"]),
     "rent_amount":       (4,  ["场地年租金(元)", "场地年租金"]),
@@ -223,6 +228,9 @@ async def import_contracts(request: Request, file: UploadFile = File(...)):
       场地合同：类型/公司收款主体/场地方/区域/地址/年租金/月租金(可空→年/12)/电费单价/付款方式/押金/提前天数/开始/结束[/备注]
       品牌合同：类型/品牌方/计费方式/单柜月租/柜数/品牌月租(可空)/品牌年租(可空)/电费收款单价/收款方式/押金/首月租金/退款/电费税率%/场地费税率%/开始/结束
     「公司收款主体」→ 公司主体（entities，不存在自动创建），写入场地与品牌合同的 entity_id。
+    场地合同：计费方式固定为「固定价格」，租金（年/月）以 Excel 为准。
+    品牌合同：场地方尚未关联电表 → 计费柜数、品牌年租金不导入；
+              品牌月租/电费收款单价/收款方式以 Excel 为准。
     品牌合同无"关联场地"列：按顺序关联前一行场地合同对应的场地方。
     """
     if not file.filename.endswith(('.xlsx', '.xls')):
@@ -271,7 +279,8 @@ async def import_contracts(request: Request, file: UploadFile = File(...)):
         try:
             ct_venue = _str(_cell(row, "ct_venue"))          # 合同类型(场地)
             entity_name = _str(_cell(row, "entity_name"))    # 公司收款主体 → 公司主体
-            landlord_name = _str(_cell(row, "landlord_name"))  # 场地方
+            landlord_name = _str(_cell(row, "landlord_name"))  # 「地址」列 = 场地方（场地本身）
+            venue_contact = _str(_cell(row, "venue_contact"))  # 「场地方」列 = 场地负责人 → 存入联系人
             region = _str(_cell(row, "region"))              # 区域
             address = _str(_cell(row, "address"))            # 地址
             rent_amount = _num(_cell(row, "rent_amount"))    # 场地年租金
@@ -325,11 +334,18 @@ async def import_contracts(request: Request, file: UploadFile = File(...)):
                 else:
                     landlord_id = _find_landlord_id(landlord_name)
                     if landlord_id is None:
-                        landlord_id = _get_or_create_landlord(landlord_name)
+                        landlord_id = _get_or_create_landlord(landlord_name, venue_contact)
                         results["created_landlords"].append(landlord_name)
+                    else:
+                        # 已存在的场地方：补填负责人
+                        _get_or_create_landlord(landlord_name, venue_contact)
 
                     current_landlord_id = landlord_id
                     current_landlord_name = landlord_name
+                    # 「场地方」列实为场地负责人 → 同步为该场地方的业主记录
+                    if venue_contact:
+                        from ..repositories.directory_repo import ensure_landlord_owner
+                        ensure_landlord_owner(landlord_id, venue_contact)
 
                     # 月租缺失 → 年租/12
                     if monthly_rent is None and rent_amount:
@@ -358,6 +374,8 @@ async def import_contracts(request: Request, file: UploadFile = File(...)):
                             "contractType": "场地合同",
                             "landlordId": landlord_id,
                             "entityId": entity_id,
+                            # 场地租金以 Excel 数值为准 → 计费方式固定为「固定价格」
+                            "rentCalcMethod": "固定价格",
                             "region": region,
                             "address": address,
                             "rentAmount": rent_amount,
@@ -391,18 +409,12 @@ async def import_contracts(request: Request, file: UploadFile = File(...)):
                 is_fixed = rent_calc_method and "固定" in rent_calc_method
                 rcm = "固定价格" if is_fixed else "按柜子数量"
 
-                # 品牌月租：按柜 → 单柜×柜数；固定租金 → Q 视为年租金/12
-                if brand_monthly_rent is None:
-                    if is_fixed:
-                        brand_monthly_rent = round((unit_monthly_rent or 0) / 12, 2) if unit_monthly_rent else None
-                    elif unit_monthly_rent and cabinets_count:
-                        brand_monthly_rent = round(unit_monthly_rent * cabinets_count, 2)
-                # 品牌年租：缺失 → 固定租金用 Q（年租金）；按柜 → 月租×12
-                if brand_rent_amount is None:
-                    if is_fixed:
-                        brand_rent_amount = unit_monthly_rent
-                    elif brand_monthly_rent:
-                        brand_rent_amount = round(brand_monthly_rent * 12, 2)
+                # 2026-09 新规：场地方尚未关联电表 → 计费柜数、品牌年租金不使用 Excel 值；
+                # 品牌月租 / 电费收款单价 / 收款方式 以 Excel 为准。
+                # 固定计费且月租缺失时，用单柜月租/12 推导（不再按柜数推算）
+                if brand_monthly_rent is None and is_fixed and unit_monthly_rent:
+                    brand_monthly_rent = round(unit_monthly_rent / 12, 2)
+                brand_rent_amount = None
 
                 pm = pay_method_brand or "月付"
 
@@ -438,9 +450,8 @@ async def import_contracts(request: Request, file: UploadFile = File(...)):
                     "entityId": entity_id,
                     "rentCalcMethod": rcm,
                     "unitMonthlyRent": unit_monthly_rent,
-                    "cabinetsCount": cabinets_count,
+                    # 计费柜数/年租金不导入（场地方未关联电表前无意义），电表关联后由实时口径接管
                     "monthlyRent": brand_monthly_rent,
-                    "rentAmount": brand_rent_amount,
                     "electricityPrice": brand_elec_price,
                     "payMethod": pm,
                     "deposit": deposit_brand,

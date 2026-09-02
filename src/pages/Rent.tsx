@@ -9,7 +9,7 @@ import { Field, TextInput, inputCls } from "@/components/fields";
 import { fmtMoney, fmtNum } from "@/lib/format";
 import { toCompact, toDisplay } from "@/lib/period";
 import { exportXlsxWithTitle } from "@/lib/export";
-import { Building2, Tag, ChevronDown, ChevronRight, Download, CalendarCheck, Clock, CheckCircle2, AlertCircle, Send, FileText } from "lucide-react";
+import { Building2, Tag, ChevronDown, ChevronRight, Download, CalendarCheck, Clock, CheckCircle2, AlertCircle, Send, FileText, Search } from "lucide-react";
 import { toast } from "sonner";
 
 // 场地费月台账（v2 重设计）：只含场地费（不含电费）
@@ -116,7 +116,8 @@ function YearlyTable({ yearlyRows, yearLabels }: { yearlyRows: any[]; yearLabels
                         <td className="px-2 py-1.5 whitespace-nowrap">{costStart ? `${costStart.slice(0, 10)} ~ ${costEnd ? costEnd.slice(0, 10) : ""}` : "—"}</td>
                         <td className="px-2 py-1.5">{years != null ? `${years}年` : "—"}</td>
                         <td className="px-2 py-1.5 text-right tabular-nums text-rose-600">
-                          {rentCostAnnual != null ? fmtMoney(rentCostAnnual) : "—"}
+                          {/* 付款信息（场地合同）：租金成本/年 = 场地合同年租金（固定金额，Excel 导入值） */}
+                          {(venue.annualRent ?? venue.rentAmount) != null ? fmtMoney(venue.annualRent ?? venue.rentAmount) : "—"}
                         </td>
                         <td className="px-2 py-1.5">{venue.payMethod || "—"}</td>
                         {yearLabels.map((yl) => {
@@ -607,6 +608,11 @@ export default function Rent() {
   const [endPeriod, setEndPeriod] = useState(CUR_MONTH);
   const [dim, setDim] = useState<"landlord" | "brand">("landlord");
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  // 整年场地收支模块：默认收起（点击标题展开），置于页面末尾
+  const [yearlyOpen, setYearlyOpen] = useState(false);
+  // 年度付款计划模块：默认收起（点击标题展开）+ 场地方/品牌模糊搜索
+  const [payOpen, setPayOpen] = useState(false);
+  const [payKeyword, setPayKeyword] = useState("");
 
   // 区间内月份列表（限制最多 36 个月）
   const monthRange = useMemo(() => {
@@ -657,6 +663,16 @@ export default function Rent() {
   // 整年场地收支（框外）：取第一个月的 yearlyRows（后端按该年全年合同构建）
   const yearlyRows: any[] = useMemo(() => (months[0]?.yearlyRows ?? []), [months]);
   const yearLabel = useMemo(() => (startPeriod || CUR_MONTH).slice(0, 4) + "年", [startPeriod]);
+
+  // 年度付款计划：按场地方名称 / 品牌方名称 模糊过滤
+  const filteredPayRows = useMemo(() => {
+    const kw = payKeyword.trim();
+    if (!kw) return yearlyRows;
+    return yearlyRows.filter((gy: any) =>
+      (gy.landlordName || "").includes(kw)
+      || (gy.brands ?? []).some((b: any) => (b.brandName || "").includes(kw))
+    );
+  }, [yearlyRows, payKeyword]);
 
   // 区间合计（总览）
   const totals = useMemo(() => {
@@ -726,7 +742,7 @@ export default function Rent() {
           venue.landlordContact || venue.landlordName || "",
           costStart ? `${String(costStart).slice(0, 10)} ~ ${costEnd ? String(costEnd).slice(0, 10) : ""}` : "",
           years != null ? `${years}年` : "",
-          rentCostAnnual != null ? Math.round(rentCostAnnual * 100) / 100 : "",
+          (venue.annualRent ?? venue.rentAmount) != null ? Math.round((venue.annualRent ?? venue.rentAmount) * 100) / 100 : "",
           venue.payMethod || "",
           payStatus,
           unitCostAnnual != null ? Math.round(unitCostAnnual * 100) / 100 : "",
@@ -805,38 +821,51 @@ export default function Rent() {
         <StatCard label="区间未收/未付" value={totals.pendingAmount} />
       </div>
 
-      {/* ── 整年场地收支（框外：按场地×品牌，整年口径） ── */}
+      {/* ── 年度付款计划（默认收起，可搜索场地方/品牌） ── */}
       {yearlyRows.length > 0 && (
-        <div>
-          <div className="mb-2 flex items-center gap-2">
-            <Building2 className="h-4 w-4 text-emerald-600" />
-            <h3 className="text-sm font-semibold text-slate-700">整年场地收支（{yearLabel}）</h3>
-            <span className="text-[11px] text-slate-400">付款信息=场地合同 · 收款信息=品牌方合同 · 按合同周期计算</span>
-          </div>
-          <YearlyTable yearlyRows={yearlyRows} yearLabels={yearLabels} />
-        </div>
-      )}
-
-      {/* ── 年度付款计划（底部模块：每个场地方一行） ── */}
-      {yearlyRows.length > 0 && (
-        <div>
-          <div className="mb-3 flex items-center gap-2.5">
+        <div className="rounded-xl border bg-white shadow-sm">
+          <button className="flex w-full items-center gap-2.5 px-4 py-3 text-left" onClick={() => setPayOpen((o) => !o)}>
+            {payOpen ? <ChevronDown className="h-4 w-4 text-indigo-600" /> : <ChevronRight className="h-4 w-4 text-indigo-600" />}
             <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-indigo-100 text-indigo-600">
               <CalendarCheck className="h-4 w-4" />
             </span>
             <h3 className="text-sm font-semibold text-slate-700">年度付款计划（{yearLabel}）</h3>
-            <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-medium text-slate-500">场地合同付款分期 · 提交审批 · 查看付款进度</span>
-          </div>
-          <div className="space-y-4">
-            {yearlyRows.map((gy: any) => (
-              <RentPaymentSchedule
-                key={gy.landlordId}
-                landlordId={gy.landlordId}
-                landlordName={gy.landlordName}
-                year={(startPeriod || CUR_MONTH).slice(0, 4)}
-              />
-            ))}
-          </div>
+            <span className="hidden rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-medium text-slate-500 md:inline">场地合同付款分期 · 提交审批 · 查看付款进度</span>
+            <span className="ml-auto text-[11px] text-slate-400">{payOpen ? "收起" : "展开"}</span>
+          </button>
+          {payOpen && (
+            <div className="border-t px-4 py-3">
+              <div className="mb-3 flex items-center gap-2">
+                <div className="relative">
+                  <Search className="absolute left-2 top-2 h-3.5 w-3.5 text-slate-400" />
+                  <input
+                    className={inputCls + " w-64 pl-7 text-xs"}
+                    placeholder="模糊搜索场地方 / 品牌方…"
+                    value={payKeyword}
+                    onChange={(e) => setPayKeyword(e.target.value)}
+                  />
+                </div>
+                <span className="text-[11px] text-slate-400">
+                  {filteredPayRows.length}/{yearlyRows.length} 个场地方
+                </span>
+              </div>
+              <div className="space-y-4">
+                {filteredPayRows.map((gy: any) => (
+                  <RentPaymentSchedule
+                    key={gy.landlordId}
+                    landlordId={gy.landlordId}
+                    landlordName={gy.landlordName}
+                    year={(startPeriod || CUR_MONTH).slice(0, 4)}
+                  />
+                ))}
+                {filteredPayRows.length === 0 && (
+                  <div className="rounded-md bg-slate-50 px-3 py-4 text-center text-xs text-slate-400">
+                    没有匹配「{payKeyword.trim()}」的场地方 / 品牌方
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
         </div>
       )}
 
@@ -942,6 +971,24 @@ export default function Rent() {
         口径：收入=品牌方合同月租（覆盖该月）；成本=场地合同月租；税费=启用租金税率的品牌方合同（含税月租−税后月租）；
         已收/未收 = 该月覆盖期次的分期状态（品牌方=已到账/未到账，场地=已付款/未付款）。不含电费。编辑合同请到「合同管理」页。
       </p>
+
+      {/* ── 整年场地收支（页面末尾，默认收起，点击展开） ── */}
+      {yearlyRows.length > 0 && (
+        <div className="rounded-xl border bg-white shadow-sm">
+          <button className="flex w-full items-center gap-2 px-4 py-3 text-left" onClick={() => setYearlyOpen((o) => !o)}>
+            {yearlyOpen ? <ChevronDown className="h-4 w-4 text-emerald-600" /> : <ChevronRight className="h-4 w-4 text-emerald-600" />}
+            <Building2 className="h-4 w-4 text-emerald-600" />
+            <h3 className="text-sm font-semibold text-slate-700">整年场地收支（{yearLabel}）</h3>
+            <span className="hidden text-[11px] text-slate-400 md:inline">付款信息=场地合同 · 收款信息=品牌方合同 · 按合同周期计算</span>
+            <span className="ml-auto text-[11px] text-slate-400">{yearlyOpen ? "收起" : "展开"}</span>
+          </button>
+          {yearlyOpen && (
+            <div className="border-t px-4 py-3">
+              <YearlyTable yearlyRows={yearlyRows} yearLabels={yearLabels} />
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }

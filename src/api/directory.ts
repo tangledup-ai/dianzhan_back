@@ -51,3 +51,13 @@ export const updateThirdPartyConfig = (id: number, data: any) => client.put(`/di
 export const deleteThirdPartyConfig = (id: number) => client.delete(`/directory/third-party-configs/${id}`).then(r => r.data);
 export const testThirdPartyConfig = (data: { baseUrl: string; authCode: string }) =>
   client.post("/directory/third-party-configs/test", data).then(r => r.data);
+
+// ─── 场地方多业主 ───
+export const addLandlordOwner = (landlordId: number, data: { ownerName: string; phone?: string; startDate?: string; remark?: string }) =>
+  client.post(`/directory/landlords/${landlordId}/owners`, data).then(r => r.data);
+
+export const updateLandlordOwner = (id: number, data: { ownerName: string; phone?: string; startDate?: string; remark?: string }) =>
+  client.put(`/directory/landlords/owners/${id}`, data).then(r => r.data);
+
+export const deleteLandlordOwner = (id: number) =>
+  client.delete(`/directory/landlords/owners/${id}`).then(r => r.data);

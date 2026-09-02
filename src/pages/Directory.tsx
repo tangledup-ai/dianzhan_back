@@ -1,9 +1,10 @@
-import { useState, useMemo } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useState, useMemo, useEffect, type ReactNode } from "react";
+import { useQuery, useQueryClient, useMutation } from "@tanstack/react-query";
 import {
   listBrands, createBrand, updateBrand, deleteBrand,
   listEntities, createEntity, updateEntity, deleteEntity,
   listLandlords, createLandlord, updateLandlord, deleteLandlord,
+  addLandlordOwner, updateLandlordOwner, deleteLandlordOwner,
   listShareholders, createShareholder, updateShareholder, deleteShareholder,
   listIntroducers, createIntroducer, updateIntroducer, deleteIntroducer,
   listPlatformUsers, createPlatformUser, updatePlatformUser, deletePlatformUser,
@@ -11,11 +12,12 @@ import {
   testThirdPartyConfig,
 } from "@/api/directory";
 import { Button } from "@/components/ui/button";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { inputCls } from "@/components/fields";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { exportXlsx } from "@/lib/export";
 import { getAlertConfig, saveAlertConfig } from "@/api/alerts";
-import { Plus, Pencil, Trash2, Check, X, Search, Download, PlugZap, AlertTriangle } from "lucide-react";
+import { Plus, Pencil, Trash2, Check, X, Search, Download, PlugZap, AlertTriangle, Users } from "lucide-react";
 import { toast } from "sonner";
 
 type RowDef = { key: string; label: string; placeholder?: string }[];
@@ -27,6 +29,7 @@ function CrudTable(props: {
   onCreate: (v: Record<string, string | null>) => Promise<any>;
   onUpdate: (id: number, v: Record<string, string | null>) => Promise<any>;
   onDelete: (id: number) => Promise<any>;
+  rowExtraAction?: (row: any) => ReactNode;
 }) {
   const queryClient = useQueryClient();
   const blank = Object.fromEntries(props.columns.map((c) => [c.key, ""]));
@@ -130,6 +133,7 @@ function CrudTable(props: {
                     </>
                   ) : (
                     <>
+                      {props.rowExtraAction?.(row)}
                       <button className="rounded p-1 text-slate-400 hover:text-emerald-600" onClick={() => startEdit(row)}><Pencil className="h-4 w-4" /></button>
                       <button className="rounded p-1 text-slate-400 hover:text-rose-500"
                         onClick={() => window.confirm("删除该档案？") && props.onDelete(row.id).then(() => { toast.success("已删除"); invalidate(); })}><Trash2 className="h-4 w-4" /></button>
@@ -630,6 +634,102 @@ function AlertSettingsTable() {
   );
 }
 
+// ─── 场地方·业主管理弹窗 ───
+function LandlordOwnersDialog({ open, onClose, landlord }: { open: boolean; onClose: () => void; landlord: any | null }) {
+  const qc = useQueryClient();
+  const invalidate = () => qc.invalidateQueries({ queryKey: ["landlords"] });
+  const blank = { ownerName: "", phone: "", startDate: "", remark: "" };
+  const [draft, setDraft] = useState(blank);
+  const [editId, setEditId] = useState<number | null>(null);
+  const [editDraft, setEditDraft] = useState(blank);
+
+  useEffect(() => {
+    if (open) { setDraft(blank); setEditId(null); }
+  }, [open, landlord?.id]);
+
+  // 最新的业主排最前（按起始日期，无日期按登记顺序）
+  const owners = (landlord?.owners ?? []).slice()
+    .sort((a: any, b: any) => (b.startDate || "").localeCompare(a.startDate || "") || b.id - a.id);
+
+  const add = useMutation({
+    mutationFn: () => addLandlordOwner(landlord.id, {
+      ownerName: draft.ownerName.trim(), phone: draft.phone.trim() || undefined,
+      startDate: draft.startDate || undefined, remark: draft.remark.trim() || undefined,
+    }),
+    onSuccess: () => { invalidate(); setDraft(blank); toast.success("业主已添加"); },
+    onError: (e: any) => toast.error(e.message),
+  });
+  const update = useMutation({
+    mutationFn: (o: any) => updateLandlordOwner(o.id, {
+      ownerName: (o.ownerName || "").trim(), phone: o.phone || undefined,
+      startDate: o.startDate || undefined, remark: (o.remark || "").trim() || undefined,
+    }),
+    onSuccess: () => { invalidate(); setEditId(null); toast.success("已保存"); },
+    onError: (e: any) => toast.error(e.message),
+  });
+  const del = useMutation({
+    mutationFn: (id: number) => deleteLandlordOwner(id),
+    onSuccess: () => { invalidate(); toast.success("已删除"); },
+    onError: (e: any) => toast.error(e.message),
+  });
+
+  return (
+    <Dialog open={open} onOpenChange={(o) => !o && onClose()}>
+      <DialogContent className="!max-w-2xl">
+        <DialogHeader><DialogTitle>业主管理 — {landlord?.name ?? ""}</DialogTitle></DialogHeader>
+        <div className="space-y-2">
+          <p className="text-xs text-slate-400">同一场地方可登记多位业主（含历史）；最新业主自动同步为「当前业主」。</p>
+          {owners.length === 0 && (
+            <div className="rounded-md bg-slate-50 px-3 py-2 text-xs text-slate-400">暂无业主记录</div>
+          )}
+          {owners.map((o: any, idx: number) => (
+            <div key={o.id} className="flex items-center gap-2 rounded-md border border-slate-100 bg-slate-50/60 px-2 py-1.5">
+              {editId === o.id ? (
+                <>
+                  <input className={inputCls + " flex-1"} value={editDraft.ownerName} placeholder="业主姓名"
+                    onChange={(e) => setEditDraft((p) => ({ ...p, ownerName: e.target.value }))} />
+                  <input className={inputCls + " w-28"} value={editDraft.phone} placeholder="电话"
+                    onChange={(e) => setEditDraft((p) => ({ ...p, phone: e.target.value }))} />
+                  <input type="date" className={inputCls + " w-36"} value={editDraft.startDate}
+                    onChange={(e) => setEditDraft((p) => ({ ...p, startDate: e.target.value }))} />
+                  <button className="rounded p-1 text-emerald-600 hover:bg-emerald-50" onClick={() => update.mutate(editDraft)}><Check className="h-4 w-4" /></button>
+                  <button className="rounded p-1 text-slate-400 hover:bg-slate-100" onClick={() => setEditId(null)}><X className="h-4 w-4" /></button>
+                </>
+              ) : (
+                <>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-1.5">
+                      <span className="font-medium text-slate-700">{o.ownerName}</span>
+                      {idx === 0 && <span className="rounded bg-emerald-100 px-1 text-[10px] text-emerald-700">当前业主</span>}
+                      {o.phone && <span className="text-xs text-slate-500">{o.phone}</span>}
+                      {o.startDate && <span className="text-xs text-slate-400">自 {o.startDate} 起</span>}
+                    </div>
+                    {o.remark && <div className="text-[11px] text-slate-400">{o.remark}</div>}
+                  </div>
+                  <button className="rounded p-1 text-slate-400 hover:text-emerald-600"
+                    onClick={() => { setEditId(o.id); setEditDraft({ ownerName: o.ownerName, phone: o.phone ?? "", startDate: o.startDate ?? "", remark: o.remark ?? "" }); }}><Pencil className="h-4 w-4" /></button>
+                  <button className="rounded p-1 text-slate-400 hover:text-rose-500"
+                    onClick={() => window.confirm(`删除业主「${o.ownerName}」？`) && del.mutate(o.id)}><Trash2 className="h-4 w-4" /></button>
+                </>
+              )}
+            </div>
+          ))}
+          <div className="flex items-center gap-2 rounded-md border border-dashed px-2 py-1.5">
+            <input className={inputCls + " min-w-0 flex-1"} placeholder="新增业主姓名" value={draft.ownerName}
+              onChange={(e) => setDraft((p) => ({ ...p, ownerName: e.target.value }))} />
+            <input className={inputCls + " w-28"} placeholder="电话" value={draft.phone}
+              onChange={(e) => setDraft((p) => ({ ...p, phone: e.target.value }))} />
+            <input type="date" className={inputCls + " w-36"} value={draft.startDate}
+              onChange={(e) => setDraft((p) => ({ ...p, startDate: e.target.value }))} />
+            <Button size="sm" className="bg-emerald-600 hover:bg-emerald-700" disabled={!draft.ownerName.trim() || add.isPending}
+              onClick={() => add.mutate()}><Plus className="mr-1 h-3.5 w-3.5" />添加</Button>
+          </div>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 export default function Directory() {
   const brands = useQuery({ queryKey: ["brands"], queryFn: listBrands });
   const entities = useQuery({ queryKey: ["entities"], queryFn: listEntities });
@@ -637,6 +737,7 @@ export default function Directory() {
   const shareholders = useQuery({ queryKey: ["shareholders"], queryFn: listShareholders });
   const introducers = useQuery({ queryKey: ["introducers"], queryFn: listIntroducers });
   const thirdPartyConfigs = useQuery({ queryKey: ["thirdPartyConfigs"], queryFn: listThirdPartyConfigs });
+  const [ownersFor, setOwnersFor] = useState<any | null>(null);
 
   return (
     <Tabs defaultValue="brands">
@@ -663,8 +764,17 @@ export default function Directory() {
         </TabsContent>
         <TabsContent value="landlords">
           <CrudTable title="场地方 / 业主档案" rows={landlords.data}
-            columns={[{ key: "name", label: "名称" }, { key: "contact", label: "联系人" }, { key: "phone", label: "电话" }, { key: "remark", label: "备注" }]}
-            onCreate={createLandlord} onUpdate={(id, v) => updateLandlord(id, v)} onDelete={deleteLandlord} />
+            columns={[{ key: "name", label: "名称" }, { key: "contact", label: "当前业主" }, { key: "phone", label: "电话" }, { key: "remark", label: "备注" }]}
+            onCreate={createLandlord} onUpdate={(id, v) => updateLandlord(id, v)} onDelete={deleteLandlord}
+            rowExtraAction={(row: any) => (
+              <button className="rounded p-1 text-slate-400 hover:text-sky-600" title="管理业主"
+                onClick={() => setOwnersFor(row)}><Users className="h-4 w-4" /></button>
+            )} />
+          <LandlordOwnersDialog
+            open={!!ownersFor}
+            onClose={() => setOwnersFor(null)}
+            landlord={ownersFor ? (landlords.data ?? []).find((l: any) => l.id === ownersFor.id) ?? null : null}
+          />
         </TabsContent>
         <TabsContent value="shareholders">
           <CrudTable title="股东档案" rows={shareholders.data}

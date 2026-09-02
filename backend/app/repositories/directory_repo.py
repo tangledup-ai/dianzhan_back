@@ -178,7 +178,113 @@ def list_landlords():
             LEFT JOIN landlord_site_summary s ON s.landlord_id = l.id
             ORDER BY l.id
         """)
-        return cur.fetchall()
+        rows = cur.fetchall()
+
+        # 多业主子表：按场地方聚合（最新的在前）
+        cur.execute("""
+            SELECT * FROM landlord_owners
+            ORDER BY landlord_id, start_date DESC NULLS LAST, id DESC
+        """)
+        owners_by_landlord = {}
+        for o in cur.fetchall():
+            owners_by_landlord.setdefault(o["landlord_id"], []).append(o)
+        for r in rows:
+            r["owners"] = owners_by_landlord.get(r["id"], [])
+        return rows
+    finally:
+        cur.close()
+        conn.close()
+
+
+def _sync_current_owner(cur, landlord_id: int):
+    """把 landlord_owners 最新一条业主同步到 landlords.contact（当前业主冗余）"""
+    cur.execute("""
+        SELECT owner_name FROM landlord_owners
+        WHERE landlord_id = %s
+        ORDER BY start_date DESC NULLS LAST, id DESC
+        LIMIT 1
+    """, (landlord_id,))
+    row = cur.fetchone()
+    cur.execute("UPDATE landlords SET contact = %s WHERE id = %s",
+                (row["owner_name"] if row else None, landlord_id))
+
+
+def add_landlord_owner(landlord_id: int, owner_name: str, phone: str = None,
+                       start_date=None, remark: str = None):
+    conn = get_connection()
+    cur = get_dict_cursor(conn)
+    try:
+        cur.execute("""
+            INSERT INTO landlord_owners (landlord_id, owner_name, phone, start_date, remark)
+            VALUES (%s, %s, %s, %s, %s) RETURNING *
+        """, (landlord_id, owner_name, phone, start_date, remark))
+        owner = cur.fetchone()
+        _sync_current_owner(cur, landlord_id)
+        conn.commit()
+        return owner
+    finally:
+        cur.close()
+        conn.close()
+
+
+def update_landlord_owner(owner_id: int, owner_name: str, phone: str = None,
+                          start_date=None, remark: str = None):
+    conn = get_connection()
+    cur = get_dict_cursor(conn)
+    try:
+        cur.execute("""
+            UPDATE landlord_owners
+            SET owner_name = %s, phone = %s, start_date = %s, remark = %s
+            WHERE id = %s RETURNING *
+        """, (owner_name, phone, start_date, remark, owner_id))
+        owner = cur.fetchone()
+        if owner:
+            _sync_current_owner(cur, owner["landlord_id"])
+        conn.commit()
+        return owner
+    finally:
+        cur.close()
+        conn.close()
+
+
+def delete_landlord_owner(owner_id: int):
+    conn = get_connection()
+    cur = get_dict_cursor(conn)
+    try:
+        cur.execute("SELECT landlord_id FROM landlord_owners WHERE id = %s", (owner_id,))
+        row = cur.fetchone()
+        if not row:
+            return False
+        cur.execute("DELETE FROM landlord_owners WHERE id = %s", (owner_id,))
+        _sync_current_owner(cur, row["landlord_id"])
+        conn.commit()
+        return True
+    finally:
+        cur.close()
+        conn.close()
+
+
+def ensure_landlord_owner(landlord_id: int, owner_name: str, phone: str = None):
+    """幂等：场地方下不存在同名业主时补一条（合同 Excel 导入用）"""
+    if not owner_name:
+        return None
+    conn = get_connection()
+    cur = get_dict_cursor(conn)
+    try:
+        cur.execute("""
+            SELECT id FROM landlord_owners WHERE landlord_id = %s AND owner_name = %s
+        """, (landlord_id, owner_name))
+        row = cur.fetchone()
+        if row:
+            return row["id"]
+        cur.execute("""
+            INSERT INTO landlord_owners (landlord_id, owner_name, phone)
+            VALUES (%s, %s, %s) RETURNING *
+        """, (landlord_id, owner_name, phone))
+        owner = cur.fetchone()
+        _sync_current_owner(cur, landlord_id)
+        conn.commit()
+        return owner
     finally:
         cur.close()
         conn.close()
@@ -194,8 +300,15 @@ def create_landlord(name: str, contact: str = None, phone: str = None, remark: s
             "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING *",
             (name, contact, phone, region, address, latitude, longitude, remark)
         )
+        row = cur.fetchone()
+        # 初始业主：联系人非空时登记为首任业主
+        if contact:
+            cur.execute(
+                "INSERT INTO landlord_owners (landlord_id, owner_name, phone) VALUES (%s, %s, %s)",
+                (row["id"], contact, phone)
+            )
         conn.commit()
-        return cur.fetchone()
+        return row
     finally:
         cur.close()
         conn.close()
@@ -229,6 +342,17 @@ def update_landlord(landlord_id: int, name: str = None, contact: str = None, pho
         cur.execute(f"UPDATE landlords SET {', '.join(updates)} WHERE id = %s RETURNING *", values)
         updated = cur.fetchone()
         # v3：contracts.station_name 冗余快照列已删除，landlord 改名无需同步
+        # 直接编辑「当前业主」（联系人）→ 同步改名最新的业主记录，保持业主表为唯一出处
+        if contact is not None:
+            cur.execute("""
+                SELECT id FROM landlord_owners
+                WHERE landlord_id = %s
+                ORDER BY start_date DESC NULLS LAST, id DESC
+                LIMIT 1
+            """, (landlord_id,))
+            latest = cur.fetchone()
+            if latest:
+                cur.execute("UPDATE landlord_owners SET owner_name = %s WHERE id = %s", (contact, latest["id"]))
         conn.commit()
         return updated
     finally:

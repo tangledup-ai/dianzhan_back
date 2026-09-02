@@ -547,6 +547,8 @@ function MeterForm({ open, onClose, record }: { open: boolean; onClose: () => vo
   const landlords = useQuery({ queryKey: ["landlords"], queryFn: listLandlords, enabled: open });
   const brands = useQuery({ queryKey: ["brands"], queryFn: listBrands, enabled: open });
   const entities = useQuery({ queryKey: ["entities"], queryFn: listEntities, enabled: open });
+  // 编号唯一校验用（与列表页共用缓存，不额外发请求）
+  const meters = useQuery({ queryKey: ["meters"], queryFn: () => listMeters(), enabled: open });
 
   useEffect(() => {
     if (!open) return;
@@ -586,16 +588,24 @@ function MeterForm({ open, onClose, record }: { open: boolean; onClose: () => vo
       }).catch(() => {});
       onClose();
     },
-    onError: (e: any) => toast.error(e.message),
+    onError: (e: any) => toast.error(e?.response?.data?.detail || e.message),
   });
 
   const submit = () => {
-    if (!f.meterNo.trim()) { toast.error("请填写电表编号"); return; }
+    const meterNo = f.meterNo.trim();
+    if (!meterNo) { toast.error("请填写电表编号"); return; }
+    // 编号唯一校验：已存在同号电表（编辑时排除自身）则不允许保存
+    const dup = (meters.data ?? []).find((m: any) => m.meterNo === meterNo && m.id !== record?.id);
+    if (dup) {
+      const where = [dup.landlordName, dup.brandName].filter(Boolean).join(" · ") || "未关联场地";
+      toast.error(`电表编号 ${meterNo} 已存在（${where}），不能重复使用`);
+      return;
+    }
     save.mutate({
       brandId: !isShared && f.brandId ? Number(f.brandId) : null,
       landlordId: f.landlordId ? Number(f.landlordId) : null,
       entityId: f.entityId ? Number(f.entityId) : null,
-      meterNo: f.meterNo.trim(),
+      meterNo: meterNo,
       meterName: f.meterName.trim() || null,
       collectorId: f.collectorId.trim() || null,
       transformerRatio: f.transformerRatio ? Number(f.transformerRatio) : 1,

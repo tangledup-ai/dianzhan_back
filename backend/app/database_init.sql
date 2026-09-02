@@ -52,6 +52,19 @@ CREATE TABLE IF NOT EXISTS landlords (
 );
 COMMENT ON TABLE landlords IS '场地方（业主，主链聚合根：公共属性唯一出处，站点/合同/电表经 landlord_id 挂回）';
 
+CREATE TABLE IF NOT EXISTS landlord_owners (
+    id SERIAL PRIMARY KEY,
+    landlord_id INTEGER NOT NULL REFERENCES landlords(id) ON DELETE CASCADE,
+    owner_name VARCHAR(100) NOT NULL,
+    phone VARCHAR(50),
+    start_date DATE,
+    remark TEXT,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_landlord_owners_landlord ON landlord_owners (landlord_id);
+COMMENT ON TABLE landlord_owners IS '场地方的多业主子表：一个场地可有多任/多位业主；landlords.contact 冗余存最新业主';
+COMMENT ON COLUMN landlords.contact IS '当前业主（冗余，自动同步 landlord_owners 最新一条）';
+
 CREATE TABLE IF NOT EXISTS shareholders (
     id SERIAL PRIMARY KEY,
     name VARCHAR(100) NOT NULL,

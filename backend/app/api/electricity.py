@@ -526,6 +526,22 @@ async def generate_electricity(data: dict):
                     ))
                 created.append(record_id)
 
+        # 5. 清理「分组已消失」的自动台账：电表归属变更（品牌 ↔ 共享互转、改场地）或合同变化后，
+        #    旧分组不再出现在当前 groups 中，残留记录会导致台账重复计表。
+        #    不变式：生成后，data_source='auto' 的台账 ⊆ 当前分组 —— 自动记录分组不在当前分组即删；
+        #    手工建的台账（data_source='manual'）是用户录入的财务数据，保留不删。
+        cur.execute("""
+            SELECT id, landlord_id, brand_id FROM electricity_records
+            WHERE period = %s AND COALESCE(data_source, 'auto') = 'auto'
+        """, (period,))
+        deleted = []
+        for r in cur.fetchall():
+            if (r["landlord_id"], r["brand_id"]) in groups:
+                continue
+            cur.execute("DELETE FROM electricity_meter_details WHERE electricity_id = %s", (r["id"],))
+            cur.execute("DELETE FROM electricity_records WHERE id = %s", (r["id"],))
+            deleted.append(r["id"])
+
         conn.commit()
 
         # 分红联动：台账生成/更新后，重算涉及场地该月的分红记录（失败不影响台账生成）
@@ -539,8 +555,9 @@ async def generate_electricity(data: dict):
         return {
             "created": len(created),
             "updated": len(updated),
+            "deleted": len(deleted),
             "period": period,
-            "detail": f"新增 {len(created)} 条，更新 {len(updated)} 条"
+            "detail": f"新增 {len(created)} 条，更新 {len(updated)} 条" + (f"，清理残留 {len(deleted)} 条" if deleted else "")
         }
     finally:
         cur.close()

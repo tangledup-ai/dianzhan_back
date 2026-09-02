@@ -108,6 +108,41 @@ async def delete_landlord(landlord_id: int):
     return {"ok": True}
 
 
+@router.post("/landlords/{landlord_id}/owners", status_code=201)
+async def add_landlord_owner(landlord_id: int, data: dict):
+    result = directory_repo.add_landlord_owner(
+        landlord_id,
+        owner_name=data.get("ownerName", ""),
+        phone=data.get("phone"),
+        start_date=data.get("startDate"),
+        remark=data.get("remark"),
+    )
+    if not result:
+        raise HTTPException(404, "场地方不存在")
+    return result
+
+
+@router.put("/landlords/owners/{owner_id}")
+async def update_landlord_owner(owner_id: int, data: dict):
+    result = directory_repo.update_landlord_owner(
+        owner_id,
+        owner_name=data.get("ownerName", ""),
+        phone=data.get("phone"),
+        start_date=data.get("startDate"),
+        remark=data.get("remark"),
+    )
+    if not result:
+        raise HTTPException(404, "业主记录不存在")
+    return result
+
+
+@router.delete("/landlords/owners/{owner_id}")
+async def delete_landlord_owner(owner_id: int):
+    if not directory_repo.delete_landlord_owner(owner_id):
+        raise HTTPException(404, "业主记录不存在")
+    return {"ok": True}
+
+
 # ─── 股东 ───────────────────────────────────────────────────
 
 @router.get("/shareholders")

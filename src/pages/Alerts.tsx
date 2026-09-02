@@ -188,6 +188,9 @@ export default function Alerts() {
   const [tab, setTab] = useState<"elec" | "contract">("elec");
   const [granularity, setGranularity] = useState<"daily" | "monthly">("monthly");
   const [days, setDays] = useState(3);
+  // 合同预警两个板块的展开/收起（默认收起，点击小标题切换）
+  const [payOpen, setPayOpen] = useState(false);
+  const [incOpen, setIncOpen] = useState(false);
   const q = useQuery({
     queryKey: ["alerts", granularity, days],
     queryFn: () => getAlerts({ granularity, days }),
@@ -283,20 +286,32 @@ export default function Alerts() {
             点合同展开可核对每期应收/付明细（区间、金额、状态、实付日期、发票号）。提前天数与电量阈值在「基础档案 → 预警设置」中调整。
           </div>
           <div>
-            <div className="mb-2 flex items-center gap-2">
+            <div
+              className="mb-2 -mx-2 flex cursor-pointer select-none items-center gap-2 rounded-lg px-2 py-1.5 hover:bg-slate-100/70"
+              onClick={() => setPayOpen((o) => !o)}
+              title={payOpen ? "点击收起" : "点击展开"}
+            >
+              {payOpen ? <ChevronDown className="h-4 w-4 text-slate-400" /> : <ChevronRight className="h-4 w-4 text-slate-400" />}
               <ArrowDownCircle className="h-4 w-4 text-rose-500" />
               <h3 className="text-sm font-semibold text-slate-700">场地合同 · 应付预警</h3>
               <span className="text-[11px] text-slate-400">公司 → 场地方</span>
+              <span className="ml-auto text-[11px] text-slate-400">{pay.length} 份</span>
             </div>
-            <ContractAlertCard items={pay} side="pay" />
+            {payOpen && <ContractAlertCard items={pay} side="pay" />}
           </div>
           <div>
-            <div className="mb-2 flex items-center gap-2">
+            <div
+              className="mb-2 -mx-2 flex cursor-pointer select-none items-center gap-2 rounded-lg px-2 py-1.5 hover:bg-slate-100/70"
+              onClick={() => setIncOpen((o) => !o)}
+              title={incOpen ? "点击收起" : "点击展开"}
+            >
+              {incOpen ? <ChevronDown className="h-4 w-4 text-slate-400" /> : <ChevronRight className="h-4 w-4 text-slate-400" />}
               <ArrowUpCircle className="h-4 w-4 text-emerald-500" />
               <h3 className="text-sm font-semibold text-slate-700">品牌方合同 · 应收预警</h3>
               <span className="text-[11px] text-slate-400">品牌方 → 公司</span>
+              <span className="ml-auto text-[11px] text-slate-400">{inc.length} 份</span>
             </div>
-            <ContractAlertCard items={inc} side="income" />
+            {incOpen && <ContractAlertCard items={inc} side="income" />}
           </div>
         </div>
       )}
