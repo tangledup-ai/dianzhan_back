@@ -184,7 +184,16 @@ export default function Dashboard() {
         <StatCard label="运营费用（元）" value={fmtMoney(data.opExpenseTotal)} icon={Wallet} />
         <StatCard label="待收款项（元）" value={fmtMoney(data.elecUncollected + data.rentUncollected)} sub={`电费 ${fmtMoney(data.elecUncollected)} · 租金 ${fmtMoney(data.rentUncollected)}`} icon={Clock} tone="amber" />
         <StatCard label="待付款项（元）" value={fmtMoney(data.elecUnpaid)} icon={Wallet} tone="red" />
-        <StatCard label="合同预警" value={`${data.expiringContracts + data.expiredContracts}`} sub={`临期 ${data.expiringContracts} · 已到期 ${data.expiredContracts}`} icon={FileWarning} tone="red" />
+        {/* 与「异常预警 → 合同预警」同口径；点击直达该页 */}
+        <Link to="/alerts?tab=contract" className="block rounded-xl transition-transform hover:scale-[1.02]">
+          <StatCard
+            label="合同预警"
+            value={`${data.expiredContracts + data.expiringContracts + (data.overdueContracts ?? 0)}`}
+            sub={`已到期 ${data.expiredContracts} · 临期 ${data.expiringContracts} · 逾期分期 ${data.overdueContracts ?? 0}`}
+            icon={FileWarning}
+            tone="red"
+          />
+        </Link>
       </div>
 
       {/* 维度看板入口 */}

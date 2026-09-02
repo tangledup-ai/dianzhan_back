@@ -255,7 +255,7 @@ def _get_contract_alerts(cur, contract_type: str, expire_days: int, side: str):
 
     cur.execute(f"""
         SELECT
-            c.id, c.contract_type, c.partner,
+            c.id, c.contract_type, c.partner, c.landlord_id,
             c.monthly_rent, c.rent_amount, c.pay_method,
             c.start_date, c.end_date, COALESCE(c.early_end_date, c.end_date) AS effective_end,
             COALESCE(l.name, '') AS landlord_name,
@@ -292,6 +292,7 @@ def _get_contract_alerts(cur, contract_type: str, expire_days: int, side: str):
 
             contracts[cid] = {
                 "contractId": cid,
+                "landlordId": r.get("landlord_id"),
                 "contractType": r.get("contract_type") or contract_type,
                 "landlordName": r.get("landlord_name") or "",
                 "brandName": r.get("brand_name") or "",

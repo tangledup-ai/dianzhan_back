@@ -189,21 +189,26 @@ async def overview(request: Request):
             """)
         div_stats = cur.fetchone()
 
-        # 合同统计
-        today = date.today()
+        # 合同统计（口径与「异常预警 → 合同预警」页一致：到期日=COALESCE(early_end_date,end_date)、
+        # 临期窗口读预警配置、含逾期未收/付分期；区别于旧的 end_date + 固定90天简化统计）
+        from .alerts import _get_config, _get_contract_alerts
+        cfg = _get_config(cur)
+        contract_alerts = (
+            _get_contract_alerts(cur, "场地合同", cfg["expireDaysVenue"], "pay")
+            + _get_contract_alerts(cur, "品牌方合同", cfg["expireDaysBrand"], "income")
+        )
+        if allowed is not None:
+            allowed_set = set(allowed)
+            contract_alerts = [c for c in contract_alerts if c.get("landlordId") in allowed_set]
+        expired = sum(1 for c in contract_alerts if c["status"] == "已到期")
+        expiring = sum(1 for c in contract_alerts if c["status"] == "临期")
+        overdue_only = sum(1 for c in contract_alerts if c["status"] not in ("已到期", "临期"))
         if allowed is not None:
             cur.execute("SELECT COUNT(*) as total FROM contracts WHERE landlord_id = ANY(%s::int[])", (allowed,))
             contract_total = cur.fetchone()["total"]
-            cur.execute("SELECT COUNT(*) as total FROM contracts WHERE landlord_id = ANY(%s::int[]) AND end_date IS NOT NULL AND end_date < %s", (allowed, today))
-            expired = cur.fetchone()["total"]
-            cur.execute("SELECT COUNT(*) as total FROM contracts WHERE landlord_id = ANY(%s::int[]) AND end_date IS NOT NULL AND end_date >= %s AND end_date <= %s + INTERVAL '90 days'", (allowed, today, today))
         else:
             cur.execute("SELECT COUNT(*) as total FROM contracts")
             contract_total = cur.fetchone()["total"]
-            cur.execute("SELECT COUNT(*) as total FROM contracts WHERE end_date IS NOT NULL AND end_date < %s", (today,))
-            expired = cur.fetchone()["total"]
-            cur.execute("SELECT COUNT(*) as total FROM contracts WHERE end_date IS NOT NULL AND end_date >= %s AND end_date <= %s + INTERVAL '90 days'", (today, today))
-        expiring = cur.fetchone()["total"]
 
         # 审批统计（v3：审批单挂 landlord_id）
         if allowed is not None:
@@ -391,6 +396,7 @@ async def overview(request: Request):
             "contractCount": contract_total,
             "expiringContracts": expiring,
             "expiredContracts": expired,
+            "overdueContracts": overdue_only,
             "pendingApprovals": pending_approvals,
             "totalKwh": float(total_kwh),
             "monthly": [{

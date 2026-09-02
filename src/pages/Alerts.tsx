@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { getAlerts } from "@/api/alerts";
 import { StatusBadge } from "@/components/Stat";
@@ -188,6 +188,14 @@ export default function Alerts() {
   const [tab, setTab] = useState<"elec" | "contract">("elec");
   const [granularity, setGranularity] = useState<"daily" | "monthly">("monthly");
   const [days, setDays] = useState(3);
+
+  // 支持从其他页面跳转直达：/alerts?tab=contract（用完即清除参数）
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const t = params.get("tab");
+    if (t === "contract" || t === "elec") setTab(t);
+    if (t) window.history.replaceState({}, "", window.location.pathname);
+  }, []);
   // 合同预警两个板块的展开/收起（默认收起，点击小标题切换）
   const [payOpen, setPayOpen] = useState(false);
   const [incOpen, setIncOpen] = useState(false);
