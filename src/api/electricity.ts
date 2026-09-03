@@ -29,3 +29,7 @@ export const getElectricityMonthlyLedger = (period: string, dim: "landlord" | "b
 // 电费收付明细导出（参考 Excel 格式：每电表一行）
 export const exportElectricityLedger = (period: string, dim: "landlord" | "brand" = "landlord") =>
   client.get("/electricity/export", { params: { period, dim } }).then(r => r.data);
+
+// 单块电表的抄表核对详情（上月/本月抄表读数与日期、区间度数、台账费用）
+export const getReadingDetail = (meterNo: string, period: string) =>
+  client.get("/electricity/reading-detail", { params: { meterNo, period } }).then(r => r.data);

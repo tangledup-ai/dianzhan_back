@@ -1,13 +1,15 @@
-import { Fragment, useMemo, useState } from "react";
+import { Fragment, useMemo, useState, useEffect } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { getElectricityMonthlyLedger, exportElectricityLedger } from "@/api/electricity";
+import { getElectricityMonthlyLedger, exportElectricityLedger, getReadingDetail } from "@/api/electricity";
+import { listLandlords } from "@/api/directory";
 import { submitStationApproval } from "@/api/approvals";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Field, TextInput, inputCls } from "@/components/fields";
 import { fmtMoney, fmtNum } from "@/lib/format";
 import { toCompact, toDisplay } from "@/lib/period";
-import { Building2, Tag, ChevronDown, ChevronRight, Download, Send, FileText } from "lucide-react";
+import { Building2, Tag, ChevronDown, ChevronRight, Download, Send, FileText, Landmark } from "lucide-react";
+import { groupByEntity, GROUP_COLOR_NEUTRAL } from "@/lib/groupColors";
 import * as XLSX from "xlsx";
 import { toast } from "sonner";
 
@@ -22,6 +24,123 @@ function StatCard({ label, value, suffix = "", tone = "slate" }: { label: string
       <div className="text-[11px] text-slate-400">{label}</div>
       <div className={`text-lg font-bold tabular-nums ${color}`}>{suffix === "kwh" ? fmtNum(value ?? 0) : fmtMoney(value ?? 0)}</div>
     </div>
+  );
+}
+
+// ─── 抄表核对详情弹窗（发给场地方/品牌方老板核对）───
+function ReadingDetailDialog({ target, onClose }: { target: { meterNo: string; period: string } | null; onClose: () => void }) {
+  const q = useQuery({
+    queryKey: ["reading-detail", target?.meterNo, target?.period],
+    queryFn: () => getReadingDetail(target!.meterNo, target!.period),
+    enabled: !!target,
+  });
+  const mtr = (q.data?.meter ?? {}) as any;
+  const rd = (q.data?.reading ?? {}) as any;
+  const lg = (q.data?.ledger ?? null) as any;
+  const prev = q.data?.prevMonth ?? null;
+  const ratio = Number(mtr.transformerRatio ?? 1);
+
+  const copyText = async () => {
+    const usage = Number(lg?.ledgerKwh ?? (Number(rd.kwh ?? 0) * ratio));
+    const lines = [
+      `【电费抄表核对】${mtr.landlordName ?? ""}（${mtr.brandName || "全品牌共享"}）`,
+      `电表：${mtr.meterNo ?? target?.meterNo}${mtr.meterName ? `（${mtr.meterName}）` : ""}`,
+      `上月抄表：${rd.prevReadingDate ?? "—"}　表盘读数 ${rd.prevReading ?? "—"}`,
+      `本月抄表：${rd.currReadingDate ?? "—"}　表盘读数 ${rd.currReading ?? "—"}`,
+      `区间度数：${rd.kwh ?? "—"} × 倍数 ${ratio} = 计费用量 ${usage.toFixed(2)} 度`,
+      `应付电费（付场地方）：${fmtMoney(Number(lg?.payAmount ?? 0))} 元（单价 ${fmtMoney(Number(lg?.payUnitPrice ?? 0))} 元/度）`,
+      `应收电费（品牌方支付）：${fmtMoney(Number(lg?.collectAmount ?? 0))} 元（单价 ${fmtMoney(Number(lg?.collectUnitPrice ?? 0))} 元/度，不含税 ${fmtMoney(Number(lg?.collectNet ?? 0))}）`,
+    ].filter(Boolean).join("\n");
+    try {
+      await navigator.clipboard.writeText(lines);
+      toast.success("已复制，可直接发给场地方/品牌方核对");
+    } catch {
+      const ta = document.createElement("textarea");
+      ta.value = lines;
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      document.body.removeChild(ta);
+      toast.success("已复制，可直接发给场地方/品牌方核对");
+    }
+  };
+
+  return (
+    <Dialog open={!!target} onOpenChange={(o) => !o && onClose()}>
+      <DialogContent className="!max-w-xl">
+        <DialogHeader>
+          <DialogTitle>抄表核对详情 — {mtr.meterName || target?.meterNo || ""}</DialogTitle>
+        </DialogHeader>
+        {q.isLoading ? (
+          <div className="py-6 text-center text-xs text-slate-400">加载中…</div>
+        ) : q.data ? (
+          <div className="space-y-3 text-xs">
+            <div className="grid grid-cols-2 gap-2 rounded-md bg-slate-50 px-3 py-2 text-slate-600">
+              <div>场地方：{mtr.landlordName ?? "—"}</div>
+              <div>品牌方：{mtr.brandName || "全品牌共享"}</div>
+              <div>电表编号：{mtr.meterNo}</div>
+              <div>倍数：{ratio}</div>
+            </div>
+            <table className="w-full rounded-md border text-xs">
+              <thead>
+                <tr className="bg-slate-50 text-left text-slate-500">
+                  <th className="px-2 py-1.5 font-medium">项目</th>
+                  <th className="px-2 py-1.5 font-medium">抄表日期</th>
+                  <th className="px-2 py-1.5 text-right font-medium">表盘读数</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr className="border-t">
+                  <td className="px-2 py-1.5">上月抄表</td>
+                  <td className="px-2 py-1.5">{rd.prevReadingDate ?? "—"}</td>
+                  <td className="px-2 py-1.5 text-right tabular-nums">{rd.prevReading ?? "—"}</td>
+                </tr>
+                <tr className="border-t">
+                  <td className="px-2 py-1.5">本月抄表</td>
+                  <td className="px-2 py-1.5">{rd.currReadingDate ?? "—"}</td>
+                  <td className="px-2 py-1.5 text-right tabular-nums">{rd.currReading ?? "—"}</td>
+                </tr>
+              </tbody>
+            </table>
+            <div className="grid grid-cols-2 gap-2">
+              <div className="rounded-md border border-slate-200 px-3 py-2">
+                <div className="text-[10px] text-slate-400">区间度数（表盘差）</div>
+                <div className="text-sm font-semibold tabular-nums text-slate-700">{fmtNum(rd.kwh)} 度</div>
+              </div>
+              <div className="rounded-md border border-slate-200 px-3 py-2">
+                <div className="text-[10px] text-slate-400">计费用量（×倍数）</div>
+                <div className="text-sm font-semibold tabular-nums text-slate-700">
+                  {fmtNum(lg?.ledgerKwh ?? (Number(rd.kwh ?? 0) * ratio))} 度
+                </div>
+              </div>
+            </div>
+            {lg && (
+              <div className="grid grid-cols-2 gap-2 text-slate-600">
+                <div className="rounded-md border border-rose-100 bg-rose-50/50 px-3 py-2">
+                  <div className="text-[10px] text-rose-500">应付电费（付场地方）· {lg.payStatus}</div>
+                  <div className="font-semibold tabular-nums text-rose-600">{fmtMoney(Number(lg.payAmount ?? 0))} 元</div>
+                  <div className="text-[10px] text-slate-400">单价 {fmtMoney(Number(lg.payUnitPrice ?? 0))} 元/度</div>
+                </div>
+                <div className="rounded-md border border-emerald-100 bg-emerald-50/50 px-3 py-2">
+                  <div className="text-[10px] text-emerald-500">应收电费（品牌方支付）· {lg.collectStatus}</div>
+                  <div className="font-semibold tabular-nums text-emerald-600">{fmtMoney(Number(lg.collectAmount ?? 0))} 元</div>
+                  <div className="text-[10px] text-slate-400">单价 {fmtMoney(Number(lg.collectUnitPrice ?? 0))} 元/度 · 不含税 {fmtMoney(Number(lg.collectNet ?? 0))}</div>
+                </div>
+              </div>
+            )}
+            {prev && Number(prev.kwh ?? 0) > 0 && (
+              <div className="text-[11px] text-slate-400">上月同期（{toDisplay(prev.month_period)}）用量：{fmtNum(prev.kwh)} 度</div>
+            )}
+            <div className="flex justify-end gap-2 pt-1">
+              <Button variant="outline" onClick={copyText}>复制核对文本</Button>
+              <Button className="bg-emerald-600 hover:bg-emerald-700" onClick={onClose}>关闭</Button>
+            </div>
+          </div>
+        ) : (
+          <div className="py-6 text-center text-xs text-slate-400">未找到该电表的抄表数据</div>
+        )}
+      </DialogContent>
+    </Dialog>
   );
 }
 
@@ -48,6 +167,20 @@ function PayElectricityDialog({ open, onClose, landlordId, landlordName, period,
   const payUnitPrice = g?.details?.[0]?.payUnitPrice;
   const amount = g?.payAmount ?? 0;
   const kwh = g?.kwh ?? 0;
+  const details = g?.details ?? [];
+
+  // 场地方档案：当前业主（收款人）与电话
+  const landlordsQ = useQuery({ queryKey: ["landlords"], queryFn: listLandlords, enabled: open });
+  const landlordRow = (landlordsQ.data ?? []).find((l: any) => l.id === landlordId) ?? null;
+
+  // 申请人默认当前登录人
+  useEffect(() => {
+    if (open) {
+      setApplicant("");
+      setExtraNote("");
+      try { setApplicant(JSON.parse(localStorage.getItem("dsh_user") || "{}").name || ""); } catch { /* ignore */ }
+    }
+  }, [open, landlordId, period]);
 
   const buildReason = () => {
     const lines = [
@@ -55,9 +188,12 @@ function PayElectricityDialog({ open, onClose, landlordId, landlordName, period,
       `应付金额（电费成本）：${amount} 元`,
       "",
       "【电费依据】",
+      `电表数量：${details.length} 块`,
       `用电度数：${kwh} 度`,
       `付款单价：${payUnitPrice ?? "—"} 元/度`,
       payUnitPrice ? `勾稽：${Math.round(amount * 100) / 100} = ${kwh} 度 × ${payUnitPrice} 元/度` : "",
+      "",
+      `【收款方】场地方当前业主：${landlordRow?.contact || "—"}${landlordRow?.phone ? `（${landlordRow.phone}）` : ""}`,
       "",
       `【经营佐证（${periodDisplay}）】`,
       `电费收款（不含税）：${g?.collectNet ?? 0} 元`,
@@ -167,6 +303,54 @@ function PayElectricityDialog({ open, onClose, landlordId, landlordName, period,
                     ) : null}
                   </div>
                 </div>
+
+                {/* 收款方（场地方当前业主） */}
+                <div className="rounded-lg border border-slate-200 px-3 py-2 text-[11px]">
+                  <div className="flex items-baseline justify-between">
+                    <span className="shrink-0 text-slate-400">收款方（场地方当前业主）</span>
+                    <span className="font-medium text-slate-700">{landlordRow?.contact || "—"}</span>
+                  </div>
+                  {landlordRow?.phone && (
+                    <div className="mt-0.5 flex items-baseline justify-between">
+                      <span className="shrink-0 text-slate-400">联系电话</span>
+                      <span className="text-slate-700">{landlordRow.phone}</span>
+                    </div>
+                  )}
+                </div>
+
+                {/* 电表明细（逐表核对） */}
+                {details.length > 0 && (
+                  <div>
+                    <div className="mb-1.5 text-[10px] font-semibold text-slate-500">电表明细（{details.length} 块）</div>
+                    <div className="max-h-40 overflow-y-auto rounded-lg border border-slate-200">
+                      <table className="w-full text-[11px]">
+                        <thead>
+                          <tr className="bg-slate-50 text-slate-500">
+                            <th className="px-2 py-1.5 text-left font-medium">电表</th>
+                            <th className="px-2 py-1.5 text-left font-medium">品牌方</th>
+                            <th className="px-2 py-1.5 text-right font-medium">用量(度)</th>
+                            <th className="px-2 py-1.5 text-right font-medium">单价</th>
+                            <th className="px-2 py-1.5 text-right font-medium">应付(元)</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {details.map((d: any, i: number) => (
+                            <tr key={i} className="border-t">
+                              <td className="px-2 py-1.5">
+                                <div className="font-medium text-slate-700">{d.meterName ?? "—"}</div>
+                                <div className="font-mono text-[10px] text-slate-400">{d.meterNo}</div>
+                              </td>
+                              <td className="px-2 py-1.5 text-slate-600">{d.brandName || "全品牌共享"}</td>
+                              <td className="px-2 py-1.5 text-right tabular-nums text-slate-700">{fmtNum(d.kwh)}</td>
+                              <td className="px-2 py-1.5 text-right tabular-nums text-slate-700">{d.payUnitPrice != null ? fmtNum(d.payUnitPrice) : "—"}</td>
+                              <td className="px-2 py-1.5 text-right tabular-nums font-medium text-slate-700">{fmtMoney(d.payAmount)}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                )}
 
                 <div>
                   <div className="mb-1.5 text-[10px] font-semibold text-slate-500">经营佐证（{toDisplay(period)}）</div>
@@ -397,6 +581,8 @@ export default function Electricity() {
   const [exporting, setExporting] = useState(false);
   // 应付电费审批弹窗（电费付款：我方付给场地方）
   const [payElec, setPayElec] = useState<{ landlordId: number; landlordName: string; period: string; g: any } | null>(null);
+  // 抄表核对详情弹窗
+  const [readingTarget, setReadingTarget] = useState<{ meterNo: string; period: string } | null>(null);
 
   const doExport = async () => {
     if (monthRange.length === 0) { toast.error("请选择有效的月份区间"); return; }
@@ -515,21 +701,43 @@ export default function Electricity() {
                           <div className="text-[11px] font-medium text-slate-400">
                             {toDisplay(m.period)} · 按{dim === "landlord" ? "场地方" : "品牌方"}明细（点击展开电表）
                           </div>
-                          {(m.rows ?? []).map((g: any) => {
+                          {(dim === "landlord"
+                            ? groupByEntity(m.rows ?? [])
+                            : [{ entityName: "", color: GROUP_COLOR_NEUTRAL, rows: m.rows ?? [] }]
+                          ).map((grp, gi) => {
+                            const grpKey = `grp-${m.period}-${gi}`;
+                            return (
+                            <div key={grpKey} className={dim === "landlord" ? `space-y-1.5 rounded-lg border p-2 ${grp.color.border} ${grp.color.bg}` : "space-y-1"}>
+                            {dim === "landlord" && (
+                              <div className="flex items-center gap-2 px-1">
+                                <div className={`flex h-5 w-5 items-center justify-center rounded ${grp.color.icon}`}>
+                                  <Landmark className="h-3 w-3 text-white" />
+                                </div>
+                                <span className={`text-[11px] font-semibold ${grp.color.text}`}>{grp.entityName}</span>
+                                <span className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${grp.color.chip}`}>{grp.rows.length} 个场地方</span>
+                              </div>
+                            )}
+                            {grp.rows.map((g: any) => {
                             const rKey = `r-${m.period}-${dim}-${g.key}`;
                             const rOpen = expanded.has(rKey);
                             const hasTransformerRatio = (g.details ?? []).some((d: any) => d.transformerRatio && d.transformerRatio !== 1);
                             const hasBrandDimension = (g.details ?? []).some((d: any) => d.brandName);
                             return (
                               <Fragment key={rKey}>
-                                <div className="flex cursor-pointer items-center gap-x-4 rounded-md border bg-white px-3 py-1.5 text-xs hover:bg-slate-50" onClick={() => toggle(rKey)}>
-                                  <span className="text-slate-400">{rOpen ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}</span>
-                                  <span className="w-44 font-medium text-slate-700">{g.name}</span>
-                                  <span className="text-slate-500 tabular-nums">{fmtNum(g.kwh)} 度</span>
-                                  <span className="text-rose-600 tabular-nums">付 {fmtMoney(g.payAmount)}</span>
-                                  <span className="text-emerald-600 tabular-nums">收 {fmtMoney(g.collectNet)}</span>
-                                  <span className="text-slate-400 tabular-nums">税 {fmtMoney(g.elecTax)}</span>
-                                  <span className="ml-auto text-slate-700 tabular-nums">利 {fmtMoney(g.profit)}</span>
+                                <div
+                                  className="grid cursor-pointer items-center gap-x-3 rounded-md border bg-white px-3 py-1.5 text-xs hover:bg-slate-50"
+                                  style={{ gridTemplateColumns: "minmax(0, 1fr) 100px 120px 120px 90px 110px auto" }}
+                                  onClick={() => toggle(rKey)}
+                                >
+                                  <span className="flex min-w-0 items-center gap-1">
+                                    <span className="shrink-0 text-slate-400">{rOpen ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}</span>
+                                    <span className="truncate font-medium text-slate-700" title={g.name}>{g.name}</span>
+                                  </span>
+                                  <span className="text-right text-slate-500 tabular-nums">{fmtNum(g.kwh)} 度</span>
+                                  <span className="text-right tabular-nums text-rose-600">付 {fmtMoney(g.payAmount)}</span>
+                                  <span className="text-right tabular-nums text-emerald-600">收 {fmtMoney(g.collectNet)}</span>
+                                  <span className="text-right tabular-nums text-slate-400">税 {fmtMoney(g.elecTax)}</span>
+                                  <span className="text-right tabular-nums font-medium text-slate-700">利 {fmtMoney(g.profit)}</span>
                                   {dim === "landlord" && g.payStatus === "未付款" && g.payAmount > 0 && (
                                     <button
                                       onClick={(e) => { e.stopPropagation(); setPayElec({ landlordId: Number(g.key), landlordName: g.name, period: m.period, g }); }}
@@ -571,6 +779,10 @@ export default function Electricity() {
                                               {d.dataSource === "manual" && (
                                                 <span className="mt-0.5 inline-block rounded bg-amber-100 px-1 text-[10px] text-amber-700">已人工修改</span>
                                               )}
+                                              <button type="button" className="mt-0.5 block text-[11px] text-rose-600 hover:text-rose-700"
+                                                onClick={(e) => { e.stopPropagation(); setReadingTarget({ meterNo: d.meterNo, period: m.period }); }}>
+                                                详细
+                                              </button>
                                             </td>
                                             {hasBrandDimension && (
                                               <td className={`px-2 py-1.5 tabular-nums ${!d.brandName ? "font-medium text-purple-600" : ""}`}>
@@ -597,7 +809,10 @@ export default function Electricity() {
                                 )}
                               </Fragment>
                             );
-                          })}
+                            })}
+                            </div>
+                          );
+                        })}
                         </div>
                       </td>
                     </tr>
@@ -636,6 +851,7 @@ export default function Electricity() {
         period={payElec?.period ?? ""}
         g={payElec?.g ?? null}
       />
+      <ReadingDetailDialog target={readingTarget} onClose={() => setReadingTarget(null)} />
     </div>
   );
 }

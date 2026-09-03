@@ -121,6 +121,68 @@ async def list_periods():
     return electricity_repo.list_periods()
 
 
+@router.get("/reading-detail")
+async def reading_detail(request: Request, meterNo: str, period: str):
+    """单块电表的抄表核对信息（上月/本月抄表读数与日期、区间度数、台账费用），
+    供发给场地方/品牌方老板核对。"""
+    from ..infra.database import get_connection, get_dict_cursor
+    period = to_compact(period)
+    conn = get_connection()
+    cur = get_dict_cursor(conn)
+    try:
+        # 电表信息
+        cur.execute("""
+            SELECT m.id, m.meter_no, m.meter_name, m.transformer_ratio, m.tag,
+                   b.name AS brand_name, l.name AS landlord_name
+            FROM meters m
+            LEFT JOIN brands b ON m.brand_id = b.id
+            LEFT JOIN landlords l ON m.landlord_id = l.id
+            WHERE m.meter_no = %s
+        """, (meterNo,))
+        meter = cur.fetchone()
+        if not meter:
+            raise HTTPException(404, "电表不存在")
+
+        # 抄表链（当期行自带 上月读数/日期 → 本月读数/日期 → 区间度数）
+        cur.execute("""
+            SELECT month_period, kwh, actual_kwh, prev_reading_date, prev_reading,
+                   curr_reading_date, curr_reading, prev_actual_reading, curr_actual_reading,
+                   synced_at
+            FROM meter_monthly
+            WHERE address = %s AND month_period = %s
+        """, (meterNo, period))
+        reading = cur.fetchone()
+
+        # 上一个月的用量（供对比）
+        prev_period = str(int(period) - 1) if period[4:6] != "01" else f"{int(period[:4]) - 1}12"
+        cur.execute("""
+            SELECT month_period, kwh FROM meter_monthly
+            WHERE address = %s AND month_period = %s
+        """, (meterNo, prev_period))
+        prev_row = cur.fetchone()
+
+        # 该表当期台账费用（场地×品牌×月的记录中本表明细）
+        cur.execute("""
+            SELECT e.pay_unit_price, e.pay_amount, e.pay_status,
+                   e.collect_unit_price, e.collect_amount, e.collect_net, e.collect_status,
+                   d.kwh AS ledger_kwh, e.data_source
+            FROM electricity_meter_details d
+            JOIN electricity_records e ON e.id = d.electricity_id
+            WHERE d.meter_id = %s AND e.period = %s
+        """, (meter["id"], period))
+        ledger = cur.fetchone()
+
+        return {
+            "meter": meter,
+            "reading": reading,
+            "prevMonth": prev_row,
+            "ledger": ledger,
+        }
+    finally:
+        cur.close()
+        conn.close()
+
+
 @router.get("/{record_id:int}")
 async def get_electricity(record_id: int, request: Request):
     record = electricity_repo.get_record(record_id)
@@ -696,9 +758,15 @@ async def monthly_ledger(period: str, dim: str = "landlord"):
                 """, brand_vals)
                 r["details"] = cur.fetchall()
         else:
-            # 场地维度：台账按 landlord 聚合（v3 直挂）
+            # 场地维度：台账按 landlord 聚合（v3 直挂）；entity_name = 场地方关联的公司主体（场地合同优先）
             cur.execute("""
                 SELECT e.landlord_id AS key, COALESCE(l.name, '未指定场地') AS name,
+                       MAX(COALESCE(
+                         (SELECT ent.name FROM contracts c JOIN entities ent ON ent.id = c.entity_id
+                           WHERE c.landlord_id = e.landlord_id AND c.contract_type = '场地合同' AND c.entity_id IS NOT NULL LIMIT 1),
+                         (SELECT ent.name FROM contracts c JOIN entities ent ON ent.id = c.entity_id
+                           WHERE c.landlord_id = e.landlord_id AND c.entity_id IS NOT NULL LIMIT 1),
+                         '未指定主体')) AS entity_name,
                        COALESCE(SUM(e.pay_kwh), 0) AS kwh,
                        COALESCE(SUM(e.pay_amount), 0) AS pay_amount,
                        COALESCE(SUM(e.collect_amount), 0) AS collect_amount,
@@ -745,6 +813,7 @@ async def monthly_ledger(period: str, dim: str = "landlord"):
         item = {
             "key": r["key"],
             "name": r["name"],
+            "entityName": r.get("entity_name") or "未指定主体",
             "kwh": round(float(r["kwh"] or 0), 2),
             "payAmount": round(pay, 2),
             "collectAmount": round(collect, 2),

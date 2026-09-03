@@ -100,12 +100,14 @@ async def monthly_ledger(request: Request, period: str = Query(..., description=
             SELECT c.id AS contract_id, c.contract_type, c.landlord_id, l.name AS landlord_name,
                    l.contact AS landlord_contact, l.phone AS landlord_phone,
                    c.brand_id, b.name AS brand_name, c.monthly_rent, c.rent_amount,
+                   c.entity_id, ent.name AS entity_name,
                    c.unit_monthly_rent, c.cabinets_count, c.deposit, c.input_cost,
                    c.rent_tax_enabled, c.rent_tax_rate, c.post_tax_rent_price,
                    c.pay_method, c.start_date, c.end_date, c.early_end_date, c.first_month_rent
             FROM contracts c
             LEFT JOIN landlords l ON c.landlord_id = l.id
             LEFT JOIN brands b ON c.brand_id = b.id
+            LEFT JOIN entities ent ON ent.id = c.entity_id
             WHERE (c.start_date IS NULL OR c.start_date <= %s)
               AND (COALESCE(c.early_end_date, c.end_date) IS NULL OR COALESCE(c.early_end_date, c.end_date) >= %s)
             ORDER BY c.landlord_id, c.contract_type, c.id
@@ -121,12 +123,14 @@ async def monthly_ledger(request: Request, period: str = Query(..., description=
             SELECT c.id AS contract_id, c.contract_type, c.landlord_id, l.name AS landlord_name,
                    l.contact AS landlord_contact, l.phone AS landlord_phone,
                    c.brand_id, b.name AS brand_name, c.monthly_rent, c.rent_amount,
+                   c.entity_id, ent.name AS entity_name,
                    c.unit_monthly_rent, c.cabinets_count, c.deposit, c.input_cost,
                    c.rent_tax_enabled, c.rent_tax_rate, c.post_tax_rent_price,
                    c.pay_method, c.start_date, c.end_date, c.early_end_date, c.first_month_rent
             FROM contracts c
             LEFT JOIN landlords l ON c.landlord_id = l.id
             LEFT JOIN brands b ON c.brand_id = b.id
+            LEFT JOIN entities ent ON ent.id = c.entity_id
             WHERE (c.start_date IS NULL OR c.start_date <= %s)
               AND (COALESCE(c.early_end_date, c.end_date) IS NULL OR COALESCE(c.early_end_date, c.end_date) >= %s)
             ORDER BY c.landlord_id, c.contract_type, c.id
@@ -211,6 +215,8 @@ async def monthly_ledger(request: Request, period: str = Query(..., description=
             "landlordPhone": c.get("landlord_phone"),
             "brandId": c["brand_id"],
             "brandName": c["brand_name"],
+            "entityId": c.get("entity_id"),
+            "entityName": c.get("entity_name"),
             "monthlyRent": round(monthly, 2),
             "annualRent": round(annual, 2),
             "unitMonthlyRent": float(c["unit_monthly_rent"]) if c.get("unit_monthly_rent") is not None else None,
@@ -384,6 +390,10 @@ async def monthly_ledger(request: Request, period: str = Query(..., description=
     for lid, gy in yearly_map.items():
         venue = gy["venue"]
         venue_lid = venue["landlordId"] if venue else lid
+        # 公司主体：优先场地合同的报税主体，缺失时回退任一品牌方合同的主体
+        ent = next((x for x in ([venue] if venue else []) + gy["brands"] if x.get("entityId")), None)
+        gy["entityId"] = ent.get("entityId") if ent else None
+        gy["entityName"] = (ent.get("entityName") if ent else None) or "未指定主体"
         monthly_cabs = [_month_brand_cabs(venue_lid, f"{year}{mm:02d}") for mm in range(1, 13)] if venue_lid else []
         active = [x for x in monthly_cabs if x > 0]
         avg_month_cabs = sum(active) / len(active) if active else 0.0
@@ -395,7 +405,37 @@ async def monthly_ledger(request: Request, period: str = Query(..., description=
             item["venueShareAnnual"] = _venue_share_annual(venue_lid, item["brandId"], brand_cabs) if venue_lid else 0.0
             item["unitCostAnnual"] = gy["unitCostAnnual"]
 
-    yearly_rows = sorted(yearly_map.values(), key=lambda x: x["landlordName"] or "")
+    yearly_rows = sorted(yearly_map.values(), key=lambda x: (x["entityName"] or "", x["landlordName"] or ""))
+
+    # 公司主体名称：挂到月份明细的每一行，前端按主体分块展示（场地维度按场地方取，品牌维度按品牌取）
+    if result_rows:
+        from ..infra.database import get_connection as _gc, get_dict_cursor as _gdc
+        conn2 = _gc()
+        cur2 = _gdc(conn2)
+        ent_map = {}
+        try:
+            keys = [g["key"] for g in result_rows if g.get("key") is not None]
+            if keys:
+                if dim == "landlord":
+                    cur2.execute("""
+                        SELECT c.landlord_id AS k, MAX(ent.name) AS entity_name
+                        FROM contracts c LEFT JOIN entities ent ON ent.id = c.entity_id
+                        WHERE c.landlord_id = ANY(%s::int[]) AND c.entity_id IS NOT NULL
+                        GROUP BY c.landlord_id
+                    """, (keys,))
+                else:
+                    cur2.execute("""
+                        SELECT c.brand_id AS k, MAX(ent.name) AS entity_name
+                        FROM contracts c LEFT JOIN entities ent ON ent.id = c.entity_id
+                        WHERE c.brand_id = ANY(%s::int[]) AND c.entity_id IS NOT NULL
+                        GROUP BY c.brand_id
+                    """, (keys,))
+                ent_map = {r["k"]: r["entity_name"] for r in cur2.fetchall()}
+        finally:
+            cur2.close()
+            conn2.close()
+        for g in result_rows:
+            g["entityName"] = ent_map.get(g.get("key")) or "未指定主体"
 
     return {"period": period, "dim": dim, "rows": result_rows, "totals": totals, "yearlyRows": yearly_rows}
 
@@ -432,11 +472,61 @@ async def yearly_payment_schedule(request: Request, landlordId: int = Query(...)
         """, (landlordId,))
         venue = cur.fetchone()
 
+        # ── 收款侧：该场地方所有品牌方合同当年的收款分期（场地费收款，品牌方 → 公司）──
+        cur.execute("""
+            SELECT c.id AS contract_id, COALESCE(b.name, '全品牌共享') AS brand_name,
+                   c.monthly_rent, c.start_date, c.early_end_date, c.end_date,
+                   s.id AS sched_id, s.seq, s.period_start, s.period_end, s.amount, s.status, s.pay_date
+            FROM contracts c
+            LEFT JOIN brands b ON b.id = c.brand_id
+            LEFT JOIN rent_income_schedule s
+                   ON s.contract_id = c.id
+                  AND s.period_start <= %s::date AND s.period_end >= %s::date
+            WHERE c.landlord_id = %s AND c.contract_type = '品牌方合同'
+            ORDER BY c.id, s.seq
+        """, (year_end, year_start, landlordId))
+        income_map: dict = {}
+        for r in cur.fetchall():
+            cid = r["contract_id"]
+            entry = income_map.get(cid)
+            if entry is None:
+                entry = income_map[cid] = {
+                    "contractId": cid,
+                    "brandName": r.get("brand_name") or "全品牌共享",
+                    "monthlyRent": float(r.get("monthly_rent") or 0),
+                    "startDate": str(r["start_date"])[:10] if r.get("start_date") else None,
+                    "endDate": str(r.get("early_end_date") or r.get("end_date"))[:10] if (r.get("early_end_date") or r.get("end_date")) else None,
+                    "schedules": [],
+                }
+            if r.get("sched_id") is not None:
+                entry["schedules"].append({
+                    "id": r["sched_id"],
+                    "seq": r["seq"],
+                    "periodStart": str(r["period_start"])[:10] if r.get("period_start") else None,
+                    "periodEnd": str(r["period_end"])[:10] if r.get("period_end") else None,
+                    "amount": float(r.get("amount") or 0),
+                    "status": r.get("status") or "未到账",
+                    "payDate": str(r["pay_date"])[:10] if r.get("pay_date") else None,
+                })
+        income_contracts = list(income_map.values())
+        for ic in income_contracts:
+            ic["totalCount"] = len(ic["schedules"])
+            ic["paidCount"] = sum(1 for x in ic["schedules"] if x["status"] == "已到账")
+            ic["totalAmount"] = round(sum(x["amount"] for x in ic["schedules"]), 2)
+            ic["paidAmount"] = round(sum(x["amount"] for x in ic["schedules"] if x["status"] == "已到账"), 2)
+        income_total = round(sum(ic["totalAmount"] for ic in income_contracts), 2)
+        income_paid = round(sum(ic["paidAmount"] for ic in income_contracts), 2)
+        income_paid_count = sum(ic["paidCount"] for ic in income_contracts)
+        income_total_count = sum(ic["totalCount"] for ic in income_contracts)
+
         if not venue:
             return {
                 "landlordId": landlordId, "landlordName": "", "year": year_s,
                 "venueContract": None, "schedules": [],
                 "totalAmount": 0, "paidAmount": 0, "paidCount": 0, "totalCount": 0,
+                "incomeContracts": income_contracts,
+                "incomeTotalAmount": income_total, "incomePaidAmount": income_paid,
+                "incomePaidCount": income_paid_count, "incomeTotalCount": income_total_count,
             }
 
         # 查该场地合同当年的付款分期
@@ -523,6 +613,11 @@ async def yearly_payment_schedule(request: Request, landlordId: int = Query(...)
             "paidAmount": round(paid_amount, 2),
             "paidCount": paid_count,
             "totalCount": len(schedules),
+            "incomeContracts": income_contracts,
+            "incomeTotalAmount": income_total,
+            "incomePaidAmount": income_paid,
+            "incomePaidCount": income_paid_count,
+            "incomeTotalCount": income_total_count,
         }
     finally:
         cur.close()

@@ -13,7 +13,8 @@ import { Field, NumInput, TextInput, DateInput, SelectInput, inputCls } from "@/
 import { MapPicker } from "@/components/MapPicker";
 import * as XLSX from "xlsx";
 import { fmtMoney, fmtNum, fmtDate, numOrNull } from "@/lib/format";
-import { Download, Plus, Search, Pencil, Trash2, AlertTriangle, FileText, ArrowDownCircle, ArrowUpCircle, ExternalLink, ChevronDown, ChevronRight, Upload } from "lucide-react";
+import { Download, Plus, Search, Pencil, Trash2, AlertTriangle, FileText, ArrowDownCircle, ArrowUpCircle, ExternalLink, ChevronDown, ChevronRight, Upload, Landmark } from "lucide-react";
+import { groupByEntity } from "@/lib/groupColors";
 import { ContractSchedule } from "@/components/ContractSchedule";
 import { toast } from "sonner";
 
@@ -150,6 +151,25 @@ export default function Contracts() {
     return [...groups.values()];
   }, [rows]);
 
+  // 公司主体分组：同主体同色、点击展开场地方详情，未指定主体排最后
+  const [openEntities, setOpenEntities] = useState<Set<string>>(new Set());
+  const toggleEntity = (name: string) => {
+    setOpenEntities((prev) => {
+      const next = new Set(prev);
+      if (next.has(name)) next.delete(name);
+      else next.add(name);
+      return next;
+    });
+  };
+  const entityGroups = useMemo(() => {
+    // 每个场地方的主体：场地合同优先，其次任一品牌方合同，都没有归「未指定主体」
+    const withEntity = groupedByLandlord.map((g: any) => ({
+      ...g,
+      entityName: (g.costContracts.find((c: any) => c.entityName) || g.incomeContracts.find((c: any) => c.entityName))?.entityName || "未指定主体",
+    }));
+    return groupByEntity(withEntity);
+  }, [groupedByLandlord]);
+
   const doExport = () => {
     // 导出全部合同（按当前筛选），样式参考"共享合同监控表"：按合同类型分 sheet
     if (rows.length === 0) { toast.error("暂无合同可导出"); return; }
@@ -258,9 +278,26 @@ export default function Contracts() {
         </div>
       </div>
 
-      {/* 按场地分组展示 */}
-      <div className="space-y-6">
-        {groupedByLandlord.map((group: any) => {
+      {/* 按公司主体分组展示（同主体同色，点击展开场地方详情） */}
+      <div className="space-y-4">
+        {entityGroups.map((eg) => {
+          const isOpen = openEntities.has(eg.entityName);
+          const contractCount = eg.rows.reduce((t: number, g: any) => t + g.costContracts.length + g.incomeContracts.length, 0);
+          return (
+            <div key={eg.entityName} className={`rounded-xl border p-3 ${eg.color.border} ${eg.color.bg}`}>
+              <button type="button" className="flex w-full items-center gap-2 px-1 text-left" onClick={() => toggleEntity(eg.entityName)}>
+                {isOpen ? <ChevronDown className="h-4 w-4 text-slate-400" /> : <ChevronRight className="h-4 w-4 text-slate-400" />}
+                <div className={`flex h-6 w-6 items-center justify-center rounded-md ${eg.color.icon}`}>
+                  <Landmark className="h-3.5 w-3.5 text-white" />
+                </div>
+                <span className={`text-sm font-semibold ${eg.color.text}`}>{eg.entityName}</span>
+                <span className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${eg.color.chip}`}>{eg.rows.length} 个场地方</span>
+                <span className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${eg.color.chip}`}>{contractCount} 份合同</span>
+                <span className="ml-auto text-[10px] text-slate-400">{isOpen ? "点击收起" : "点击展开"}</span>
+              </button>
+              {isOpen && (
+              <div className="mt-3 space-y-6">
+        {eg.rows.map((group: any) => {
           const totalCost = group.costContracts.reduce((t: number, c: any) => t + (c.monthlyRent ? Number(c.monthlyRent) : 0), 0);
           const totalIncome = group.incomeContracts.reduce((t: number, c: any) => t + (c.monthlyRent ? Number(c.monthlyRent) : 0), 0);
 
@@ -337,7 +374,7 @@ export default function Contracts() {
                             {isExpanded && (
                               <tr key={`${c.id}-exp`} className="bg-slate-50/50">
                                 <td colSpan={13} className="px-4 py-3">
-                                  <ContractSchedule contractId={c.id} side="payment" title={`${c.landlordName || ""} 付款情况`} editable />
+                                  <ContractSchedule contractId={c.id} side="payment" title={`${c.landlordName || ""} 场地费 付款情况`} editable />
                                 </td>
                               </tr>
                             )}
@@ -430,7 +467,7 @@ export default function Contracts() {
                             {isExpanded && (
                               <tr key={`${c.id}-exp`} className="bg-slate-50/50">
                                 <td colSpan={17} className="px-4 py-3">
-                                  <ContractSchedule contractId={c.id} side="income" title={`${c.brandName || "全部品牌共享"} 收款情况`} editable />
+                                  <ContractSchedule contractId={c.id} side="income" title={`${c.brandName || "全部品牌共享"} 场地费 收款情况`} editable />
                                 </td>
                               </tr>
                             )}
@@ -447,7 +484,12 @@ export default function Contracts() {
             </div>
           );
         })}
-        {groupedByLandlord.length === 0 && (
+              </div>
+              )}
+            </div>
+          );
+        })}
+        {entityGroups.length === 0 && (
           <div className="rounded-xl border border-dashed py-16 text-center text-slate-400">
             {list.isLoading ? "加载中…" : "暂无合同数据"}
           </div>

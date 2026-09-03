@@ -45,7 +45,8 @@ def list_contracts(brand_id: int = None, landlord_id: int = None, station_id: in
             values.extend([f"%{keyword}%", f"%{keyword}%"])
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         cur.execute(f"""
-            SELECT c.*, b.name as brand_name, l.name as landlord_name, NULL as station_name_ref,
+            SELECT c.*, b.name as brand_name, l.name as landlord_name, ent.name as entity_name,
+                   NULL as station_name_ref,
               (
                 SELECT COALESCE(SUM(GREATEST(1, cab_cnt)), 0) FROM (
                   SELECT m.id, (SELECT COUNT(*) FROM cabinets cab WHERE cab.meter_id = m.id) AS cab_cnt
@@ -104,6 +105,7 @@ def list_contracts(brand_id: int = None, landlord_id: int = None, station_id: in
             FROM contracts c
             LEFT JOIN brands b ON c.brand_id = b.id
             LEFT JOIN landlords l ON c.landlord_id = l.id
+            LEFT JOIN entities ent ON ent.id = c.entity_id
             {where}
             ORDER BY c.landlord_id, c.contract_type, c.id
         """, values)
