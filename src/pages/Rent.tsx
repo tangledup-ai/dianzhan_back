@@ -426,6 +426,34 @@ function RentPaymentSchedule({ landlordId, landlordName, year, color }: { landlo
     enabled: !!landlordId && !!year,
   });
 
+  // 收款侧（场地费收款：品牌方合同 rent_income_schedule，品牌方 → 公司）
+  // 注意：以下 hooks 必须位于组件的提前 return 之前（Rules of Hooks）
+  const incomeContracts = data?.incomeContracts ?? [];
+  const incomeTotal = data?.incomeTotalAmount ?? 0;
+  const incomePaid = data?.incomePaidAmount ?? 0;
+  const incomePaidCount = data?.incomePaidCount ?? 0;
+  const incomeTotalCount = data?.incomeTotalCount ?? 0;
+  const incomeProgress = incomeTotal > 0 ? Math.min(100, Math.round((incomePaid / incomeTotal) * 100)) : 0;
+  const incomeRows = incomeContracts
+    .flatMap((ic: any) => (ic.schedules ?? []).map((s: any) => ({ ...s, brandName: ic.brandName })))
+    .sort((a: any, b: any) => String(a.periodStart ?? "").localeCompare(String(b.periodStart ?? "")) || String(a.brandName).localeCompare(String(b.brandName)));
+
+  // 收款侧按品牌分组：先列品牌方，点击品牌方再展开该品牌的收款分期
+  const [incomeBrandOpen, setIncomeBrandOpen] = useState<string | null>(null);
+  const incomeBrands = useMemo(() => {
+    const map = new Map<string, { brandName: string; rows: any[]; totalAmount: number; paidAmount: number; paidCount: number; totalCount: number }>();
+    for (const s of incomeRows) {
+      const key = s.brandName || "全品牌共享";
+      if (!map.has(key)) map.set(key, { brandName: key, rows: [], totalAmount: 0, paidAmount: 0, paidCount: 0, totalCount: 0 });
+      const g = map.get(key)!;
+      g.rows.push(s);
+      g.totalAmount += Number(s.amount || 0);
+      if (s.status === "已到账") { g.paidAmount += Number(s.amount || 0); g.paidCount += 1; }
+      g.totalCount += 1;
+    }
+    return [...map.values()];
+  }, [incomeRows]);
+
   if (isLoading) {
     return (
       <div className="rounded-xl border bg-white p-4 text-center text-xs text-slate-400">
@@ -446,23 +474,13 @@ function RentPaymentSchedule({ landlordId, landlordName, year, color }: { landlo
   const totalCount = data.totalCount || 0;
   const progress = totalAmount > 0 ? Math.min(100, Math.round((paidAmount / totalAmount) * 100)) : 0;
   const firstAmount = schedules[0]?.amount ?? 0;
-  // 收款侧（场地费收款：品牌方合同 rent_income_schedule，品牌方 → 公司）
-  const incomeContracts = data.incomeContracts ?? [];
-  const incomeTotal = data.incomeTotalAmount ?? 0;
-  const incomePaid = data.incomePaidAmount ?? 0;
-  const incomePaidCount = data.incomePaidCount ?? 0;
-  const incomeTotalCount = data.incomeTotalCount ?? 0;
-  const incomeProgress = incomeTotal > 0 ? Math.min(100, Math.round((incomePaid / incomeTotal) * 100)) : 0;
-  const incomeRows = incomeContracts
-    .flatMap((ic: any) => (ic.schedules ?? []).map((s: any) => ({ ...s, brandName: ic.brandName })))
-    .sort((a: any, b: any) => String(a.periodStart ?? "").localeCompare(String(b.periodStart ?? "")) || String(a.brandName).localeCompare(String(b.brandName)));
 
   return (
     <div className="overflow-hidden rounded-2xl border border-indigo-100/80 bg-white shadow-sm">
       {/* 标题栏（点击展开/收起） */}
       <button
         type="button"
-        onClick={() => setCollapsed((c) => !c)}
+        onClick={() => { if (!collapsed) setIncomeBrandOpen(null); setCollapsed((c) => !c); }}
         className={`flex w-full flex-wrap items-center gap-3 border-b border-slate-100 bg-gradient-to-r ${color.head} px-5 py-4 text-left transition-colors hover:bg-slate-50/70`}
       >
         <div className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br ${color.iconGrad} text-white shadow-sm`}>
@@ -665,7 +683,39 @@ function RentPaymentSchedule({ landlordId, landlordName, year, color }: { landlo
                     )}
                   </td>
                   <td className="px-4 py-3 text-center">
-                    {isPending && markingId !== s.id && (
+                    {markingId === s.id ? (
+                      <div className="flex items-center justify-center gap-1">
+                        <input
+                          type="date"
+                          className="w-32 rounded-md border border-slate-200 px-2 py-1 text-xs"
+                          value={markDate}
+                          onChange={(e) => setMarkDate(e.target.value)}
+                        />
+                        <Button
+                          size="sm"
+                          className="h-7 rounded-lg bg-emerald-600 px-2.5 text-xs text-white hover:bg-emerald-700"
+                          disabled={markDone.isPending}
+                          onClick={() => {
+                            if (!markDate) { toast.error("请选择付款日期"); return; }
+                            markDone.mutate({ id: s.id, status: "已付款", payDate: markDate, side: "payment" });
+                          }}
+                        >
+                          保存
+                        </Button>
+                        {isPaid && (
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="h-7 rounded-lg border-amber-200 bg-amber-50/60 px-2.5 text-xs font-medium text-amber-600 hover:bg-amber-100"
+                            disabled={markDone.isPending}
+                            onClick={() => markDone.mutate({ id: s.id, status: "未付款", payDate: markDate, side: "payment" })}
+                          >
+                            撤销付款
+                          </Button>
+                        )}
+                        <Button size="sm" variant="outline" className="h-7 rounded-lg px-2.5 text-xs" onClick={() => { setMarkingId(null); setMarkDate(""); }}>取消</Button>
+                      </div>
+                    ) : isPending ? (
                       <div className="flex items-center justify-center gap-1.5">
                         <Button
                           size="sm"
@@ -684,31 +734,14 @@ function RentPaymentSchedule({ landlordId, landlordName, year, color }: { landlo
                           标记付款
                         </Button>
                       </div>
-                    )}
-                    {isPending && markingId === s.id && (
-                      <div className="flex items-center justify-center gap-1">
-                        <input
-                          type="date"
-                          className="w-32 rounded-md border border-slate-200 px-2 py-1 text-xs"
-                          value={markDate}
-                          onChange={(e) => setMarkDate(e.target.value)}
-                        />
-                        <Button
-                          size="sm"
-                          className="h-7 rounded-lg bg-emerald-600 px-2.5 text-xs text-white hover:bg-emerald-700"
-                          disabled={markDone.isPending}
-                          onClick={() => {
-                            if (!markDate) { toast.error("请选择付款日期"); return; }
-                            markDone.mutate({ id: s.id, status: "已付款", payDate: markDate, side: "payment" });
-                          }}
-                        >
-                          确认
-                        </Button>
-                        <Button size="sm" variant="outline" className="h-7 rounded-lg px-2.5 text-xs" onClick={() => { setMarkingId(null); setMarkDate(""); }}>取消</Button>
-                      </div>
-                    )}
-                    {isPaid && (
-                      <span className="text-[10px] text-slate-300">已完成</span>
+                    ) : (
+                      <button
+                        type="button"
+                        className="rounded px-1.5 py-0.5 text-[11px] text-rose-600 hover:text-rose-700"
+                        onClick={() => { setMarkingId(s.id); setMarkDate(s.payDate || new Date().toISOString().slice(0, 10)); }}
+                      >
+                        修改
+                      </button>
                     )}
                   </td>
                 </tr>
@@ -723,99 +756,151 @@ function RentPaymentSchedule({ landlordId, landlordName, year, color }: { landlo
 
       {side === "income" && (
         <>
-      {/* 收款分期明细（场地费收款：品牌方 → 公司） */}
+      {/* 收款分期明细（按品牌分组：点击品牌方展开该品牌的收款分期） */}
       <div className={`border-t border-slate-100 ${color.bg} px-5 py-2.5`}>
-        <span className={`text-[11px] font-medium ${color.text}`}>收款分期明细（场地费收款 · 品牌方 → 公司）</span>
+        <span className={`text-[11px] font-medium ${color.text}`}>收款分期明细（场地费收款 · 品牌方 → 公司 · 点击品牌方展开）</span>
       </div>
-      <div className="overflow-x-auto">
-        <table className="w-full text-xs">
-          <thead>
-            <tr className="text-left text-[10px] uppercase tracking-wider text-slate-400">
-              <th className="px-5 py-2.5 font-medium">期数</th>
-              <th className="px-4 py-2.5 font-medium">品牌方</th>
-              <th className="px-4 py-2.5 font-medium">应收时间</th>
-              <th className="px-4 py-2.5 text-right font-medium">应收金额</th>
-              <th className="px-4 py-2.5 font-medium">状态</th>
-              <th className="px-4 py-2.5 font-medium">实际到账时间</th>
-              <th className="px-4 py-2.5 text-center font-medium">操作</th>
-            </tr>
-          </thead>
-          <tbody>
-            {incomeRows.length === 0 && (
-              <tr><td colSpan={7} className="py-10 text-center text-slate-400">
-                暂无收款分期数据（品牌方合同生成分期后显示）
-              </td></tr>
-            )}
-            {incomeRows.map((s: any) => {
-              const isPaid = s.status === "已到账";
-              return (
-                <tr key={s.id} className={`border-t border-slate-50 transition-colors hover:bg-slate-50/50 ${isPaid ? "bg-emerald-50/20" : ""}`}>
-                  <td className="px-5 py-3">
-                    <span className={`inline-flex h-6 w-6 items-center justify-center rounded-full text-[11px] font-semibold ${isPaid ? "bg-emerald-100 text-emerald-700" : "bg-slate-100 text-slate-500"}`}>{s.seq}</span>
-                  </td>
-                  <td className="px-4 py-3 whitespace-nowrap font-medium text-slate-700">{s.brandName}</td>
-                  <td className="px-4 py-3 whitespace-nowrap text-slate-600">
-                    {s.periodStart?.slice(0, 10) || "—"} ~ {s.periodEnd?.slice(0, 10) || "—"}
-                  </td>
-                  <td className="px-4 py-3 text-right font-medium tabular-nums text-slate-700">{fmtMoney(s.amount)}</td>
-                  <td className="px-4 py-3">
-                    {isPaid ? (
-                      <span className="inline-flex items-center gap-1 rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-medium text-emerald-700">
-                        <CheckCircle2 className="h-3 w-3" />已到账
-                      </span>
-                    ) : (
-                      <span className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-white px-2 py-0.5 text-[10px] font-medium text-slate-500">
-                        未到账
-                      </span>
-                    )}
-                  </td>
-                  <td className="px-4 py-3">
-                    {isPaid && s.payDate ? (
-                      <span className="tabular-nums text-emerald-600">{s.payDate}</span>
-                    ) : (
-                      <span className="text-slate-300">—</span>
-                    )}
-                  </td>
-                  <td className="px-4 py-3 text-center">
-                    {!isPaid && markingId !== s.id && (
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        className="h-7 rounded-lg border-emerald-200 bg-emerald-50/60 px-2.5 text-xs font-medium text-emerald-600 hover:border-emerald-300 hover:bg-emerald-100"
-                        onClick={() => { setMarkingId(s.id); setMarkDate(new Date().toISOString().slice(0, 10)); }}
-                      >
-                        标记到账
-                      </Button>
-                    )}
-                    {!isPaid && markingId === s.id && (
-                      <div className="flex items-center justify-center gap-1">
-                        <input
-                          type="date"
-                          className="w-32 rounded-md border border-slate-200 px-2 py-1 text-xs"
-                          value={markDate}
-                          onChange={(e) => setMarkDate(e.target.value)}
-                        />
-                        <Button
-                          size="sm"
-                          className="h-7 rounded-lg bg-emerald-600 px-2.5 text-xs text-white hover:bg-emerald-700"
-                          disabled={markDone.isPending}
-                          onClick={() => {
-                            if (!markDate) { toast.error("请选择到账日期"); return; }
-                            markDone.mutate({ id: s.id, status: "已到账", payDate: markDate, side: "income" });
-                          }}
-                        >
-                          确认
-                        </Button>
-                        <Button size="sm" variant="outline" className="h-7 rounded-lg px-2.5 text-xs" onClick={() => { setMarkingId(null); setMarkDate(""); }}>取消</Button>
-                      </div>
-                    )}
-                    {isPaid && <span className="text-[10px] text-slate-300">已完成</span>}
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
+      <div className="px-5 py-3">
+        {incomeBrands.length === 0 && (
+          <div className="rounded-md bg-slate-50 px-3 py-4 text-center text-xs text-slate-400">
+            暂无收款分期数据（品牌方合同生成分期后显示）
+          </div>
+        )}
+        <div className="space-y-2">
+          {incomeBrands.map((b) => {
+            const isOpen = incomeBrandOpen === b.brandName;
+            const allPaid = b.totalCount > 0 && b.paidCount >= b.totalCount;
+            return (
+              <div key={b.brandName} className="overflow-hidden rounded-lg border border-slate-200">
+                <button
+                  type="button"
+                  className="flex w-full items-center gap-3 bg-slate-50/60 px-3 py-2.5 text-left text-xs hover:bg-slate-100/70"
+                  onClick={() => setIncomeBrandOpen(isOpen ? null : b.brandName)}
+                >
+                  {isOpen ? <ChevronDown className="h-3.5 w-3.5 shrink-0 text-slate-400" /> : <ChevronRight className="h-3.5 w-3.5 shrink-0 text-slate-400" />}
+                  <span className="font-medium text-slate-700">{b.brandName}</span>
+                  <span className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${allPaid ? "bg-emerald-100 text-emerald-700" : "bg-amber-50 text-amber-600"}`}>
+                    已到账 {b.paidCount}/{b.totalCount} 期
+                  </span>
+                  <span className="ml-auto text-right tabular-nums">
+                    <span className="text-[10px] text-slate-400">已收 </span>
+                    <span className="font-medium text-emerald-600">{fmtMoney(b.paidAmount)}</span>
+                    <span className="mx-1 text-slate-300">/</span>
+                    <span className="text-slate-600">{fmtMoney(b.totalAmount)} 元</span>
+                  </span>
+                </button>
+                {isOpen && (
+                  <div className="overflow-x-auto border-t">
+                    <table className="w-full text-xs">
+                      <thead>
+                        <tr className="text-left text-[10px] uppercase tracking-wider text-slate-400">
+                          <th className="px-5 py-2.5 font-medium">期数</th>
+                          <th className="px-4 py-2.5 font-medium">应收时间</th>
+                          <th className="px-4 py-2.5 text-right font-medium">应收金额</th>
+                          <th className="px-4 py-2.5 font-medium">状态</th>
+                          <th className="px-4 py-2.5 font-medium">实际到账时间</th>
+                          <th className="px-4 py-2.5 text-center font-medium">操作</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {b.rows.length === 0 && (
+                          <tr><td colSpan={6} className="py-6 text-center text-slate-400">暂无分期</td></tr>
+                        )}
+                        {b.rows.map((s: any) => {
+                          const isPaid = s.status === "已到账";
+                          return (
+                            <tr key={s.id} className={`border-t border-slate-50 transition-colors hover:bg-slate-50/50 ${isPaid ? "bg-emerald-50/20" : ""}`}>
+                              <td className="px-5 py-3">
+                                <span className={`inline-flex h-6 w-6 items-center justify-center rounded-full text-[11px] font-semibold ${isPaid ? "bg-emerald-100 text-emerald-700" : "bg-slate-100 text-slate-500"}`}>{s.seq}</span>
+                              </td>
+                              <td className="px-4 py-3 whitespace-nowrap text-slate-600">
+                                {s.periodStart?.slice(0, 10) || "—"} ~ {s.periodEnd?.slice(0, 10) || "—"}
+                              </td>
+                              <td className="px-4 py-3 text-right font-medium tabular-nums text-slate-700">{fmtMoney(s.amount)}</td>
+                              <td className="px-4 py-3">
+                                {isPaid ? (
+                                  <span className="inline-flex items-center gap-1 rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-medium text-emerald-700">
+                                    <CheckCircle2 className="h-3 w-3" />已到账
+                                  </span>
+                                ) : (
+                                  <span className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-white px-2 py-0.5 text-[10px] font-medium text-slate-500">
+                                    未到账
+                                  </span>
+                                )}
+                              </td>
+                              <td className="px-4 py-3">
+                                {isPaid && s.payDate ? (
+                                  <span className="tabular-nums text-emerald-600">{s.payDate}</span>
+                                ) : (
+                                  <span className="text-slate-300">—</span>
+                                )}
+                              </td>
+                              <td className="px-4 py-3 text-center">
+                                {markingId === s.id ? (
+                                  <div className="flex items-center justify-center gap-1">
+                                    <input
+                                      type="date"
+                                      className="w-32 rounded-md border border-slate-200 px-2 py-1 text-xs"
+                                      value={markDate}
+                                      onChange={(e) => setMarkDate(e.target.value)}
+                                    />
+                                    <Button
+                                      size="sm"
+                                      className="h-7 rounded-lg bg-emerald-600 px-2.5 text-xs text-white hover:bg-emerald-700"
+                                      disabled={markDone.isPending}
+                                      onClick={() => {
+                                        if (!markDate) { toast.error("请选择到账日期"); return; }
+                                        markDone.mutate({ id: s.id, status: "已到账", payDate: markDate, side: "income" });
+                                      }}
+                                    >
+                                      保存
+                                    </Button>
+                                    {isPaid && (
+                                      <Button
+                                        size="sm"
+                                        variant="outline"
+                                        className="h-7 rounded-lg border-amber-200 bg-amber-50/60 px-2.5 text-xs font-medium text-amber-600 hover:bg-amber-100"
+                                        disabled={markDone.isPending}
+                                        onClick={() => markDone.mutate({ id: s.id, status: "未到账", payDate: markDate, side: "income" })}
+                                      >
+                                        撤销到账
+                                      </Button>
+                                    )}
+                                    <Button size="sm" variant="outline" className="h-7 rounded-lg px-2.5 text-xs" onClick={() => { setMarkingId(null); setMarkDate(""); }}>取消</Button>
+                                  </div>
+                                ) : isPaid ? (
+                                  <div className="flex items-center justify-center gap-1">
+                                    <span className="tabular-nums text-emerald-600">{s.payDate || ""}</span>
+                                    <button
+                                      type="button"
+                                      className="rounded px-1.5 py-0.5 text-[11px] text-rose-600 hover:text-rose-700"
+                                      onClick={() => { setMarkingId(s.id); setMarkDate(s.payDate || new Date().toISOString().slice(0, 10)); }}
+                                    >
+                                      修改
+                                    </button>
+                                  </div>
+                                ) : (
+                                  <Button
+                                    size="sm"
+                                    variant="outline"
+                                    className="h-7 rounded-lg border-emerald-200 bg-emerald-50/60 px-2.5 text-xs font-medium text-emerald-600 hover:border-emerald-300 hover:bg-emerald-100"
+                                    onClick={() => { setMarkingId(s.id); setMarkDate(new Date().toISOString().slice(0, 10)); }}
+                                  >
+                                    标记到账
+                                  </Button>
+                                )}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
       </div>
         </>
       )}

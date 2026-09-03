@@ -30,9 +30,10 @@ export function ContractSchedule({ contractId, side, title, editable = true }: {
   });
 
   const doneStatus = side === "payment" ? "已付款" : "已到账";
+  const undoneStatus = side === "payment" ? "未付款" : "未到账";
   const markDone = useMutation({
-    mutationFn: ({ id, payDate }: { id: number; payDate: string }) =>
-      updateSchedule(id, { status: doneStatus, payDate, side }),
+    mutationFn: ({ id, payDate, status }: { id: number; payDate: string; status?: string }) =>
+      updateSchedule(id, { status: status ?? doneStatus, payDate, side }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: [queryKey] });
       toast.success(side === "payment" ? "已标记付款" : "已标记到账");
@@ -141,36 +142,49 @@ export function ContractSchedule({ contractId, side, title, editable = true }: {
                   </td>
                   {editable && (
                     <td className="px-2.5 py-1.5 text-center">
-                      {!done && (
-                        markingId === r.id ? (
-                          <div className="flex items-center justify-center gap-1">
-                            <input
-                              type="date"
-                              className={inputCls + " w-32 text-xs"}
-                              value={markDate}
-                              onChange={(e) => setMarkDate(e.target.value)}
-                            />
-                            <button
-                              onClick={() => {
-                                if (!markDate) { toast.error("请选择日期"); return; }
-                                markDone.mutate({ id: r.id, payDate: markDate });
-                              }}
-                              disabled={markDone.isPending}
-                              className="rounded bg-emerald-600 px-1.5 py-0.5 text-[10px] text-white hover:bg-emerald-700 disabled:opacity-50"
-                            >确认</button>
-                            <button
-                              onClick={() => { setMarkingId(null); setMarkDate(""); }}
-                              className="rounded bg-slate-200 px-1.5 py-0.5 text-[10px] text-slate-600 hover:bg-slate-300"
-                            >取消</button>
-                          </div>
-                        ) : (
+                      {markingId === r.id ? (
+                        <div className="flex items-center justify-center gap-1">
+                          <input
+                            type="date"
+                            className={inputCls + " w-32 text-xs"}
+                            value={markDate}
+                            onChange={(e) => setMarkDate(e.target.value)}
+                          />
                           <button
-                            onClick={() => { setMarkingId(r.id); setMarkDate(new Date().toISOString().slice(0, 10)); }}
-                            className="rounded bg-blue-600 px-1.5 py-0.5 text-[10px] text-white hover:bg-blue-700"
-                          >
-                            {side === "payment" ? "标记付款" : "标记到账"}
-                          </button>
-                        )
+                            onClick={() => {
+                              if (!markDate) { toast.error("请选择日期"); return; }
+                              markDone.mutate({ id: r.id, payDate: markDate, status: doneStatus });
+                            }}
+                            disabled={markDone.isPending}
+                            className="rounded bg-emerald-600 px-1.5 py-0.5 text-[10px] text-white hover:bg-emerald-700 disabled:opacity-50"
+                          >保存</button>
+                          {done && (
+                            <button
+                              onClick={() => markDone.mutate({ id: r.id, payDate: markDate, status: undoneStatus })}
+                              disabled={markDone.isPending}
+                              className="rounded border border-amber-200 bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-600 hover:bg-amber-100 disabled:opacity-50"
+                            >撤销</button>
+                          )}
+                          <button
+                            onClick={() => { setMarkingId(null); setMarkDate(""); }}
+                            className="rounded bg-slate-200 px-1.5 py-0.5 text-[10px] text-slate-600 hover:bg-slate-300"
+                          >取消</button>
+                        </div>
+                      ) : done ? (
+                        <div className="flex items-center justify-center gap-1">
+                          <span className="text-[10px] text-emerald-600">{doneStatus}</span>
+                          <button
+                            onClick={() => { setMarkingId(r.id); setMarkDate(r.payDate || new Date().toISOString().slice(0, 10)); }}
+                            className="rounded px-1 text-[10px] text-rose-600 hover:text-rose-700"
+                          >修改</button>
+                        </div>
+                      ) : (
+                        <button
+                          onClick={() => { setMarkingId(r.id); setMarkDate(new Date().toISOString().slice(0, 10)); }}
+                          className="rounded bg-blue-600 px-1.5 py-0.5 text-[10px] text-white hover:bg-blue-700"
+                        >
+                          {side === "payment" ? "标记付款" : "标记到账"}
+                        </button>
                       )}
                     </td>
                   )}

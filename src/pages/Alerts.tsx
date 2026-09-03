@@ -4,7 +4,8 @@ import { getAlerts } from "@/api/alerts";
 import { StatusBadge } from "@/components/Stat";
 import { inputCls } from "@/components/fields";
 import { fmtMoney, fmtNum, fmtDate } from "@/lib/format";
-import { Zap, ChevronDown, ChevronRight, AlertTriangle, ArrowDownCircle, ArrowUpCircle, RefreshCw } from "lucide-react";
+import { Zap, ChevronDown, ChevronRight, AlertTriangle, ArrowDownCircle, ArrowUpCircle, RefreshCw, Landmark } from "lucide-react";
+import { groupByEntity } from "@/lib/groupColors";
 import { toast } from "sonner";
 
 // ─── 统计卡片 ───
@@ -99,8 +100,17 @@ function ContractAlertCard({ items, side }: { items: any[]; side: "pay" | "incom
   const pendingWord = side === "pay" ? "未付" : "未收";
 
   return (
-    <div className="space-y-3">
-      {items.map((c: any) => {
+    <div className="space-y-4">
+      {groupByEntity(items).map((grp) => (
+        <div key={grp.entityName} className={`space-y-3 rounded-xl border p-3 ${grp.color.border} ${grp.color.bg}`}>
+          <div className="flex items-center gap-2 px-1">
+            <div className={`flex h-6 w-6 items-center justify-center rounded-md ${grp.color.icon}`}>
+              <Landmark className="h-3.5 w-3.5 text-white" />
+            </div>
+            <span className={`text-xs font-semibold ${grp.color.text}`}>{grp.entityName}</span>
+            <span className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${grp.color.chip}`}>{grp.rows.length} 份预警合同</span>
+          </div>
+          {grp.rows.map((c: any) => {
         const open = expanded.has(c.contractId);
         const overdue = c.overdueCount > 0;
         const statusBadge = c.status === "已到期" ? "已到期" : c.status === "临期" ? `临期(${c.daysLeft}天)` : "";
@@ -111,8 +121,13 @@ function ContractAlertCard({ items, side }: { items: any[]; side: "pay" | "incom
               <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
                 <span className="text-slate-400">{open ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}</span>
                 <span className="font-semibold text-slate-800">
-                  {side === "pay" ? (c.landlordName || c.partner) : (c.brandName || c.partner)}
+                  {c.landlordName || c.partner}
                 </span>
+                {side === "income" && (
+                  <span className="rounded-full bg-sky-100 px-2 py-0.5 text-[10px] font-medium text-sky-700">
+                    {c.brandName || "全品牌共享"}
+                  </span>
+                )}
                 <span className="text-xs text-slate-500">{c.contractType}</span>
                 {statusBadge && <StatusBadge status={statusBadge} />}
                 {overdue && (
@@ -178,7 +193,9 @@ function ContractAlertCard({ items, side }: { items: any[]; side: "pay" | "incom
             )}
           </div>
         );
-      })}
+        })}
+        </div>
+      ))}
     </div>
   );
 }

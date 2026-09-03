@@ -340,7 +340,19 @@ export default function Contracts() {
                       <th className={`${th} text-center`}>操作</th>
                     </tr></thead>
                     <tbody>
-                      {group.costContracts.map((c: any) => {
+                      {(() => {
+                        // 到期拆分：未过期合同在上，已到期/提前结束在下（剩余天数按 0 显示）
+                        const expiredCost = group.costContracts.filter((c: any) => c.status === "已到期" || c.status === "提前结束");
+                        const seqCost: any[] = group.costContracts.filter((c: any) => c.status !== "已到期" && c.status !== "提前结束");
+                        if (expiredCost.length > 0) seqCost.push({ divider: `已到期 / 提前结束（${expiredCost.length} 份）` }, ...expiredCost);
+                        return seqCost.map((c: any, ci: number) => {
+                        if (c.divider) {
+                          return (
+                            <tr key={`cost-divider-${ci}`} className="bg-slate-100/80">
+                              <td colSpan={13} className="px-3 py-1 text-[10px] font-medium text-slate-500">⬇ {c.divider}</td>
+                            </tr>
+                          );
+                        }
                         const isExpanded = expandedContractId === c.id;
                         return (
                           <>
@@ -380,7 +392,8 @@ export default function Contracts() {
                             )}
                           </>
                         );
-                      })}
+                        });
+                      })()}
                       {group.costContracts.length === 0 && (
                         <tr><td colSpan={13} className="py-4 text-center text-slate-400">暂无成本合同</td></tr>
                       )}
@@ -417,7 +430,19 @@ export default function Contracts() {
                       <th className={`${th} text-center`}>操作</th>
                     </tr></thead>
                     <tbody>
-                      {group.incomeContracts.map((c: any) => {
+                      {(() => {
+                        // 到期拆分：未过期合同在上，已到期/提前结束在下（剩余天数按 0 显示）
+                        const expiredInc = group.incomeContracts.filter((c: any) => c.status === "已到期" || c.status === "提前结束");
+                        const seqInc: any[] = group.incomeContracts.filter((c: any) => c.status !== "已到期" && c.status !== "提前结束");
+                        if (expiredInc.length > 0) seqInc.push({ divider: `已到期 / 提前结束（${expiredInc.length} 份）` }, ...expiredInc);
+                        return seqInc.map((c: any, ci: number) => {
+                        if (c.divider) {
+                          return (
+                            <tr key={`income-divider-${ci}`} className="bg-slate-100/80">
+                              <td colSpan={17} className="px-3 py-1 text-[10px] font-medium text-slate-500">⬇ {c.divider}</td>
+                            </tr>
+                          );
+                        }
                         const isExpanded = expandedContractId === c.id;
                         return (
                           <>
@@ -473,7 +498,8 @@ export default function Contracts() {
                             )}
                           </>
                         );
-                      })}
+                        });
+                      })()}
                       {group.incomeContracts.length === 0 && (
                         <tr><td colSpan={17} className="py-4 text-center text-slate-400">暂无收入合同</td></tr>
                       )}

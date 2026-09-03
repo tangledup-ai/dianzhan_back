@@ -1,6 +1,6 @@
 import { Fragment, useMemo, useState, useEffect } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { getElectricityMonthlyLedger, exportElectricityLedger, getReadingDetail } from "@/api/electricity";
+import { getElectricityMonthlyLedger, exportElectricityLedger, getReadingDetail, updateElectricityStatus } from "@/api/electricity";
 import { listLandlords } from "@/api/directory";
 import { submitStationApproval } from "@/api/approvals";
 import { Button } from "@/components/ui/button";
@@ -583,6 +583,19 @@ export default function Electricity() {
   const [payElec, setPayElec] = useState<{ landlordId: number; landlordName: string; period: string; g: any } | null>(null);
   // 抄表核对详情弹窗
   const [readingTarget, setReadingTarget] = useState<{ meterNo: string; period: string } | null>(null);
+  // 付款/收款状态行内编辑（可反复修改）
+  const [statusEdit, setStatusEdit] = useState<{ recordId: number; field: "pay" | "collect" } | null>(null);
+  const queryClient = useQueryClient();
+  const updateStatusMut = useMutation({
+    mutationFn: (p: { recordId: number; payStatus?: string; collectStatus?: string }) =>
+      updateElectricityStatus(p.recordId, p),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["electricity-monthly-ledger-range"] });
+      setStatusEdit(null);
+      toast.success("状态已更新");
+    },
+    onError: (e: any) => toast.error(e.response?.data?.detail || e.message || "更新失败"),
+  });
 
   const doExport = async () => {
     if (monthRange.length === 0) { toast.error("请选择有效的月份区间"); return; }
@@ -793,11 +806,45 @@ export default function Electricity() {
                                             <td className="px-2 py-1.5 tabular-nums">{fmtNum(d.kwh ?? d.payKwh)}</td>
                                             <td className="border-x px-2 py-1.5 text-right tabular-nums">{d.payUnitPrice != null ? fmtNum(d.payUnitPrice) : "—"}</td>
                                             <td className="px-2 py-1.5 text-right tabular-nums text-rose-600">{fmtMoney(d.payAmount)}</td>
-                                            <td className="px-2 py-1.5">{d.payStatus ?? "—"}</td>
+                                            <td className="px-2 py-1.5 text-center">
+                                              {statusEdit && statusEdit.recordId === d.recordId && statusEdit.field === "pay" ? (
+                                                <div className="flex items-center justify-center gap-1">
+                                                  <button type="button" className="rounded bg-emerald-100 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 hover:bg-emerald-200"
+                                                    onClick={(e) => { e.stopPropagation(); updateStatusMut.mutate({ recordId: d.recordId, payStatus: "已付款" }); }}>已付款</button>
+                                                  <button type="button" className="rounded border border-slate-200 bg-white px-1.5 py-0.5 text-[10px] text-slate-500 hover:bg-slate-100"
+                                                    onClick={(e) => { e.stopPropagation(); updateStatusMut.mutate({ recordId: d.recordId, payStatus: "未付款" }); }}>未付款</button>
+                                                  <button type="button" className="rounded px-1 text-[10px] text-slate-400 hover:text-slate-600"
+                                                    onClick={(e) => { e.stopPropagation(); setStatusEdit(null); }}>取消</button>
+                                                </div>
+                                              ) : (
+                                                <button type="button" title="点击修改付款状态"
+                                                  className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium ${d.payStatus === "已付款" ? "bg-emerald-100 text-emerald-700" : "border border-slate-200 bg-white text-slate-500"} hover:border-sky-300`}
+                                                  onClick={(e) => { e.stopPropagation(); setStatusEdit({ recordId: d.recordId, field: "pay" }); }}>
+                                                  {d.payStatus ?? "—"}
+                                                </button>
+                                              )}
+                                            </td>
                                             <td className="border-x px-2 py-1.5 text-right tabular-nums">{d.collectUnitPrice != null ? fmtNum(d.collectUnitPrice) : "—"}</td>
                                             <td className="px-2 py-1.5 text-right tabular-nums">{fmtMoney(d.collectAmount)}</td>
                                             <td className="px-2 py-1.5 text-right tabular-nums text-emerald-600">{fmtMoney(d.collectNet)}</td>
-                                            <td className="px-2 py-1.5">{d.collectStatus ?? "—"}</td>
+                                            <td className="px-2 py-1.5 text-center">
+                                              {statusEdit && statusEdit.recordId === d.recordId && statusEdit.field === "collect" ? (
+                                                <div className="flex items-center justify-center gap-1">
+                                                  <button type="button" className="rounded bg-emerald-100 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 hover:bg-emerald-200"
+                                                    onClick={(e) => { e.stopPropagation(); updateStatusMut.mutate({ recordId: d.recordId, collectStatus: "已到账" }); }}>已到账</button>
+                                                  <button type="button" className="rounded border border-slate-200 bg-white px-1.5 py-0.5 text-[10px] text-slate-500 hover:bg-slate-100"
+                                                    onClick={(e) => { e.stopPropagation(); updateStatusMut.mutate({ recordId: d.recordId, collectStatus: "未到账" }); }}>未到账</button>
+                                                  <button type="button" className="rounded px-1 text-[10px] text-slate-400 hover:text-slate-600"
+                                                    onClick={(e) => { e.stopPropagation(); setStatusEdit(null); }}>取消</button>
+                                                </div>
+                                              ) : (
+                                                <button type="button" title="点击修改收款状态"
+                                                  className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium ${d.collectStatus === "已到账" ? "bg-emerald-100 text-emerald-700" : "border border-slate-200 bg-white text-slate-500"} hover:border-sky-300`}
+                                                  onClick={(e) => { e.stopPropagation(); setStatusEdit({ recordId: d.recordId, field: "collect" }); }}>
+                                                  {d.collectStatus ?? "—"}
+                                                </button>
+                                              )}
+                                            </td>
                                             <td className="px-2 py-1.5 text-right tabular-nums font-medium text-slate-700">
                                               {fmtMoney(d.profit ?? (Number(d.collectNet ?? 0) - Number(d.payAmount ?? 0)))}
                                             </td>

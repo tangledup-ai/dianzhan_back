@@ -33,3 +33,7 @@ export const exportElectricityLedger = (period: string, dim: "landlord" | "brand
 // 单块电表的抄表核对详情（上月/本月抄表读数与日期、区间度数、台账费用）
 export const getReadingDetail = (meterNo: string, period: string) =>
   client.get("/electricity/reading-detail", { params: { meterNo, period } }).then(r => r.data);
+
+// 只更新付款/收款状态（点击状态徽章编辑；不影响金额与数据来源）
+export const updateElectricityStatus = (id: number, data: { payStatus?: string; collectStatus?: string }) =>
+  client.put(`/electricity/${id}/status`, data).then((r: any) => r.data);
