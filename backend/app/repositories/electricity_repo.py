@@ -132,6 +132,27 @@ def create_record(data: dict):
         conn.close()
 
 
+def update_status(record_id: int, pay_status: str = None, collect_status: str = None):
+    """仅更新付款/收款状态（不动金额与 data_source 标记）"""
+    conn = get_connection()
+    cur = get_dict_cursor(conn)
+    try:
+        updates, values = [], []
+        if pay_status is not None:
+            updates.append("pay_status = %s"); values.append(pay_status)
+        if collect_status is not None:
+            updates.append("collect_status = %s"); values.append(collect_status)
+        if not updates:
+            return None
+        values.append(record_id)
+        cur.execute(f"UPDATE electricity_records SET {', '.join(updates)}, updated_at = NOW() WHERE id = %s RETURNING *", values)
+        conn.commit()
+        return cur.fetchone()
+    finally:
+        cur.close()
+        conn.close()
+
+
 def update_record(record_id: int, data: dict):
     conn = get_connection()
     cur = get_dict_cursor(conn)

@@ -587,8 +587,10 @@ export default function Electricity() {
   const [statusEdit, setStatusEdit] = useState<{ recordId: number; field: "pay" | "collect" } | null>(null);
   const queryClient = useQueryClient();
   const updateStatusMut = useMutation({
-    mutationFn: (p: { recordId: number; payStatus?: string; collectStatus?: string }) =>
-      updateElectricityStatus(p.recordId, p),
+    mutationFn: (p: { recordId: number; payStatus?: string; collectStatus?: string }) => {
+      if (!p.recordId) throw new Error("台账记录ID缺失，请刷新页面后重试");
+      return updateElectricityStatus(p.recordId, p);
+    },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["electricity-monthly-ledger-range"] });
       setStatusEdit(null);
@@ -807,7 +809,7 @@ export default function Electricity() {
                                             <td className="border-x px-2 py-1.5 text-right tabular-nums">{d.payUnitPrice != null ? fmtNum(d.payUnitPrice) : "—"}</td>
                                             <td className="px-2 py-1.5 text-right tabular-nums text-rose-600">{fmtMoney(d.payAmount)}</td>
                                             <td className="px-2 py-1.5 text-center">
-                                              {statusEdit && statusEdit.recordId === d.recordId && statusEdit.field === "pay" ? (
+                                              {statusEdit && d.recordId != null && statusEdit.recordId === d.recordId && statusEdit.field === "pay" ? (
                                                 <div className="flex items-center justify-center gap-1">
                                                   <button type="button" className="rounded bg-emerald-100 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 hover:bg-emerald-200"
                                                     onClick={(e) => { e.stopPropagation(); updateStatusMut.mutate({ recordId: d.recordId, payStatus: "已付款" }); }}>已付款</button>
@@ -817,9 +819,10 @@ export default function Electricity() {
                                                     onClick={(e) => { e.stopPropagation(); setStatusEdit(null); }}>取消</button>
                                                 </div>
                                               ) : (
-                                                <button type="button" title="点击修改付款状态"
-                                                  className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium ${d.payStatus === "已付款" ? "bg-emerald-100 text-emerald-700" : "border border-slate-200 bg-white text-slate-500"} hover:border-sky-300`}
-                                                  onClick={(e) => { e.stopPropagation(); setStatusEdit({ recordId: d.recordId, field: "pay" }); }}>
+                                                <button type="button" title={d.recordId != null ? "点击修改付款状态" : "台账记录ID缺失，请刷新页面后重试"}
+                                                  disabled={d.recordId == null}
+                                                  className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium ${d.payStatus === "已付款" ? "bg-emerald-100 text-emerald-700" : "border border-slate-200 bg-white text-slate-500"} hover:border-sky-300 disabled:cursor-not-allowed disabled:opacity-60`}
+                                                  onClick={(e) => { e.stopPropagation(); if (d.recordId != null) setStatusEdit({ recordId: d.recordId, field: "pay" }); }}>
                                                   {d.payStatus ?? "—"}
                                                 </button>
                                               )}
@@ -828,7 +831,7 @@ export default function Electricity() {
                                             <td className="px-2 py-1.5 text-right tabular-nums">{fmtMoney(d.collectAmount)}</td>
                                             <td className="px-2 py-1.5 text-right tabular-nums text-emerald-600">{fmtMoney(d.collectNet)}</td>
                                             <td className="px-2 py-1.5 text-center">
-                                              {statusEdit && statusEdit.recordId === d.recordId && statusEdit.field === "collect" ? (
+                                              {statusEdit && d.recordId != null && statusEdit.recordId === d.recordId && statusEdit.field === "collect" ? (
                                                 <div className="flex items-center justify-center gap-1">
                                                   <button type="button" className="rounded bg-emerald-100 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 hover:bg-emerald-200"
                                                     onClick={(e) => { e.stopPropagation(); updateStatusMut.mutate({ recordId: d.recordId, collectStatus: "已到账" }); }}>已到账</button>
@@ -838,9 +841,10 @@ export default function Electricity() {
                                                     onClick={(e) => { e.stopPropagation(); setStatusEdit(null); }}>取消</button>
                                                 </div>
                                               ) : (
-                                                <button type="button" title="点击修改收款状态"
-                                                  className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium ${d.collectStatus === "已到账" ? "bg-emerald-100 text-emerald-700" : "border border-slate-200 bg-white text-slate-500"} hover:border-sky-300`}
-                                                  onClick={(e) => { e.stopPropagation(); setStatusEdit({ recordId: d.recordId, field: "collect" }); }}>
+                                                <button type="button" title={d.recordId != null ? "点击修改收款状态" : "台账记录ID缺失，请刷新页面后重试"}
+                                                  disabled={d.recordId == null}
+                                                  className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium ${d.collectStatus === "已到账" ? "bg-emerald-100 text-emerald-700" : "border border-slate-200 bg-white text-slate-500"} hover:border-sky-300 disabled:cursor-not-allowed disabled:opacity-60`}
+                                                  onClick={(e) => { e.stopPropagation(); if (d.recordId != null) setStatusEdit({ recordId: d.recordId, field: "collect" }); }}>
                                                   {d.collectStatus ?? "—"}
                                                 </button>
                                               )}

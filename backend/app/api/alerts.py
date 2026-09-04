@@ -6,7 +6,7 @@
   - 品牌方合同（收款）：到期提醒 + 应收分期明细（rent_income_schedule）
   - 提前天数在「基础档案 → 预警设置」配置（contract_expire_days_venue / _brand）
 """
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from ..infra.database import get_connection, get_dict_cursor
 from datetime import date, timedelta
 from .base import CamelJSONResponse
@@ -90,6 +90,42 @@ async def get_alerts(granularity: str = "monthly", days: int = 3):
             "contractPayments": contract_payments,
             "contractCollections": contract_collections,
         }
+    finally:
+        cur.close()
+        conn.close()
+
+
+@router.post("/contracts/{contract_id}/handle")
+async def handle_contract_alert(contract_id: int, request: Request):
+    """标记某合同的预警为「已处理」：记录处理时间与当时的预警特征。
+
+    预警特征 = 状态|到期日|逾期期数。特征未变化则该合同不再出现在预警里；
+    出现新的逾期分期或状态变化（如临期→已到期）后，特征改变，会再次预警。
+    """
+    from ..infra.database import get_connection, get_dict_cursor
+
+    conn = get_connection()
+    cur = get_dict_cursor(conn)
+    try:
+        cfg = _get_config(cur)
+        sig = None
+        for side, ctype, days in (("pay", "场地合同", cfg["expireDaysVenue"]),
+                                  ("income", "品牌方合同", cfg["expireDaysBrand"])):
+            for item in _get_contract_alerts(cur, ctype, days, side):
+                if item["contractId"] == contract_id:
+                    sig = item["handleSig"]
+                    break
+            if sig:
+                break
+        if not sig:
+            raise HTTPException(404, "该合同当前没有预警，无需处理")
+
+        cur.execute(
+            "UPDATE contracts SET alert_handled_at = NOW(), alert_handled_sig = %s WHERE id = %s",
+            (sig, contract_id),
+        )
+        conn.commit()
+        return {"ok": True, "contractId": contract_id, "sig": sig}
     finally:
         cur.close()
         conn.close()
@@ -256,6 +292,13 @@ def _get_contract_alerts(cur, contract_type: str, expire_days: int, side: str):
     cur.execute(f"""
         SELECT
             c.id, c.contract_type, c.partner, c.landlord_id,
+            c.alert_handled_sig, c.alert_handled_at,
+            COALESCE(
+              (SELECT ent.name FROM contracts c2 JOIN entities ent ON ent.id = c2.entity_id
+                WHERE c2.landlord_id = c.landlord_id AND c2.contract_type = '场地合同' AND c2.entity_id IS NOT NULL LIMIT 1),
+              (SELECT ent.name FROM contracts c2 JOIN entities ent ON ent.id = c2.entity_id
+                WHERE c2.landlord_id = c.landlord_id AND c2.entity_id IS NOT NULL LIMIT 1),
+              '未指定主体') AS entity_name,
             c.monthly_rent, c.rent_amount, c.pay_method,
             c.start_date, c.end_date, COALESCE(c.early_end_date, c.end_date) AS effective_end,
             COALESCE(l.name, '') AS landlord_name,
@@ -293,6 +336,9 @@ def _get_contract_alerts(cur, contract_type: str, expire_days: int, side: str):
             contracts[cid] = {
                 "contractId": cid,
                 "landlordId": r.get("landlord_id"),
+                "entityName": r.get("entity_name") or "未指定主体",
+                "handledSig": r.get("alert_handled_sig"),
+                "handledAt": r.get("alert_handled_at"),
                 "contractType": r.get("contract_type") or contract_type,
                 "landlordName": r.get("landlord_name") or "",
                 "brandName": r.get("brand_name") or "",
@@ -357,6 +403,11 @@ def _get_contract_alerts(cur, contract_type: str, expire_days: int, side: str):
         c["overdueAmount"] = round(c["overdueAmount"], 2)
         # 只返回「有提醒价值」的合同：临期 / 已到期 / 有逾期未收未付分期
         if c["status"] in ("已到期", "临期") or c["overdueCount"] > 0:
+            # 处理状态：处理时记录的预警特征（状态|到期日|逾期期数）与当前一致 → 已处理；
+            # 特征变化（新的逾期分期、临期→已到期等）→ 自动回到未处理，再次提醒
+            sig = f"{c['status']}|{c['endDate'] or ''}|{c['overdueCount']}"
+            c["handleSig"] = sig
+            c["handleStatus"] = "已处理" if c.get("handledSig") == sig else "未处理"
             result.append(c)
 
     # 排序：已到期 > 临期（剩余天数少的在前）> 逾期金额大的在前

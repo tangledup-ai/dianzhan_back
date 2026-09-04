@@ -121,6 +121,23 @@ async def list_periods():
     return electricity_repo.list_periods()
 
 
+@router.put("/{record_id}/status")
+async def update_electricity_status(record_id: int, data: dict):
+    """只更新付款/收款状态（点击状态徽章编辑；不影响金额与 data_source 标记）"""
+    pay = data.get("payStatus")
+    collect = data.get("collectStatus")
+    if pay is None and collect is None:
+        raise HTTPException(400, "无状态更新")
+    if pay is not None and pay not in ("未付款", "已付款"):
+        raise HTTPException(400, f"付款状态无效: {pay}")
+    if collect is not None and collect not in ("未到账", "已到账"):
+        raise HTTPException(400, f"收款状态无效: {collect}")
+    result = electricity_repo.update_status(record_id, pay, collect)
+    if not result:
+        raise HTTPException(404, "电费记录不存在")
+    return result
+
+
 @router.get("/reading-detail")
 async def reading_detail(request: Request, meterNo: str, period: str):
     """单块电表的抄表核对信息（上月/本月抄表读数与日期、区间度数、台账费用），
@@ -748,7 +765,7 @@ async def monthly_ledger(period: str, dim: str = "landlord"):
                            m.brand_id, b.name AS brand_name,
                            d.kwh, d.pay_unit_price, d.pay_amount, d.collect_unit_price,
                            d.collect_amount, d.collect_net,
-                           e.pay_status, e.collect_status, e.data_source
+                           e.pay_status, e.collect_status, e.data_source, e.id AS record_id
                     FROM electricity_meter_details d
                     JOIN electricity_records e ON e.id = d.electricity_id
                     JOIN meters m ON d.meter_id = m.id
@@ -791,7 +808,7 @@ async def monthly_ledger(period: str, dim: str = "landlord"):
                            m.brand_id, b.name AS brand_name,
                            d.kwh, d.pay_unit_price, d.pay_amount, d.collect_unit_price,
                            d.collect_amount, d.collect_net,
-                           e.pay_status, e.collect_status, e.data_source
+                           e.pay_status, e.collect_status, e.data_source, e.id AS record_id
                     FROM electricity_meter_details d
                     JOIN electricity_records e ON e.id = d.electricity_id
                     JOIN meters m ON d.meter_id = m.id

@@ -1,15 +1,32 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { getOverview, getMonthlyDetail } from "@/api/overview";
-import { listContracts } from "@/api/contracts";
+import { getAlerts } from "@/api/alerts";
+import { ContractAlertCard } from "@/components/ContractAlertCard";
 import { StatCard } from "@/components/Stat";
 import { MonthPicker } from "@/components/MonthPicker";
 import { fmtMoney, fmtNum } from "@/lib/format";
-import { Building2, Zap, Home, TrendingUp, AlertTriangle, FileWarning, Wallet, Clock, Users, Tag, Landmark, MapPin, ChevronDown, ChevronRight } from "lucide-react";
+import { Building2, Zap, Home, TrendingUp, FileWarning, Wallet, Clock, Users, Tag, Landmark, MapPin, ChevronDown, ChevronRight } from "lucide-react";
 import {
   ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Tooltip, Legend, CartesianGrid,
 } from "recharts";
 import { Link } from "react-router";
+
+// 首页合同预警板块（默认展开，可点击收起）
+function DashboardAlertSection({ title, caption, items, side }: { title: string; caption: string; items: any[]; side: "pay" | "income" }) {
+  const [open, setOpen] = useState(true);
+  return (
+    <div>
+      <button type="button" className="mb-2 flex w-full items-center gap-2 text-left" onClick={() => setOpen((o) => !o)}>
+        {open ? <ChevronDown className="h-3.5 w-3.5 text-slate-400" /> : <ChevronRight className="h-3.5 w-3.5 text-slate-400" />}
+        <span className="text-xs font-semibold text-slate-700">{title}</span>
+        <span className="text-[11px] text-slate-400">{caption}</span>
+        <span className="ml-auto text-[11px] text-slate-400">{items.length} 份</span>
+      </button>
+      {open && <ContractAlertCard items={items} side={side} brief linkTo="/alerts?tab=contract" />}
+    </div>
+  );
+}
 
 export default function Dashboard() {
   // 默认选中当月
@@ -18,7 +35,15 @@ export default function Dashboard() {
   const [selectedMonth, setSelectedMonth] = useState(defaultMonth);
 
   const { data, isLoading } = useQuery({ queryKey: ["overview"], queryFn: getOverview });
-  const contracts = useQuery({ queryKey: ["contracts"], queryFn: () => listContracts() });
+  // 合同预警（与预警页同源：应付/应收 + 逾期分期，按公司主体分组）
+  const alertsQ = useQuery({ queryKey: ["alerts", "monthly", 3], queryFn: () => getAlerts({ granularity: "monthly", days: 3 }) });
+  const alertPay = alertsQ.data?.contractPayments ?? [];
+  const alertInc = alertsQ.data?.contractCollections ?? [];
+  // 首页只展示「未处理」的预警；已处理的在预警页可见
+  const openAlertPay = alertPay.filter((i: any) => i.handleStatus !== "已处理");
+  const openAlertInc = alertInc.filter((i: any) => i.handleStatus !== "已处理");
+  const expiringCount = [...openAlertPay, ...openAlertInc].filter((i: any) => i.status === "临期").length;
+  const overdueOnlyCount = [...openAlertPay, ...openAlertInc].filter((i: any) => i.status !== "临期" && i.status !== "已到期").length;
   const monthlyDetail = useQuery({
     queryKey: ["monthlyDetail", selectedMonth],
     queryFn: () => getMonthlyDetail(selectedMonth),
@@ -29,7 +54,7 @@ export default function Dashboard() {
 
   if (isLoading || !data) return <div className="py-20 text-center text-slate-400">🚀 正在加载数据...</div>;
 
-  const expiring = (contracts.data ?? []).filter((c: any) => c.status === "临期" || c.status === "已到期");
+  // 到期预警列表：只显示临期（未过期）合同；已到期/提前结束（剩余天数 0）的不展示，避免堆积
   const md = monthlyDetail.data;
   const totalProfit = data.netProfitTotal ?? (data.elecProfit + data.rentIncomeTotal - data.rentCostTotal - data.opExpenseTotal);
 
@@ -184,12 +209,12 @@ export default function Dashboard() {
         <StatCard label="运营费用（元）" value={fmtMoney(data.opExpenseTotal)} icon={Wallet} />
         <StatCard label="待收款项（元）" value={fmtMoney(data.elecUncollected + data.rentUncollected)} sub={`电费 ${fmtMoney(data.elecUncollected)} · 租金 ${fmtMoney(data.rentUncollected)}`} icon={Clock} tone="amber" />
         <StatCard label="待付款项（元）" value={fmtMoney(data.elecUnpaid)} icon={Wallet} tone="red" />
-        {/* 与「异常预警 → 合同预警」同口径；点击直达该页 */}
+        {/* 预警口径：只计「未处理」的 临期 + 逾期分期；已到期（0天）与已处理的不计数，明细见预警页 */}
         <Link to="/alerts?tab=contract" className="block rounded-xl transition-transform hover:scale-[1.02]">
           <StatCard
             label="合同预警"
-            value={`${data.expiredContracts + data.expiringContracts + (data.overdueContracts ?? 0)}`}
-            sub={`已到期 ${data.expiredContracts} · 临期 ${data.expiringContracts} · 逾期分期 ${data.overdueContracts ?? 0}`}
+            value={`${expiringCount + overdueOnlyCount}`}
+            sub={`临期 ${expiringCount} · 逾期分期 ${overdueOnlyCount}`}
             icon={FileWarning}
             tone="red"
           />
@@ -226,10 +251,10 @@ export default function Dashboard() {
 
       {/* 图表与预警 */}
       <div className="grid gap-6 lg:grid-cols-3">
-        <div className="rounded-xl border bg-white p-5 shadow-sm lg:col-span-2">
+        <div className="rounded-xl border bg-white p-5 shadow-sm lg:col-span-2 flex flex-col min-w-0">
           <h3 className="mb-4 text-sm font-semibold text-slate-700">电费收付月度趋势</h3>
-          <div className="h-72">
-            <ResponsiveContainer width="100%" height="100%">
+          <div className="min-h-[18rem] flex-1">
+            <ResponsiveContainer width="100%" height="100%" debounce={200}>
               <BarChart data={data.monthly}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" />
                 <XAxis dataKey="period" fontSize={12} />
@@ -244,28 +269,20 @@ export default function Dashboard() {
           </div>
         </div>
 
-        <div className="rounded-xl border bg-white p-5 shadow-sm">
+        {/* 合同预警：与预警页同源（应付/应收 + 逾期分期），按公司主体分组 */}
+        <div className="rounded-xl border bg-white p-5 shadow-sm min-w-0">
           <div className="mb-3 flex items-center justify-between">
             <h3 className="flex items-center gap-1.5 text-sm font-semibold text-slate-700">
-              <AlertTriangle className="h-4 w-4 text-amber-500" /> 合同到期预警
+              <FileWarning className="h-4 w-4 text-rose-500" /> 合同预警
             </h3>
-            <Link to="/contracts" className="text-xs text-emerald-600 hover:underline">全部合同 →</Link>
+            <Link to="/alerts?tab=contract" className="text-xs text-emerald-600 hover:underline">预警详情 →</Link>
           </div>
-          <div className="max-h-72 space-y-2 overflow-y-auto">
-            {expiring.length === 0 && <div className="py-10 text-center text-xs text-slate-400">暂无临期或到期合同</div>}
-            {expiring.map((c: any) => (
-              <div key={c.id} className="rounded-lg border border-slate-100 bg-slate-50 px-3 py-2">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-medium text-slate-700">{c.landlordName || c.stationName || "-"}</span>
-                  <span className={`text-[11px] font-semibold ${c.status === "已到期" ? "text-rose-600" : "text-amber-600"}`}>
-                    {c.status === "已到期" ? `已逾期 ${-c.days_left} 天` : `剩 ${c.days_left} 天`}
-                  </span>
-                </div>
-                <div className="mt-0.5 text-[11px] text-slate-400">
-                  {c.brandName ?? "未关联品牌"} · 至 {c.endDate ?? "-"}
-                </div>
-              </div>
-            ))}
+          <div className="max-h-[28rem] space-y-4 overflow-y-auto pr-1">
+            {openAlertPay.length === 0 && openAlertInc.length === 0 && (
+              <div className="py-8 text-center text-xs text-slate-400">暂无未处理的合同预警（临期 / 逾期分期合同将显示在这里）</div>
+            )}
+            <DashboardAlertSection title="场地合同 · 应付预警" caption="公司 → 场地方" items={openAlertPay} side="pay" />
+            <DashboardAlertSection title="品牌方合同 · 应收预警" caption="品牌方 → 公司" items={openAlertInc} side="income" />
           </div>
         </div>
       </div>

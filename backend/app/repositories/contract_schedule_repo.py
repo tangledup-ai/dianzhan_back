@@ -226,9 +226,17 @@ def update_schedule(schedule_id: int, side: str, data: dict):
             "amount": "amount",
         }
         updates, values = [], []
+        # 撤销标记：状态改回未付款/未到账时，清空实际付款/到账日期（忽略传入的 payDate）
+        revert = data.get("status") in ("未付款", "未到账")
         for key, db_field in field_map.items():
-            if key in data and data[key] is not None:
+            if key not in data:
+                continue
+            if key == "payDate" and revert:
+                continue
+            if data[key] is not None:
                 updates.append(f"{db_field} = %s"); values.append(data[key])
+        if revert:
+            updates.append("pay_date = NULL")
         if not updates:
             return None
         values.append(schedule_id)

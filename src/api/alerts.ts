@@ -11,3 +11,7 @@ export const saveAlertConfig = (data: { elecYoyRatio?: number; expireDaysVenue?:
 // granularity: daily=近N天日均 vs 前7天日均；monthly=本月 vs 去年同月
 export const getAlerts = (params?: { granularity?: "daily" | "monthly"; days?: number }) =>
   client.get("/alerts", { params }).then(r => r.data);
+
+// 标记某合同的预警为「已处理」：记录当时的预警特征，特征未变化前不再提醒
+export const handleContractAlert = (contractId: number) =>
+  client.post(`/alerts/contracts/${contractId}/handle`).then(r => r.data);

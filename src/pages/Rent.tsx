@@ -1002,14 +1002,16 @@ export default function Rent() {
 
   // 区间合计（总览）
   const totals = useMemo(() => {
-    const t = { rentIncome: 0, rentCost: 0, rentTax: 0, paidAmount: 0, pendingAmount: 0, rentProfit: 0 };
+    const t = { rentIncome: 0, rentCost: 0, rentTax: 0, paidAmount: 0, unpaidAmount: 0, collectedAmount: 0, uncollectedAmount: 0, rentProfit: 0 };
     for (const m of months) {
       const mt = m.totals ?? {};
       t.rentIncome += mt.rentIncome ?? 0;
       t.rentCost += mt.rentCost ?? 0;
       t.rentTax += mt.rentTax ?? 0;
       t.paidAmount += mt.paidAmount ?? 0;
-      t.pendingAmount += mt.pendingAmount ?? 0;
+      t.unpaidAmount += mt.unpaidAmount ?? 0;
+      t.collectedAmount += mt.collectedAmount ?? 0;
+      t.uncollectedAmount += mt.uncollectedAmount ?? 0;
     }
     t.rentProfit = t.rentIncome - t.rentCost - t.rentTax;
     return t;
@@ -1138,13 +1140,15 @@ export default function Rent() {
       </div>
 
       {/* ── 区间总览（合计核对） ── */}
-      <div className="grid grid-cols-2 gap-3 md:grid-cols-6">
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
         <StatCard label="区间场地费收入" value={totals.rentIncome} tone="emerald" />
         {dim === "landlord" && <StatCard label="区间场地费成本" value={totals.rentCost} tone="rose" />}
         <StatCard label="区间税费" value={totals.rentTax} />
         <StatCard label="区间利润" value={totals.rentProfit} tone="blue" />
-        <StatCard label="区间已收/已付" value={totals.paidAmount} />
-        <StatCard label="区间未收/未付" value={totals.pendingAmount} />
+        <StatCard label="区间已收" value={totals.collectedAmount} tone="emerald" />
+        <StatCard label="区间未收" value={totals.uncollectedAmount} />
+        {dim === "landlord" && <StatCard label="区间已付" value={totals.paidAmount} />}
+        {dim === "landlord" && <StatCard label="区间未付" value={totals.unpaidAmount} tone="rose" />}
       </div>
 
       {/* ── 年度付款计划（默认收起，可搜索场地方/品牌） ── */}
@@ -1221,13 +1225,15 @@ export default function Rent() {
               {dim === "landlord" && <th className="px-3 py-2.5 text-right font-medium">场地费成本</th>}
               <th className="px-3 py-2.5 text-right font-medium">税费</th>
               <th className="px-3 py-2.5 text-right font-medium">利润</th>
-              <th className="px-3 py-2.5 text-right font-medium">已收/已付</th>
-              <th className="px-3 py-2.5 text-right font-medium">未收/未付</th>
+              <th className="px-3 py-2.5 text-right font-medium">已收</th>
+              <th className="px-3 py-2.5 text-right font-medium">未收</th>
+              {dim === "landlord" && <th className="px-3 py-2.5 text-right font-medium">已付</th>}
+              {dim === "landlord" && <th className="px-3 py-2.5 text-right font-medium">未付</th>}
             </tr>
           </thead>
           <tbody>
             {months.length === 0 && (
-              <tr><td colSpan={8} className="px-3 py-8 text-center text-slate-400">
+              <tr><td colSpan={dim === "landlord" ? 10 : 6} className="px-3 py-8 text-center text-slate-400">
                 {q.isLoading ? "加载中…" : "请选择有效的月份区间"}
               </td></tr>
             )}
@@ -1246,12 +1252,14 @@ export default function Rent() {
                     {dim === "landlord" && <td className="px-3 py-2.5 text-right tabular-nums text-rose-600">{fmtMoney(mt.rentCost)}</td>}
                     <td className="px-3 py-2.5 text-right tabular-nums text-slate-500">{fmtMoney(mt.rentTax)}</td>
                     <td className="px-3 py-2.5 text-right tabular-nums font-medium text-slate-700">{fmtMoney(mt.rentProfit)}</td>
-                    <td className="px-3 py-2.5 text-right tabular-nums text-slate-600">{fmtMoney(mt.paidAmount)}</td>
-                    <td className="px-3 py-2.5 text-right tabular-nums text-amber-600">{fmtMoney(mt.pendingAmount)}</td>
+                    <td className="px-3 py-2.5 text-right tabular-nums text-emerald-600">{fmtMoney(mt.collectedAmount)}</td>
+                    <td className="px-3 py-2.5 text-right tabular-nums text-amber-600">{fmtMoney(mt.uncollectedAmount)}</td>
+                    {dim === "landlord" && <td className="px-3 py-2.5 text-right tabular-nums text-slate-600">{fmtMoney(mt.paidAmount)}</td>}
+                    {dim === "landlord" && <td className="px-3 py-2.5 text-right tabular-nums text-rose-600">{fmtMoney(mt.unpaidAmount)}</td>}
                   </tr>
                   {mOpen && (
                     <tr className="border-b bg-slate-50/40">
-                      <td colSpan={dim === "landlord" ? 8 : 7} className="px-6 py-3">
+                      <td colSpan={dim === "landlord" ? 10 : 6} className="px-6 py-3">
                         <div className="space-y-3">
                           <div className="text-[11px] font-medium text-slate-400">
                             {toDisplay(m.period)} · 按{dim === "landlord" ? "场地方" : "品牌方"}明细（点击卡片展开合同：付款/收款信息）
@@ -1277,8 +1285,10 @@ export default function Rent() {
                                     {dim === "landlord" && <th className="px-2 py-1 text-right">场地费成本</th>}
                                     <th className="px-2 py-1 text-right">税费</th>
                                     <th className="px-2 py-1 text-right">利润</th>
-                                    <th className="px-2 py-1 text-right">已收/已付</th>
-                                    <th className="px-2 py-1 text-right">未收/未付</th>
+                                    <th className="px-2 py-1 text-right">已收</th>
+                                    <th className="px-2 py-1 text-right">未收</th>
+                                    {dim === "landlord" && <th className="px-2 py-1 text-right">已付</th>}
+                                    {dim === "landlord" && <th className="px-2 py-1 text-right">未付</th>}
                                   </tr>
                                 </thead>
                                 <tbody>
@@ -1289,8 +1299,10 @@ export default function Rent() {
                                     {dim === "landlord" && <td className="px-2 py-1.5 text-right tabular-nums text-rose-600">{fmtMoney(g.rentCost)}</td>}
                                     <td className="px-2 py-1.5 text-right tabular-nums text-slate-500">{fmtMoney(g.rentTax)}</td>
                                     <td className="px-2 py-1.5 text-right tabular-nums font-medium text-slate-700">{fmtMoney(g.rentProfit)}</td>
-                                    <td className="px-2 py-1.5 text-right tabular-nums text-slate-600">{fmtMoney(g.paidAmount)}</td>
-                                    <td className="px-2 py-1.5 text-right tabular-nums text-amber-600">{fmtMoney(g.pendingAmount)}</td>
+                                    <td className="px-2 py-1.5 text-right tabular-nums text-emerald-600">{fmtMoney(g.collectedAmount)}</td>
+                                    <td className="px-2 py-1.5 text-right tabular-nums text-amber-600">{fmtMoney(g.uncollectedAmount)}</td>
+                                    {dim === "landlord" && <td className="px-2 py-1.5 text-right tabular-nums text-slate-600">{fmtMoney(g.paidAmount)}</td>}
+                                    {dim === "landlord" && <td className="px-2 py-1.5 text-right tabular-nums text-rose-600">{fmtMoney(g.unpaidAmount)}</td>}
                                   </tr>
                                   ))}
                                 </tbody>
@@ -1315,8 +1327,10 @@ export default function Rent() {
                 {dim === "landlord" && <td className="px-3 py-2.5 text-right tabular-nums text-rose-600">{fmtMoney(totals.rentCost)}</td>}
                 <td className="px-3 py-2.5 text-right tabular-nums text-slate-500">{fmtMoney(totals.rentTax)}</td>
                 <td className="px-3 py-2.5 text-right tabular-nums">{fmtMoney(totals.rentProfit)}</td>
-                <td className="px-3 py-2.5 text-right tabular-nums">{fmtMoney(totals.paidAmount)}</td>
-                <td className="px-3 py-2.5 text-right tabular-nums">{fmtMoney(totals.pendingAmount)}</td>
+                <td className="px-3 py-2.5 text-right tabular-nums text-emerald-600">{fmtMoney(totals.collectedAmount)}</td>
+                <td className="px-3 py-2.5 text-right tabular-nums text-amber-600">{fmtMoney(totals.uncollectedAmount)}</td>
+                {dim === "landlord" && <td className="px-3 py-2.5 text-right tabular-nums text-slate-600">{fmtMoney(totals.paidAmount)}</td>}
+                {dim === "landlord" && <td className="px-3 py-2.5 text-right tabular-nums text-rose-600">{fmtMoney(totals.unpaidAmount)}</td>}
               </tr>
             </tfoot>
           )}
@@ -1325,7 +1339,7 @@ export default function Rent() {
 
       <p className="text-[11px] text-slate-400">
         口径：收入=品牌方合同月租（覆盖该月）；成本=场地合同月租；税费=启用租金税率的品牌方合同（含税月租−税后月租）；
-        已收/未收 = 该月覆盖期次的分期状态（品牌方=已到账/未到账，场地=已付款/未付款）。不含电费。编辑合同请到「合同管理」页。
+        已收/未收 = 品牌方合同该月覆盖期次的到账状态（已到账/未到账）；已付/未付 = 场地合同该月覆盖期次的付款状态（已付款/未付款）。不含电费。编辑合同请到「合同管理」页。
       </p>
 
       {/* ── 整年场地收支（页面末尾，默认收起，点击展开） ── */}

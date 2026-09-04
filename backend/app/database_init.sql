@@ -331,6 +331,9 @@ CREATE TABLE IF NOT EXISTS contracts (
     pay_method VARCHAR(50),
     rent_advance_days INTEGER NOT NULL DEFAULT 0,
     pay_status VARCHAR(20) DEFAULT '未付款',
+    -- ⑥ 预警处理：记录「标记已处理」时间与当时的预警特征，特征未变化则不再提醒
+    alert_handled_at TIMESTAMPTZ,
+    alert_handled_sig TEXT,
     start_date DATE,
     end_date DATE,
     rent_tax_enabled BOOLEAN DEFAULT FALSE,
@@ -1145,3 +1148,7 @@ CREATE INDEX IF NOT EXISTS idx_elec_details_meter ON electricity_meter_details(m
 --         station_id WITH =, introducer_id WITH =, COALESCE(brand_id, 0) WITH =,
 --         daterange(COALESCE(start_date, DATE '1970-01-01'), COALESCE(end_date, DATE '9999-12-31'), '[]') WITH &&
 --     );
+
+-- ─── 合同预警「标记已处理」：存量库补列（幂等）──────────────────
+ALTER TABLE contracts ADD COLUMN IF NOT EXISTS alert_handled_at TIMESTAMPTZ;
+ALTER TABLE contracts ADD COLUMN IF NOT EXISTS alert_handled_sig TEXT;

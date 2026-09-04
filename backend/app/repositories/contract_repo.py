@@ -137,7 +137,8 @@ def list_contracts(brand_id: int = None, landlord_id: int = None, station_id: in
             end = early_end or r.get("end_date")
             if end:
                 days_left = (end - today).days
-                r["days_left"] = days_left
+                # 剩余天数显示值最小为 0：已到期/提前结束由 status 徽章表达，不再显示负数
+                r["days_left"] = max(0, days_left)
                 if early_end and days_left < 0:
                     r["status"] = "提前结束"
                 elif days_left < 0:

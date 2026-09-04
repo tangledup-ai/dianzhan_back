@@ -198,14 +198,21 @@ async def monthly_ledger(request: Request, period: str = Query(..., description=
         rent_tax = 0.0
         if c["contract_type"] == "品牌方合同" and c["rent_tax_enabled"] and c.get("post_tax_rent_price") is not None:
             rent_tax = round(monthly - float(c["post_tax_rent_price"]), 2)
-        paid = pending = 0.0
+        # 收付拆分：品牌方合同=收款侧（已到账/未到账）；场地合同=付款侧（已付款/未付款）
+        collected = uncollected = paid = unpaid = 0.0
+        is_income = c["contract_type"] == "品牌方合同"
         for s in sched_map.get(c["contract_id"], []):
             amt = float(s["amount"] or 0)
-            if s["status"] in ("已到账", "已付款"):
-                paid += amt
+            if is_income:
+                if s["status"] == "已到账":
+                    collected += amt
+                else:
+                    uncollected += amt
             else:
-                pending += amt
-        is_income = c["contract_type"] == "品牌方合同"
+                if s["status"] == "已付款":
+                    paid += amt
+                else:
+                    unpaid += amt
         return {
             "contractId": c["contract_id"],
             "contractType": c["contract_type"],
@@ -231,7 +238,9 @@ async def monthly_ledger(request: Request, period: str = Query(..., description=
             "startDate": str(c["start_date"])[:10] if c["start_date"] else None,
             "endDate": str(c["early_end_date"] or c["end_date"])[:10] if (c["early_end_date"] or c["end_date"]) else None,
             "paidAmount": round(paid, 2),
-            "pendingAmount": round(pending, 2),
+            "unpaidAmount": round(unpaid, 2),
+            "collectedAmount": round(collected, 2),
+            "uncollectedAmount": round(uncollected, 2),
             # 逐年付款/到账情况（品牌方=已到账，场地=已付款）
             "yearStatus": _year_status(c["contract_id"], ("已到账", "已付款") if is_income else ("已付款",)),
         }
@@ -248,7 +257,8 @@ async def monthly_ledger(request: Request, period: str = Query(..., description=
             g = rows.setdefault(key, {
                 "key": c["brand_id"], "name": c["brand_name"] or f"品牌#{c['brand_id']}",
                 "rentIncome": 0.0, "rentCost": 0.0, "rentTax": 0.0,
-                "paidAmount": 0.0, "pendingAmount": 0.0, "contracts": [],
+                "paidAmount": 0.0, "unpaidAmount": 0.0,
+                "collectedAmount": 0.0, "uncollectedAmount": 0.0, "contracts": [],
             })
             g["rentIncome"] += item["monthlyRent"]
             g["rentTax"] += item["rentTax"]
@@ -257,15 +267,20 @@ async def monthly_ledger(request: Request, period: str = Query(..., description=
             g = rows.setdefault(key, {
                 "key": c["landlord_id"], "name": c["landlord_name"] or f"场地#{c['landlord_id']}",
                 "rentIncome": 0.0, "rentCost": 0.0, "rentTax": 0.0,
-                "paidAmount": 0.0, "pendingAmount": 0.0, "contracts": [],
+                "paidAmount": 0.0, "unpaidAmount": 0.0,
+                "collectedAmount": 0.0, "uncollectedAmount": 0.0, "contracts": [],
             })
             if c["contract_type"] == "品牌方合同":
                 g["rentIncome"] += item["monthlyRent"]
                 g["rentTax"] += item["rentTax"]
             else:
                 g["rentCost"] += item["monthlyRent"]
-        g["paidAmount"] += item["paidAmount"]
-        g["pendingAmount"] += item["pendingAmount"]
+        if c["contract_type"] == "品牌方合同":
+            g["collectedAmount"] += item["collectedAmount"]
+            g["uncollectedAmount"] += item["uncollectedAmount"]
+        else:
+            g["paidAmount"] += item["paidAmount"]
+            g["unpaidAmount"] += item["unpaidAmount"]
         g["contracts"].append(item)
 
     # 为每个品牌方合同附加「场地合同付款信息」快照（v3：品牌行 = 场地付款 + 品牌收款）
@@ -359,10 +374,11 @@ async def monthly_ledger(request: Request, period: str = Query(..., description=
             item["unitCostAnnual"] = unit_cost_annual
 
     result_rows = []
-    totals = {"rentIncome": 0.0, "rentCost": 0.0, "rentTax": 0.0, "paidAmount": 0.0, "pendingAmount": 0.0}
+    totals = {"rentIncome": 0.0, "rentCost": 0.0, "rentTax": 0.0,
+              "paidAmount": 0.0, "unpaidAmount": 0.0, "collectedAmount": 0.0, "uncollectedAmount": 0.0}
     for key, g in sorted(rows.items(), key=lambda kv: kv[1]["name"]):
         g["rentProfit"] = round(g["rentIncome"] - g["rentCost"] - g["rentTax"], 2)
-        for k in ("rentIncome", "rentCost", "rentTax", "paidAmount", "pendingAmount"):
+        for k in ("rentIncome", "rentCost", "rentTax", "paidAmount", "unpaidAmount", "collectedAmount", "uncollectedAmount"):
             g[k] = round(g[k], 2)
             totals[k] += g[k]
         result_rows.append(g)

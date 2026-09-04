@@ -12,8 +12,8 @@ export default defineConfig({
     port: 3000,
     proxy: {
       '/api': {
-        // 后端容器映射到宿主机 3002（docker-compose: 3002:3001）
-        target: 'http://localhost:3002',
+        // 后端容器映射到宿主机 3001（docker-compose: 3001:3001）
+        target: 'http://localhost:3001',
         changeOrigin: true,
       },
     },
