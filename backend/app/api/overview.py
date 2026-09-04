@@ -638,9 +638,22 @@ async def station_board(request: Request, landlordId: int = None, keyword: str =
         """, values)
         landlords = cur.fetchall()
 
+        # 公司主体名称（场地合同的报税主体优先，缺失回退任一合同的主体）——前端按主体分块展示
+        cur.execute("""
+            SELECT k, MAX(entity_name) AS entity_name FROM (
+                SELECT c.landlord_id AS k, ent.name AS entity_name,
+                       CASE WHEN c.contract_type = '场地合同' THEN 0 ELSE 1 END AS pri
+                FROM contracts c LEFT JOIN entities ent ON ent.id = c.entity_id
+                WHERE c.entity_id IS NOT NULL
+            ) t WHERE k = ANY(%s::int[])
+            GROUP BY k ORDER BY MIN(pri)
+        """, ([l["id"] for l in landlords],))
+        entity_map = {r["k"]: r["entity_name"] for r in cur.fetchall()}
+
         result = []
         for landlord in landlords:
             lid = landlord["id"]
+            entity_name = entity_map.get(lid)
 
             # 获取该场地方下的所有电表（排除测试电表）
             cur.execute("""
@@ -868,6 +881,7 @@ async def station_board(request: Request, landlordId: int = None, keyword: str =
                     "contact": landlord["contact"],
                     "phone": landlord["phone"],
                 },
+                "entityName": entity_name,
                 "meters": meters,
                 "meterCount": len(meters),
                 "totalKwh": round(total_kwh, 2),

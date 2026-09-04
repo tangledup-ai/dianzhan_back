@@ -28,6 +28,7 @@ def _user_payload(u: dict) -> dict:
         "shareholderId": u.get("shareholder_id"),
         "shareholderName": u.get("shareholder_name"),
         "landlordIds": [int(x) for x in (u.get("landlord_ids") or []) if x is not None],
+        "meterTagScope": u.get("meter_tag_scope"),
         "phone": u.get("phone"),
     }
 

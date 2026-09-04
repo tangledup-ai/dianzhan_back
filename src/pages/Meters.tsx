@@ -9,12 +9,13 @@ import { StatusBadge } from "@/components/Stat";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Switch } from "@/components/ui/switch";
-import { Field, NumInput, TextInput, SelectInput, inputCls } from "@/components/fields";
+import { Field, NumInput, TextInput, SelectInput, SearchSelect, inputCls } from "@/components/fields";
 import { exportXlsx } from "@/lib/export";
 import { fmtNum } from "@/lib/format";
 import { toCompact, toDisplay } from "@/lib/period";
 import { Download, Search, Plus, Pencil, Trash2, Gauge, ChevronDown, ChevronRight, RefreshCw, BookOpen, Upload } from "lucide-react";
 import { toast } from "sonner";
+import { useAuth } from "@/providers/auth";
 
 // ─── 倒计时格式化 ───
 function formatCountdown(seconds: number): string {
@@ -85,10 +86,12 @@ function useSyncLimit() {
 }
 
 export default function Meters() {
+  const { user } = useAuth();
+  const tagScope = user?.meterTagScope || "";
   const [keyword, setKeyword] = useState("");
   const [landlordId, setLandlordId] = useState("");
   const [brandId, setBrandId] = useState("");
-  const [tag, setTag] = useState("");
+  const [tag, setTag] = useState(tagScope);
   const [formOpen, setFormOpen] = useState(false);
   const [editRecord, setEditRecord] = useState<any>(null);
   const [expandedMeterId, setExpandedMeterId] = useState<number | null>(null);
@@ -269,12 +272,18 @@ export default function Meters() {
           <option value="shared">共享电表（全品牌）</option>
           {(brands.data ?? []).map((b: any) => <option key={b.id} value={String(b.id)}>{b.name}</option>)}
         </select>
-        <select className={`${inputCls} w-36`} value={tag} onChange={(e) => setTag(e.target.value)}>
-          <option value="">全部标签</option>
-          <option value="合作商电表">合作商电表</option>
-          <option value="民用电表">民用电表</option>
-          <option value="共享电表">共享电表</option>
-        </select>
+        {tagScope ? (
+          <select className={`${inputCls} w-36`} value={tagScope} disabled title="当前账号的数据范围">
+            <option value={tagScope}>{tagScope}</option>
+          </select>
+        ) : (
+          <select className={`${inputCls} w-36`} value={tag} onChange={(e) => setTag(e.target.value)}>
+            <option value="">全部标签</option>
+            <option value="合作商电表">合作商电表</option>
+            <option value="民用电表">民用电表</option>
+            <option value="共享电表">共享电表</option>
+          </select>
+        )}
         <div className="ml-auto flex gap-2">
           {/* 刷新按钮 */}
           <Button
@@ -541,7 +550,9 @@ function MeterCard({ meter, isExpanded, onToggle, onEdit, onDelete, onReading, h
 
 // ─── 电表表单 ───
 function MeterForm({ open, onClose, record }: { open: boolean; onClose: () => void; record?: any }) {
-  const blank = { brandId: "", landlordId: "", entityId: "", meterNo: "", meterName: "", collectorId: "", transformerRatio: "", tag: "合作商电表", remark: "" };
+  const { user } = useAuth();
+  const tagScope = user?.meterTagScope || "";
+  const blank = { brandId: "", landlordId: "", entityId: "", meterNo: "", meterName: "", collectorId: "", transformerRatio: "", tag: tagScope || "合作商电表", remark: "" };
   const [f, setF] = useState(blank);
   const queryClient = useQueryClient();
   const landlords = useQuery({ queryKey: ["landlords"], queryFn: listLandlords, enabled: open });
@@ -559,19 +570,22 @@ function MeterForm({ open, onClose, record }: { open: boolean; onClose: () => vo
         entityId: record.entityId ? String(record.entityId) : "",
         meterNo: record.meterNo ?? "", meterName: record.meterName ?? "",
         collectorId: record.collectorId ?? "", transformerRatio: String(record.transformerRatio ?? ""),
-        tag: record.tag ?? "合作商电表", remark: record.remark ?? "",
+        tag: record.tag ?? (tagScope || "合作商电表"), remark: record.remark ?? "",
       });
     } else setF(blank);
   }, [open, record]);
 
   const set = (k: string) => (v: string) => setF((p) => ({ ...p, [k]: v }));
 
-  // 全品牌共享：标签=共享电表 即视为共享，开关与「标签」下拉双向联动
+  // 全品牌共享：标签=共享电表 即视为共享，开关与「标签」下拉双向联动。
+  // 数据范围限定为「共享电表」时开关锁定为开；限定其他类型时不可开启（无法建共享表）。
   const isShared = f.tag === "共享电表";
+  const sharedLockedOn = tagScope === "共享电表";
+  const sharedHidden = !!tagScope && tagScope !== "共享电表";
   const toggleShared = (on: boolean) => {
     setF((p) => ({
       ...p,
-      tag: on ? "共享电表" : (p.tag === "共享电表" ? "合作商电表" : p.tag),
+      tag: on ? "共享电表" : (p.tag === "共享电表" ? (tagScope || "合作商电表") : p.tag),
       brandId: on ? "" : p.brandId,
     }));
   };
@@ -620,45 +634,55 @@ function MeterForm({ open, onClose, record }: { open: boolean; onClose: () => vo
         <DialogHeader><DialogTitle>{record ? "编辑电表" : "新增电表"}</DialogTitle></DialogHeader>
         <div className="space-y-3">
           <Field label="场地方 *">
-            <SelectInput value={f.landlordId} onChange={set("landlordId")}
-              options={[{ value: "", label: "请选择场地方" }, ...(landlords.data ?? []).map((l: any) => ({ value: String(l.id), label: l.name }))]} />
+            <SearchSelect value={f.landlordId} onChange={set("landlordId")} placeholder="请选择或搜索场地方"
+              options={(landlords.data ?? []).map((l: any) => ({ value: String(l.id), label: l.name }))} />
           </Field>
           <div className="-mt-2 text-[11px] text-slate-400">
             v3：电表直接归属场地方 + 品牌方（不再经站点）。
           </div>
           {/* 全品牌共享开关：场地内所有品牌共用一块电表时开启，无需选择品牌方 */}
-          <div className="flex items-center gap-3 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5">
-            <Switch checked={isShared} onCheckedChange={toggleShared} />
-            <div>
-              <div className="text-sm text-slate-700">所有品牌共用此电表</div>
-              <div className="text-[11px] text-slate-400">
-                开启后无需选择品牌方（标签自动记为「共享电表」），适用于场地内各品牌共用的总表
+          {!sharedHidden && (
+            <div className="flex items-center gap-3 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5">
+              <Switch checked={isShared} onCheckedChange={toggleShared} disabled={sharedLockedOn} />
+              <div>
+                <div className="text-sm text-slate-700">所有品牌共用此电表</div>
+                <div className="text-[11px] text-slate-400">
+                  {sharedLockedOn
+                    ? "当前账号的数据范围限定为「共享电表」，此开关保持开启"
+                    : "开启后无需选择品牌方（标签自动记为「共享电表」），适用于场地内各品牌共用的总表"}
+                </div>
               </div>
             </div>
-          </div>
+          )}
           <Field label="品牌方">
             {isShared ? (
               <div className="rounded-md border border-purple-200 bg-purple-50 px-2.5 py-1.5 text-sm text-purple-700">
                 全部品牌方共用（无需选择）
               </div>
             ) : (
-              <SelectInput value={f.brandId} onChange={set("brandId")}
-                options={[{ value: "", label: "未指定" }, ...(brands.data ?? []).map((b: any) => ({ value: String(b.id), label: b.name }))]} />
+              <SearchSelect value={f.brandId} onChange={set("brandId")} placeholder="未指定（可搜索品牌方）"
+                options={(brands.data ?? []).map((b: any) => ({ value: String(b.id), label: b.name }))} />
             )}
           </Field>
           <Field label="报税公司主体">
-            <SelectInput value={f.entityId} onChange={set("entityId")}
-              options={[{ value: "", label: "未指定" }, ...(entities.data ?? []).map((e: any) => ({ value: String(e.id), label: e.name }))]} />
+            <SearchSelect value={f.entityId} onChange={set("entityId")} placeholder="未指定（可搜索公司主体）"
+              options={(entities.data ?? []).map((e: any) => ({ value: String(e.id), label: e.name }))} />
           </Field>
           <Field label="电表编号 *"><TextInput value={f.meterNo} onChange={set("meterNo")} /></Field>
           <Field label="电表名称"><TextInput value={f.meterName} onChange={set("meterName")} /></Field>
           <Field label="标签">
-            <SelectInput value={f.tag} onChange={set("tag")}
-              options={[
-                { value: "合作商电表", label: "合作商电表" },
-                { value: "民用电表", label: "民用电表" },
-                { value: "共享电表", label: "共享电表" },
-              ]} />
+            {tagScope ? (
+              <div className="rounded-md border border-violet-200 bg-violet-50 px-2.5 py-1.5 text-sm text-violet-700">
+                {tagScope}（当前账号数据范围）
+              </div>
+            ) : (
+              <SelectInput value={f.tag} onChange={set("tag")}
+                options={[
+                  { value: "合作商电表", label: "合作商电表" },
+                  { value: "民用电表", label: "民用电表" },
+                  { value: "共享电表", label: "共享电表" },
+                ]} />
+            )}
           </Field>
           <Field label="采集器号"><TextInput value={f.collectorId} onChange={set("collectorId")} /></Field>
           <Field label="互感器倍数"><NumInput value={f.transformerRatio} onChange={set("transformerRatio")} placeholder="1" /></Field>

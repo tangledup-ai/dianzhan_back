@@ -40,7 +40,23 @@ async def create_contract(data: dict, request: Request):
         refresh_dividend_records(result.get("landlord_id") or data.get("landlordId"))
     except Exception:
         pass
+    _sync_meter_entities_if_venue(result)
     return result
+
+
+def _sync_meter_entities_if_venue(contract: dict):
+    """场地合同的公司主体保存后，该场地下「默认跟随」的电表自动同步主体。
+
+    entity_source='manual' 的电表是用户在 Entities 页/表单里显式设置的，不覆盖；
+    失败不影响合同保存。
+    """
+    if not contract or contract.get("contract_type") != "场地合同":
+        return
+    try:
+        from ..repositories.meter_repo import sync_landlord_meter_entities
+        sync_landlord_meter_entities(contract.get("landlord_id"), contract.get("entity_id"))
+    except Exception:
+        pass
 
 
 # ─── Excel 导入辅助函数 ─────────────────────────────────────
@@ -499,6 +515,7 @@ async def update_contract(contract_id: int, data: dict, request: Request):
         refresh_dividend_records(result.get("landlord_id") or data.get("landlordId"))
     except Exception:
         pass
+    _sync_meter_entities_if_venue(result)
     return result
 
 

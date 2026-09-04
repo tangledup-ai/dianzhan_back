@@ -91,6 +91,11 @@ export default function Layout() {
                 {isShareholder && user.landlordIds?.length > 0 && (
                   <span className="text-[10px] text-slate-400">关联 {user.landlordIds.length} 个场地</span>
                 )}
+                {user.meterTagScope && (
+                  <span className="rounded-full bg-violet-50 px-2 py-0.5 text-[10px] font-medium text-violet-700" title="该账号仅可查看此类电表相关的数据">
+                    仅{user.meterTagScope}
+                  </span>
+                )}
               </div>
             )}
             <button

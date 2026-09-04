@@ -1,6 +1,23 @@
 from ..infra.database import get_connection, get_dict_cursor
 
 
+def ids_with_tag_meters(column: str, tag: str) -> set:
+    """拥有指定类型电表的档案 id 集合（column ∈ brand_id/entity_id/landlord_id）
+
+    用于指定电表类型范围的账号在基础档案页的品牌/主体/场地列表过滤。
+    """
+    if column not in ("brand_id", "entity_id", "landlord_id"):
+        raise ValueError(f"非法的档案列: {column}")
+    conn = get_connection()
+    cur = get_dict_cursor(conn)
+    try:
+        cur.execute(f"SELECT DISTINCT {column} AS id FROM meters WHERE tag = %s AND {column} IS NOT NULL", (tag,))
+        return {int(r["id"]) for r in cur.fetchall()}
+    finally:
+        cur.close()
+        conn.close()
+
+
 # ─── 品牌方 ─────────────────────────────────────────────────
 
 def list_brands():
@@ -143,17 +160,22 @@ def delete_entity(entity_id: int):
     conn = get_connection()
     cur = get_dict_cursor(conn)
     try:
-        # 级联删除关联数据（先删子表，再删主表）
-        cascade_tables = ["entity_brands", "meters"]
-        deleted = []
-        for table in cascade_tables:
-            try:
-                cur.execute(f"DELETE FROM {table} WHERE entity_id = %s", (entity_id,))
-                if cur.rowcount > 0:
-                    deleted.append(f"{table}({cur.rowcount}条)")
-            except Exception:
-                conn.rollback()
-
+        # 引用检查：合同/电表仍挂在主体上时拒绝删除（级联会连带毁掉电表的抄表记录与柜子数据）
+        cur.execute("SELECT name FROM entities WHERE id = %s", (entity_id,))
+        entity = cur.fetchone()
+        if not entity:
+            return False
+        cur.execute("SELECT count(*) AS n FROM contracts WHERE entity_id = %s", (entity_id,))
+        contract_n = cur.fetchone()["n"]
+        cur.execute("SELECT count(*) AS n FROM meters WHERE entity_id = %s", (entity_id,))
+        meter_n = cur.fetchone()["n"]
+        if contract_n or meter_n:
+            raise ValueError(
+                f"无法删除「{entity['name']}」：仍有 {contract_n} 份合同、{meter_n} 块电表关联到该主体，"
+                "请先在合同/电表中修改或删除这些关联后再删除"
+            )
+        # 品牌授权关联是纯关联表，随主体一并删除
+        cur.execute("DELETE FROM entity_brands WHERE entity_id = %s", (entity_id,))
         cur.execute("DELETE FROM entities WHERE id = %s", (entity_id,))
         conn.commit()
         return cur.rowcount > 0
@@ -567,17 +589,21 @@ def list_platform_users():
         conn.close()
 
 
+# update_platform_user 的「未提供」哨兵：区分「不改动」与「显式清空」
+_UNSET = object()
+
+
 def create_platform_user(name: str, role: str, shareholder_id: int = None, phone: str = None, remark: str = None,
-                         password: str = None, landlord_ids: list = None):
+                         password: str = None, landlord_ids: list = None, meter_tag_scope: str = None):
     from ..infra.password import hash_password
     conn = get_connection()
     cur = get_dict_cursor(conn)
     try:
         pwd = hash_password(password) if password else None
         cur.execute(
-            "INSERT INTO platform_users (name, role, shareholder_id, password, landlord_ids, phone, remark) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING *",
-            (name, role, shareholder_id, pwd, landlord_ids, phone, remark)
+            "INSERT INTO platform_users (name, role, shareholder_id, password, landlord_ids, meter_tag_scope, phone, remark) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING *",
+            (name, role, shareholder_id, pwd, landlord_ids, meter_tag_scope, phone, remark)
         )
         conn.commit()
         return cur.fetchone()
@@ -587,7 +613,8 @@ def create_platform_user(name: str, role: str, shareholder_id: int = None, phone
 
 
 def update_platform_user(user_id: int, name: str = None, role: str = None, shareholder_id: int = None, phone: str = None,
-                         remark: str = None, password: str = None, landlord_ids: list = None):
+                         remark: str = None, password: str = None, landlord_ids: list = None,
+                         meter_tag_scope=_UNSET):
     from ..infra.password import hash_password
     conn = get_connection()
     cur = get_dict_cursor(conn)
@@ -605,6 +632,8 @@ def update_platform_user(user_id: int, name: str = None, role: str = None, share
             updates.append("password = %s"); values.append(hash_password(password))
         if landlord_ids is not None:
             updates.append("landlord_ids = %s"); values.append(landlord_ids)
+        if meter_tag_scope is not _UNSET:
+            updates.append("meter_tag_scope = %s"); values.append(meter_tag_scope)
         if remark is not None:
             updates.append("remark = %s"); values.append(remark)
         if not updates:

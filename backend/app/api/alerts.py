@@ -63,24 +63,28 @@ async def update_alert_config(data: dict):
 
 
 @router.get("")
-async def get_alerts(granularity: str = "monthly", days: int = 3):
+async def get_alerts(granularity: str = "monthly", days: int = 3, request: Request = None):
     """聚合异常提醒：电量异常（可按日/按月对比）+ 合同到期/应收应付预警
 
     granularity: daily=最近 N 天日均 vs 前 7 天日均（N 由 days 指定，默认 3 天）；
                  monthly=最近月份 vs 去年同月
     """
+    from ..infra.auth_scope import scope_landlord_ids, scope_meter_tag
+    allowed = scope_landlord_ids(request) if request is not None else None
+    tag_scope = scope_meter_tag(request) if request is not None else None
+
     conn = get_connection()
     cur = get_dict_cursor(conn)
     try:
         cfg = _get_config(cur)
         if granularity == "daily":
-            elec_anomalies = _detect_elec_daily(cur, cfg["elecYoyRatio"], days)
+            elec_anomalies = _detect_elec_daily(cur, cfg["elecYoyRatio"], days, allowed, tag_scope)
             eff_granularity = "daily"
         else:
-            elec_anomalies = _detect_elec_yoy(cur, cfg["elecYoyRatio"])
+            elec_anomalies = _detect_elec_yoy(cur, cfg["elecYoyRatio"], allowed, tag_scope)
             eff_granularity = "monthly"
-        contract_payments = _get_contract_alerts(cur, "场地合同", cfg["expireDaysVenue"], "pay")
-        contract_collections = _get_contract_alerts(cur, "品牌方合同", cfg["expireDaysBrand"], "income")
+        contract_payments = _get_contract_alerts(cur, "场地合同", cfg["expireDaysVenue"], "pay", allowed)
+        contract_collections = _get_contract_alerts(cur, "品牌方合同", cfg["expireDaysBrand"], "income", allowed)
 
         return {
             "config": cfg,
@@ -103,15 +107,17 @@ async def handle_contract_alert(contract_id: int, request: Request):
     出现新的逾期分期或状态变化（如临期→已到期）后，特征改变，会再次预警。
     """
     from ..infra.database import get_connection, get_dict_cursor
+    from ..infra.auth_scope import scope_landlord_ids
 
     conn = get_connection()
     cur = get_dict_cursor(conn)
     try:
         cfg = _get_config(cur)
+        allowed = scope_landlord_ids(request)
         sig = None
         for side, ctype, days in (("pay", "场地合同", cfg["expireDaysVenue"]),
                                   ("income", "品牌方合同", cfg["expireDaysBrand"])):
-            for item in _get_contract_alerts(cur, ctype, days, side):
+            for item in _get_contract_alerts(cur, ctype, days, side, allowed):
                 if item["contractId"] == contract_id:
                     sig = item["handleSig"]
                     break
@@ -131,13 +137,26 @@ async def handle_contract_alert(contract_id: int, request: Request):
         conn.close()
 
 
-def _detect_elec_daily(cur, ratio_threshold: float, days: int = 3):
+def _meter_scope_sql(allowed, tag_scope):
+    """电表维度数据隔离的 SQL 片段（m 为 meters 表别名）"""
+    sql, vals = "", []
+    if allowed is not None:
+        sql += " AND m.landlord_id = ANY(%s::int[])"
+        vals.append(allowed)
+    if tag_scope:
+        sql += " AND m.tag = %s"
+        vals.append(tag_scope)
+    return sql, vals
+
+
+def _detect_elec_daily(cur, ratio_threshold: float, days: int = 3, allowed=None, tag_scope=None):
     """电量异常检测（日级，按天聚合）：最近 N 天日均 vs 前 7 天日均（不含最近 N 天）。
 
     平滑单日波动：把最近 N 天（默认 3 天）的用电量合并对比，比值 = 近 N 天日均 ÷ 前 7 天日均。
     返回按上涨幅度降序。
     """
     days = max(1, min(int(days or 3), 14))
+    scope_sql, scope_vals = _meter_scope_sql(allowed, tag_scope)
     # 最新一个有数据的一天
     cur.execute("""
         SELECT MAX(day_date) AS latest FROM meter_daily
@@ -187,8 +206,8 @@ def _detect_elec_daily(cur, ratio_threshold: float, days: int = 3):
             FROM baseline GROUP BY address
         ) avg_base ON avg_base.address = rec.address
         WHERE m.landlord_id IS NOT NULL AND m.brand_id IS NOT NULL
-          AND m.meter_no NOT LIKE 'TEST%%'
-    """)
+          AND m.meter_no NOT LIKE 'TEST%%'{scope_sql}
+    """, scope_vals)
     rows = cur.fetchall()
 
     anomalies = []
@@ -215,7 +234,7 @@ def _detect_elec_daily(cur, ratio_threshold: float, days: int = 3):
     return anomalies
 
 
-def _detect_elec_yoy(cur, yoy_ratio: float):
+def _detect_elec_yoy(cur, yoy_ratio: float, allowed=None, tag_scope=None):
     """电量同比异常检测（月级）：本月 vs 去年同期。
 
     对比口径：上月（最近一个有完整读数的月份）用电量 vs 去年同月用电量。
@@ -234,7 +253,8 @@ def _detect_elec_yoy(cur, yoy_ratio: float):
     prev_y = y - 1
     prev_period = f"{prev_y:04d}{m:02d}"
 
-    cur.execute("""
+    scope_sql, scope_vals = _meter_scope_sql(allowed, tag_scope)
+    cur.execute(f"""
         SELECT
             m.meter_no, m.meter_name, l.name AS station_name, m.landlord_id, m.brand_id,
             b.name AS brand_name,
@@ -251,8 +271,8 @@ def _detect_elec_yoy(cur, yoy_ratio: float):
         WHERE cur.month_period = %s
           AND m.landlord_id IS NOT NULL AND m.brand_id IS NOT NULL
           AND m.meter_no NOT LIKE 'TEST%%'
-          AND cur.kwh IS NOT NULL AND cur.kwh > 0
-    """, (prev_period, latest))
+          AND cur.kwh IS NOT NULL AND cur.kwh > 0{scope_sql}
+    """, (prev_period, latest, *scope_vals))
     rows = cur.fetchall()
 
     anomalies = []
@@ -278,11 +298,12 @@ def _detect_elec_yoy(cur, yoy_ratio: float):
     return anomalies
 
 
-def _get_contract_alerts(cur, contract_type: str, expire_days: int, side: str):
+def _get_contract_alerts(cur, contract_type: str, expire_days: int, side: str, allowed=None):
     """合同到期 + 应收/付明细预警。
 
     - 场地合同（side=pay）：我们付给场地方 → 应付分期 rent_payment_schedule
     - 品牌方合同（side=income）：品牌方付给我们 → 应收分期 rent_income_schedule
+    - allowed：可见场地白名单（股东/指定电表类型范围的账号），None=不限制
     返回：到期提醒（剩余天数）+ 分期明细（区间/金额/状态/实付日期/发票）+ 汇总
     """
     today = date.today()
@@ -316,9 +337,11 @@ def _get_contract_alerts(cur, contract_type: str, expire_days: int, side: str):
     """, (contract_type,))
     rows = cur.fetchall()
 
-    # 按合同聚合
+    # 按合同聚合（受限账号只看可见场地内的合同）
     contracts = {}
     for r in rows:
+        if allowed is not None and (r.get("landlord_id") is None or r["landlord_id"] not in allowed):
+            continue
         cid = r["id"]
         if cid not in contracts:
             effective_end = r.get("effective_end")

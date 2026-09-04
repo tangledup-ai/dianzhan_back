@@ -9,7 +9,8 @@ import { MonthPicker } from "@/components/MonthPicker";
 import { fmtMoney } from "@/lib/format";
 import { toCompact, toDisplay } from "@/lib/period";
 import { inputCls } from "@/components/fields";
-import { Users, MapPin, X, Trash2, UserPlus, Wallet, Settings, Pencil } from "lucide-react";
+import { groupByEntity } from "@/lib/groupColors";
+import { Users, MapPin, X, Trash2, UserPlus, Wallet, Settings, Pencil, Search } from "lucide-react";
 import { toast } from "sonner";
 
 // ════════════════════════════════════════════════════════════════
@@ -790,6 +791,16 @@ export default function Shareholders() {
   );
   const landlordId = selectedLandlord?.landlord?.id ?? null;
 
+  // 场地方列表：搜索（场地名称/公司主体模糊匹配）+ 按公司主体分块
+  const [landlordKeyword, setLandlordKeyword] = useState("");
+  const filteredLandlords = useMemo(() => {
+    const kw = landlordKeyword.trim();
+    if (!kw) return landlords;
+    return landlords.filter((r: any) =>
+      (r.landlord?.name || "").includes(kw) || (r.entityName || "").includes(kw));
+  }, [landlords, landlordKeyword]);
+  const filteredLandlordGroups = useMemo(() => groupByEntity(filteredLandlords), [filteredLandlords]);
+
   const previewQueries = useQueries({
     queries: monthsInRange.map((m) => ({
       queryKey: ["dividendPreview", landlordId, m],
@@ -1216,25 +1227,49 @@ export default function Shareholders() {
           </div>
         </div>
 
+        {/* 场地方视图：搜索框（按场地名称/公司主体模糊匹配） */}
+        {viewMode === "landlord" && (
+          <div className="border-b border-slate-100 px-3 pb-2">
+            <div className="relative">
+              <Search className="absolute left-2 top-2 h-3.5 w-3.5 text-slate-400" />
+              <input
+                className={inputCls + " w-full pl-7 text-xs"}
+                placeholder="搜索场地方 / 公司主体…"
+                value={landlordKeyword}
+                onChange={(e) => setLandlordKeyword(e.target.value)}
+              />
+            </div>
+          </div>
+        )}
+
         <div className="flex-1 overflow-y-auto">
           {viewMode === "landlord" ? (
-            landlords.length === 0 ? (
-              <div className="p-4 text-center text-xs text-slate-400">暂无场地</div>
+            filteredLandlordGroups.length === 0 ? (
+              <div className="p-4 text-center text-xs text-slate-400">
+                {landlords.data?.length ? "没有匹配的场地方 / 公司主体" : "暂无场地"}
+              </div>
             ) : (
-              landlords.map((r: any) => (
-                <button
-                  key={r.landlord.id}
-                  onClick={() => setSelectedLandlordId(r.landlord.id)}
-                  className={`flex w-full items-center gap-2 border-b px-3 py-2.5 text-left text-xs transition-colors ${selectedLandlordId === r.landlord.id ? "bg-emerald-50 border-l-2 border-l-emerald-500" : "hover:bg-slate-50"}`}
-                >
-                  <MapPin className="h-4 w-4 shrink-0 text-slate-400" />
-                  <div className="min-w-0 flex-1">
-                    <div className="font-medium text-slate-800 truncate">{r.landlord.name}</div>
-                    <div className="text-[11px] text-slate-400">
-                      {isRange ? "末月利润" : "总利润"} <span className={r.totalProfit >= 0 ? "text-emerald-600" : "text-rose-600"}>{fmtMoney(r.totalProfit)}</span>
-                    </div>
+              filteredLandlordGroups.map((grp: any) => (
+                <div key={grp.entityName} className={grp.color.bg}>
+                  <div className="sticky top-0 z-10 border-b bg-white/95 px-3 py-1.5 text-[10px] font-semibold text-slate-500 backdrop-blur">
+                    公司主体：{grp.entityName}（{grp.rows.length}）
                   </div>
-                </button>
+                  {grp.rows.map((r: any) => (
+                    <button
+                      key={r.landlord.id}
+                      onClick={() => setSelectedLandlordId(r.landlord.id)}
+                      className={`flex w-full items-center gap-2 border-b px-3 py-2.5 text-left text-xs transition-colors ${selectedLandlordId === r.landlord.id ? "bg-emerald-50 border-l-2 border-l-emerald-500" : "hover:bg-slate-50"}`}
+                    >
+                      <MapPin className="h-4 w-4 shrink-0 text-slate-400" />
+                      <div className="min-w-0 flex-1">
+                        <div className="font-medium text-slate-800 truncate">{r.landlord.name}</div>
+                        <div className="text-[11px] text-slate-400">
+                          {isRange ? "末月利润" : "总利润"} <span className={r.totalProfit >= 0 ? "text-emerald-600" : "text-rose-600"}>{fmtMoney(r.totalProfit)}</span>
+                        </div>
+                      </div>
+                    </button>
+                  ))}
+                </div>
               ))
             )
           ) : (

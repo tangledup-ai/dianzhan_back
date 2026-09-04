@@ -1,7 +1,8 @@
 from ..infra.database import get_connection, get_dict_cursor
 
 
-def list_meters(station_id: int = None, brand_id: int = None, landlord_id: int = None, allowed_landlord_ids: list = None):
+def list_meters(station_id: int = None, brand_id: int = None, landlord_id: int = None,
+                allowed_landlord_ids: list = None, allowed_tag: str = None):
     conn = get_connection()
     cur = get_dict_cursor(conn)
     try:
@@ -13,6 +14,8 @@ def list_meters(station_id: int = None, brand_id: int = None, landlord_id: int =
             conditions.append("m.landlord_id = %s"); values.append(landlord_id)
         if allowed_landlord_ids is not None:
             conditions.append("m.landlord_id = ANY(%s::int[])"); values.append(allowed_landlord_ids)
+        if allowed_tag:
+            conditions.append("m.tag = %s"); values.append(allowed_tag)
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         cur.execute(f"""
             SELECT m.*, l.name as station_name, b.name as brand_name, l.name as landlord_name,
@@ -75,6 +78,38 @@ def _check_meter_no_unique(cur, meter_no, exclude_id=None):
         raise ValueError(f"电表编号 {meter_no} 已存在，不能重复使用")
 
 
+def _venue_entity_id(cur, landlord_id) -> int | None:
+    """场地方的默认公司主体 = 其最新一份场地合同的 entity_id（无场地合同或未指定主体 → None）"""
+    cur.execute("""
+        SELECT entity_id FROM contracts
+        WHERE landlord_id = %s AND contract_type = '场地合同' AND entity_id IS NOT NULL
+        ORDER BY id DESC
+        LIMIT 1
+    """, (landlord_id,))
+    row = cur.fetchone()
+    return row["entity_id"] if row else None
+
+
+def sync_landlord_meter_entities(landlord_id: int, entity_id: int | None) -> int:
+    """场地合同主体保存/变更后级联：该场地下「默认跟随」的电表（非 manual）同步主体。
+
+    entity_source='manual' 的电表是用户在 Entities 页/表单里显式设置的，不自动覆盖；
+    entity_source IS NULL 的电表是尚未有主体可跟随的默认态，一并填充。
+    """
+    conn = get_connection()
+    cur = get_dict_cursor(conn)
+    try:
+        cur.execute("""
+            UPDATE meters SET entity_id = %s, entity_source = 'auto'
+            WHERE landlord_id = %s AND entity_source IS DISTINCT FROM 'manual'
+        """, (entity_id, landlord_id))
+        conn.commit()
+        return cur.rowcount
+    finally:
+        cur.close()
+        conn.close()
+
+
 def create_meter(data: dict):
     conn = get_connection()
     cur = get_dict_cursor(conn)
@@ -83,13 +118,22 @@ def create_meter(data: dict):
         landlord_id = data.get("landlordId")
         _check_meter_no_unique(cur, data.get("meterNo"))
 
+        # 默认继承：未显式指定主体时，跟随场地方的公司主体（场地合同 entity_id）
+        entity_id = data.get("entityId")
+        entity_source = None
+        if entity_id is not None:
+            entity_source = "manual"
+        elif landlord_id:
+            entity_id = _venue_entity_id(cur, landlord_id)
+            entity_source = "auto" if entity_id is not None else None
+
         cur.execute("""
-            INSERT INTO meters (brand_id, landlord_id, entity_id, meter_no, meter_name, collector_id, transformer_ratio, tag, remark)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO meters (brand_id, landlord_id, entity_id, entity_source, meter_no, meter_name, collector_id, transformer_ratio, tag, remark)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING *
         """, (
             data.get("brandId"), landlord_id,
-            data.get("entityId"),
+            entity_id, entity_source,
             data.get("meterNo"), data.get("meterName"), data.get("collectorId"),
             data.get("transformerRatio", 1), data.get("tag") or "合作商电表", data.get("remark")
         ))
@@ -104,12 +148,21 @@ def update_meter(meter_id: int, data: dict):
     conn = get_connection()
     cur = get_dict_cursor(conn)
     try:
-        # 一电表一主体校验：设置 entity_id 为非 null 时，若电表已关联到其他主体则拒绝
-        # （允许解除关联：entity_id 设为 null）
-        if data.get("entityId") is not None:
-            cur.execute("SELECT entity_id FROM meters WHERE id = %s", (meter_id,))
-            row = cur.fetchone()
-            if row and row.get("entity_id") is not None and row["entity_id"] != data["entityId"]:
+        cur.execute("SELECT landlord_id, entity_id, entity_source FROM meters WHERE id = %s", (meter_id,))
+        cur_row = cur.fetchone()
+
+        # 场地变更 → 电表默认跟随新场地的公司主体（场地合同 entity_id）。
+        # 表单里显式选了别的主体（entityId 与当前不同且非空）则尊重用户选择。
+        if data.get("landlordId") is not None and cur_row and cur_row.get("landlord_id") != data["landlordId"]:
+            incoming = data.get("entityId")
+            if "entityId" not in data or incoming is None or incoming == cur_row.get("entity_id"):
+                inherited = _venue_entity_id(cur, data["landlordId"])
+                data = {**data, "entityId": inherited, "entitySource": "auto"}
+
+        # 一电表一主体校验：显式改主体时，若电表已关联到其他主体则拒绝
+        # （场地变更的自动跟随不受限；允许解除关联：entity_id 设为 null）
+        if data.get("entityId") is not None and data.get("entitySource") != "auto":
+            if cur_row and cur_row.get("entity_id") is not None and cur_row["entity_id"] != data["entityId"]:
                 raise ValueError("该电表已关联其他公司主体，请先解除关联后再关联")
 
         field_map = {
@@ -131,6 +184,21 @@ def update_meter(meter_id: int, data: dict):
             elif data[key] is not None:
                 updates.append(f"{db_field} = %s")
                 values.append(data[key])
+
+        # 主体来源标记：值变了 → manual（用户显式设置）或 auto（场地变更自动跟随）；
+        # 值没变 → 保持原标记（避免电表表单原样带回 entityId 把 auto 翻成 manual）
+        if "entityId" in data:
+            val = data.get("entityId")
+            current_entity = cur_row.get("entity_id") if cur_row else None
+            if data.get("entitySource") == "auto":
+                new_source = "auto" if val is not None else None
+            elif val != current_entity:
+                new_source = "manual"
+            else:
+                new_source = cur_row.get("entity_source") if cur_row else None
+            updates.append("entity_source = %s")
+            values.append(new_source)
+
         if not updates:
             return None
         # 编号被修改时校验唯一（排除自身）

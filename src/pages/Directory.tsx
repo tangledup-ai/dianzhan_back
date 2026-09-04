@@ -136,7 +136,12 @@ function CrudTable(props: {
                       {props.rowExtraAction?.(row)}
                       <button className="rounded p-1 text-slate-400 hover:text-emerald-600" onClick={() => startEdit(row)}><Pencil className="h-4 w-4" /></button>
                       <button className="rounded p-1 text-slate-400 hover:text-rose-500"
-                        onClick={() => window.confirm("删除该档案？") && props.onDelete(row.id).then(() => { toast.success("已删除"); invalidate(); })}><Trash2 className="h-4 w-4" /></button>
+                        onClick={() => {
+                          if (!window.confirm("删除该档案？")) return;
+                          props.onDelete(row.id)
+                            .then(() => { toast.success("已删除"); invalidate(); })
+                            .catch((e: any) => toast.error(e.response?.data?.detail || e.message || "删除失败"));
+                        }}><Trash2 className="h-4 w-4" /></button>
                     </>
                   )}
                 </div>
@@ -159,12 +164,17 @@ const ROLE_OPTIONS = [
 
 const roleLabel = (role: string) => ROLE_OPTIONS.find((r) => r.value === role)?.label ?? role;
 
+// 数据范围：限定财务/财务主管可见的电表类型（后端按此隔离全部页面数据）
+const METER_TAG_SCOPE_OPTIONS = ["合作商电表", "民用电表", "共享电表"];
+const SCOPED_ROLES = ["finance", "finance_supervisor"];
+const isScopedRole = (role: string) => SCOPED_ROLES.includes(role);
+
 function PlatformUsersTable({ shareholders, landlords }: { shareholders: any[] | undefined; landlords: any[] | undefined }) {
   const queryClient = useQueryClient();
   const users = useQuery({ queryKey: ["platformUsers"], queryFn: listPlatformUsers });
-  const [draft, setDraft] = useState({ name: "", role: "boss", shareholderId: "", password: "", landlordIds: [] as number[], phone: "", remark: "" });
+  const [draft, setDraft] = useState({ name: "", role: "boss", shareholderId: "", password: "", landlordIds: [] as number[], meterTagScope: "", phone: "", remark: "" });
   const [editId, setEditId] = useState<number | null>(null);
-  const [editDraft, setEditDraft] = useState({ name: "", role: "boss", shareholderId: "", password: "", landlordIds: [] as number[], phone: "", remark: "" });
+  const [editDraft, setEditDraft] = useState({ name: "", role: "boss", shareholderId: "", password: "", landlordIds: [] as number[], meterTagScope: "", phone: "", remark: "" });
   const [keyword, setKeyword] = useState("");
 
   const invalidate = () => queryClient.invalidateQueries();
@@ -184,6 +194,8 @@ function PlatformUsersTable({ shareholders, landlords }: { shareholders: any[] |
     password: d.password.trim() || undefined,
     // 股东关联场地：非股东清空
     landlordIds: d.role === "shareholder" ? d.landlordIds : [],
+    // 数据范围：仅财务/财务主管可指定
+    meterTagScope: isScopedRole(d.role) && d.meterTagScope ? d.meterTagScope : null,
     phone: d.phone.trim() || null,
     remark: d.remark.trim() || null,
   });
@@ -193,7 +205,7 @@ function PlatformUsersTable({ shareholders, landlords }: { shareholders: any[] |
     if (draft.role === "shareholder" && !draft.shareholderId) { toast.error("请选择关联的股东"); return; }
     try {
       await createPlatformUser(toPayload(draft));
-      setDraft({ name: "", role: "boss", shareholderId: "", password: "", landlordIds: [], phone: "", remark: "" });
+      setDraft({ name: "", role: "boss", shareholderId: "", password: "", landlordIds: [], meterTagScope: "", phone: "", remark: "" });
       toast.success("已保存");
       invalidate();
     } catch (e: any) { toast.error(e.message); }
@@ -207,6 +219,7 @@ function PlatformUsersTable({ shareholders, landlords }: { shareholders: any[] |
       shareholderId: row.shareholderId ? String(row.shareholderId) : "",
       password: "",
       landlordIds: (row.landlordIds ?? []).map(Number),
+      meterTagScope: row.meterTagScope ?? "",
       phone: row.phone ?? "",
       remark: row.remark ?? "",
     });
@@ -230,6 +243,7 @@ function PlatformUsersTable({ shareholders, landlords }: { shareholders: any[] |
         姓名: r.name,
         角色: roleLabel(r.role),
         关联股东: r.shareholderName ?? "-",
+        数据范围: isScopedRole(r.role) ? (r.meterTagScope || "全部") : "-",
         电话: r.phone ?? "-",
         备注: r.remark ?? "-",
       })),
@@ -245,7 +259,7 @@ function PlatformUsersTable({ shareholders, landlords }: { shareholders: any[] |
       </td>
       <td className="px-3 py-2">
         <select className={`${inputCls} w-28`} value={d.role}
-          onChange={(e) => setD((p: any) => ({ ...p, role: e.target.value, shareholderId: "" }))}>
+          onChange={(e) => setD((p: any) => ({ ...p, role: e.target.value, shareholderId: "", meterTagScope: "" }))}>
           {ROLE_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
         </select>
       </td>
@@ -266,6 +280,17 @@ function PlatformUsersTable({ shareholders, landlords }: { shareholders: any[] |
             value={d.landlordIds.map(String)}
             onChange={(e) => setD((p: any) => ({ ...p, landlordIds: Array.from(e.target.selectedOptions).map((o: any) => Number(o.value)) }))}>
             {(landlords ?? []).map((l: any) => <option key={l.id} value={l.id}>{l.name}</option>)}
+          </select>
+        ) : (
+          <span className="text-xs text-slate-400">-</span>
+        )}
+      </td>
+      <td className="px-3 py-2">
+        {isScopedRole(d.role) ? (
+          <select className={`${inputCls} w-28`} value={d.meterTagScope}
+            onChange={(e) => setD((p: any) => ({ ...p, meterTagScope: e.target.value }))}>
+            <option value="">全部</option>
+            {METER_TAG_SCOPE_OPTIONS.map((t) => <option key={t} value={t}>{t}</option>)}
           </select>
         ) : (
           <span className="text-xs text-slate-400">-</span>
@@ -304,6 +329,7 @@ function PlatformUsersTable({ shareholders, landlords }: { shareholders: any[] |
           <th className="px-4 py-2.5 font-medium">角色</th>
           <th className="px-4 py-2.5 font-medium">关联股东</th>
           <th className="px-4 py-2.5 font-medium">关联场地</th>
+          <th className="px-4 py-2.5 font-medium">数据范围</th>
           <th className="px-4 py-2.5 font-medium">密码</th>
           <th className="px-4 py-2.5 font-medium">电话</th>
           <th className="px-4 py-2.5 font-medium">备注</th>
@@ -343,6 +369,15 @@ function PlatformUsersTable({ shareholders, landlords }: { shareholders: any[] |
                     {row.role === "shareholder" && (row.landlordIds ?? []).length > 0
                       ? (landlords ?? []).filter((l: any) => (row.landlordIds ?? []).includes(l.id)).map((l: any) => l.name).join("、") || "-"
                       : "-"}
+                  </td>
+                  <td className="px-4 py-2.5">
+                    {isScopedRole(row.role) ? (
+                      row.meterTagScope
+                        ? <span className="inline-block rounded-full bg-violet-100 px-2 py-0.5 text-xs text-violet-700">仅{row.meterTagScope}</span>
+                        : <span className="text-xs text-slate-400">全部</span>
+                    ) : (
+                      <span className="text-xs text-slate-400">-</span>
+                    )}
                   </td>
                   <td className="px-4 py-2.5 text-slate-600">{row.phone ?? "-"}</td>
                   <td className="px-4 py-2.5 text-slate-600">{row.remark ?? "-"}</td>

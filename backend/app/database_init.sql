@@ -102,6 +102,7 @@ CREATE TABLE IF NOT EXISTS platform_users (
     shareholder_id INTEGER REFERENCES shareholders(id),
     password VARCHAR(200),
     landlord_ids INTEGER[],
+    meter_tag_scope VARCHAR(20),
     phone VARCHAR(50),
     remark TEXT,
     created_at TIMESTAMP DEFAULT NOW()
@@ -134,6 +135,7 @@ CREATE TABLE IF NOT EXISTS meters (
     brand_id INTEGER REFERENCES brands(id),
     landlord_id INTEGER REFERENCES landlords(id),
     entity_id INTEGER REFERENCES entities(id),
+    entity_source VARCHAR(10),
     meter_no VARCHAR(100) NOT NULL UNIQUE,
     meter_name VARCHAR(200),
     collector_id VARCHAR(100),
@@ -824,6 +826,8 @@ ALTER TABLE landlords    ADD COLUMN IF NOT EXISTS region VARCHAR(50);
 ALTER TABLE landlords    ADD COLUMN IF NOT EXISTS address VARCHAR(300);
 ALTER TABLE landlords    ADD COLUMN IF NOT EXISTS latitude NUMERIC(10,7);
 ALTER TABLE landlords    ADD COLUMN IF NOT EXISTS longitude NUMERIC(10,7);
+ALTER TABLE platform_users ADD COLUMN IF NOT EXISTS meter_tag_scope VARCHAR(20);
+COMMENT ON COLUMN platform_users.meter_tag_scope IS '数据隔离：限定可见的电表类型（合作商电表/民用电表/共享电表）；NULL=不限制（仅对 finance/finance_supervisor 生效）';
 
 -- 2.2 电表档案补列
 ALTER TABLE meters ADD COLUMN IF NOT EXISTS landlord_id INTEGER REFERENCES landlords(id);

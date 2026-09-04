@@ -1,13 +1,18 @@
 from ..infra.database import get_connection, get_dict_cursor
 
 
-def list_cabinets(meter_id: int = None):
+def list_cabinets(meter_id: int = None, allowed_landlord_ids: list = None, allowed_tag: str = None):
     conn = get_connection()
     cur = get_dict_cursor(conn)
     try:
         conditions, values = [], []
         if meter_id:
             conditions.append("c.meter_id = %s"); values.append(meter_id)
+        # 数据隔离：股东按场地、指定电表类型范围的账号按类型过滤
+        if allowed_landlord_ids is not None:
+            conditions.append("m.landlord_id = ANY(%s::int[])"); values.append(allowed_landlord_ids)
+        if allowed_tag:
+            conditions.append("m.tag = %s"); values.append(allowed_tag)
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         cur.execute(f"""
             SELECT c.*, m.meter_no, m.meter_name, b.name as brand_name

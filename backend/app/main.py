@@ -1,7 +1,7 @@
 import os
 import asyncio
 from datetime import datetime
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
@@ -187,25 +187,37 @@ async def monthly_kwh_status():
 
 
 @app.get("/api/meter-monthly")
-async def get_meter_monthly(address: str = None, month: str = None):
+async def get_meter_monthly(address: str = None, month: str = None, request: Request = None):
     """查询本地缓存的月度用电量（不调用第三方API）"""
     from .infra.database import get_connection, get_dict_cursor
+    from .infra.auth_scope import scope_landlord_ids, scope_meter_tag
     conn = get_connection()
     cur = get_dict_cursor(conn)
     try:
         conditions, values = [], []
+        # 数据隔离：股东按场地、指定电表类型范围的账号按类型过滤
+        if request is not None:
+            allowed = scope_landlord_ids(request)
+            if allowed is not None:
+                conditions.append("m.landlord_id = ANY(%s::int[])")
+                values.append(allowed)
+            tag_scope = scope_meter_tag(request)
+            if tag_scope:
+                conditions.append("m.tag = %s")
+                values.append(tag_scope)
         if address:
-            conditions.append("address = %s")
+            conditions.append("mm.address = %s")
             values.append(address)
         if month:
-            conditions.append("month_period = %s")
+            conditions.append("mm.month_period = %s")
             values.append(month)
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         cur.execute(f"""
-            SELECT address, month_period, kwh, synced_at
-            FROM meter_monthly
+            SELECT mm.address, mm.month_period, mm.kwh, mm.synced_at
+            FROM meter_monthly mm
+            LEFT JOIN meters m ON m.meter_no = mm.address
             {where}
-            ORDER BY month_period DESC, address
+            ORDER BY mm.month_period DESC, mm.address
         """, values)
         return cur.fetchall()
     finally:

@@ -2,7 +2,7 @@ import { useMemo, useState, useEffect, useRef, type ReactNode } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { listContracts, createContract, updateContract, deleteContract, importContractsExcel, getContractAudit } from "@/api/contracts";
 import { createApproval } from "@/api/approvals";
-import { listBrands, listLandlords } from "@/api/directory";
+import { listBrands, listLandlords, listEntities } from "@/api/directory";
 import { listMeters } from "@/api/meters";
 import { listCabinets } from "@/api/cabinets";
 import { StatusBadge } from "@/components/Stat";
@@ -35,6 +35,8 @@ export default function Contracts() {
   const queryClient = useQueryClient();
   const brands = useQuery({ queryKey: ["brands"], queryFn: listBrands });
   const landlords = useQuery({ queryKey: ["landlords"], queryFn: listLandlords });
+  const entitiesQ = useQuery({ queryKey: ["entities"], queryFn: listEntities });
+  const metersQ = useQuery({ queryKey: ["meters"], queryFn: () => listMeters() });
   const list = useQuery({
     queryKey: ["contracts", keyword, brandId, landlordId, contractType],
     queryFn: () => listContracts({
@@ -162,13 +164,22 @@ export default function Contracts() {
     });
   };
   const entityGroups = useMemo(() => {
-    // 每个场地方的主体：场地合同优先，其次任一品牌方合同，都没有归「未指定主体」
+    // 每个场地方的主体：合同 entity_id 优先，其次该场地方电表的报税主体（与 Entities 页口径一致），都没有归「未指定主体」
+    const entityNameById = new Map<number, string>((entitiesQ.data ?? []).map((e: any) => [e.id, e.name] as [number, string]));
+    const meterEntityByLandlord = new Map<number, string>();
+    for (const m of metersQ.data ?? []) {
+      if (m.landlordId && m.entityId && !meterEntityByLandlord.has(m.landlordId)) {
+        const name = entityNameById.get(m.entityId);
+        if (name) meterEntityByLandlord.set(m.landlordId, name);
+      }
+    }
     const withEntity = groupedByLandlord.map((g: any) => ({
       ...g,
-      entityName: (g.costContracts.find((c: any) => c.entityName) || g.incomeContracts.find((c: any) => c.entityName))?.entityName || "未指定主体",
+      entityName: (g.costContracts.find((c: any) => c.entityName) || g.incomeContracts.find((c: any) => c.entityName))?.entityName
+        || meterEntityByLandlord.get(g.landlordId) || "未指定主体",
     }));
     return groupByEntity(withEntity);
-  }, [groupedByLandlord]);
+  }, [groupedByLandlord, metersQ.data, entitiesQ.data]);
 
   const doExport = () => {
     // 导出全部合同（按当前筛选），样式参考"共享合同监控表"：按合同类型分 sheet

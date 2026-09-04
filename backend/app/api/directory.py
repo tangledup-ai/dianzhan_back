@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException, Request
 from ..repositories import directory_repo
-from ..infra.auth_scope import scope_landlord_ids
+from ..infra.auth_scope import scope_landlord_ids, scope_meter_tag, METER_TAGS
 from .base import CamelJSONResponse
 
 router = APIRouter(prefix="/api/directory", tags=["基础档案"], default_response_class=CamelJSONResponse)
@@ -9,8 +9,14 @@ router = APIRouter(prefix="/api/directory", tags=["基础档案"], default_respo
 # ─── 品牌方 ─────────────────────────────────────────────────
 
 @router.get("/brands")
-async def list_brands():
-    return directory_repo.list_brands()
+async def list_brands(request: Request = None):
+    rows = directory_repo.list_brands()
+    # 指定电表类型范围的账号：只看到拥有该类型电表的品牌
+    tag_scope = scope_meter_tag(request) if request is not None else None
+    if tag_scope:
+        ids = directory_repo.ids_with_tag_meters("brand_id", tag_scope)
+        rows = [r for r in rows if r["id"] in ids]
+    return rows
 
 
 @router.post("/brands", status_code=201)
@@ -42,8 +48,14 @@ async def delete_brand(brand_id: int):
 # ─── 公司主体 ───────────────────────────────────────────────
 
 @router.get("/entities")
-async def list_entities():
-    return directory_repo.list_entities()
+async def list_entities(request: Request = None):
+    rows = directory_repo.list_entities()
+    # 指定电表类型范围的账号：只看到拥有该类型电表的公司主体
+    tag_scope = scope_meter_tag(request) if request is not None else None
+    if tag_scope:
+        ids = directory_repo.ids_with_tag_meters("entity_id", tag_scope)
+        rows = [r for r in rows if r["id"] in ids]
+    return rows
 
 
 @router.post("/entities", status_code=201)
@@ -232,6 +244,16 @@ async def delete_entity_brand(id: int):
 
 # ─── 平台使用人员 ─────────────────────────────────────────────
 
+def _validated_meter_tag_scope(data: dict) -> str or None:
+    """校验并规整电表类型范围：空值 → None（不限制）；非法值报 400"""
+    tag = data.get("meterTagScope")
+    if tag in (None, ""):
+        return None
+    if tag not in METER_TAGS:
+        raise HTTPException(400, f"无效的电表类型范围: {tag}，可选: 全部(空)/{'/'.join(METER_TAGS)}")
+    return tag
+
+
 def _sanitize_user(u: dict) -> dict:
     """去除密码哈希等敏感字段"""
     if u is None:
@@ -256,6 +278,7 @@ async def create_platform_user(data: dict):
         remark=data.get("remark"),
         password=data.get("password"),
         landlord_ids=data.get("landlordIds"),
+        meter_tag_scope=_validated_meter_tag_scope(data),
     ))
 
 
@@ -270,6 +293,7 @@ async def update_platform_user(user_id: int, data: dict):
         remark=data.get("remark"),
         password=data.get("password"),
         landlord_ids=data.get("landlordIds"),
+        meter_tag_scope=_validated_meter_tag_scope(data) if "meterTagScope" in data else directory_repo._UNSET,
     )
     if not result:
         raise HTTPException(404, "用户不存在")

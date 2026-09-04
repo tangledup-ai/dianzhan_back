@@ -1,13 +1,27 @@
 """电表能耗数据 API"""
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from ..infra.database import get_connection, get_dict_cursor
+from ..infra.auth_scope import scope_landlord_ids, scope_meter_tag, ensure_meter_in_scope
 from .base import CamelJSONResponse
 
 router = APIRouter(prefix="/api/meter-energy", tags=["电表能耗"], default_response_class=CamelJSONResponse)
 
 
+def _scope_conditions(conditions: list, values: list, request, column: str):
+    """能耗查询的数据隔离条件：m 为 JOIN 出的 meters 表别名"""
+    allowed = scope_landlord_ids(request)
+    if allowed is not None:
+        conditions.append(f"{column}.landlord_id = ANY(%s::int[])")
+        values.append(allowed)
+    tag_scope = scope_meter_tag(request)
+    if tag_scope:
+        conditions.append(f"{column}.tag = %s")
+        values.append(tag_scope)
+
+
 @router.get("/daily")
 async def get_daily_kwh(
+    request: Request = None,
     meterNo: str = None,
     startDate: str = Query(None, description="开始日期 YYYYMMDD"),
     endDate: str = Query(None, description="结束日期 YYYYMMDD"),
@@ -17,6 +31,8 @@ async def get_daily_kwh(
     cur = get_dict_cursor(conn)
     try:
         conditions, values = [], []
+        if request is not None:
+            _scope_conditions(conditions, values, request, "m")
         if meterNo:
             conditions.append("d.address = %s")
             values.append(meterNo)
@@ -49,6 +65,7 @@ async def get_daily_kwh(
 
 @router.get("/hourly")
 async def get_hourly_kwh(
+    request: Request = None,
     meterNo: str = None,
     startTime: str = Query(None, description="开始时间 YYYYMMDDHH"),
     endTime: str = Query(None, description="结束时间 YYYYMMDDHH"),
@@ -58,6 +75,8 @@ async def get_hourly_kwh(
     cur = get_dict_cursor(conn)
     try:
         conditions, values = [], []
+        if request is not None:
+            _scope_conditions(conditions, values, request, "m")
         if meterNo:
             conditions.append("h.address = %s")
             values.append(meterNo)
@@ -90,6 +109,7 @@ async def get_hourly_kwh(
 
 @router.get("/monthly")
 async def get_monthly_kwh(
+    request: Request = None,
     meterNo: str = None,
     startMonth: str = Query(None, description="开始月份 YYYYMM"),
     endMonth: str = Query(None, description="结束月份 YYYYMM"),
@@ -99,6 +119,8 @@ async def get_monthly_kwh(
     cur = get_dict_cursor(conn)
     try:
         conditions, values = [], []
+        if request is not None:
+            _scope_conditions(conditions, values, request, "m")
         if meterNo:
             conditions.append("mm.address = %s")
             values.append(meterNo)
@@ -136,7 +158,7 @@ async def get_monthly_kwh(
 
 
 @router.post("/readings")
-async def save_meter_reading(data: dict):
+async def save_meter_reading(data: dict, request: Request = None):
     """手动录入/更新电表月度读数（人工实际读数不随第三方同步覆盖）"""
     address = data.get("address")
     month_period = data.get("monthPeriod")
@@ -151,6 +173,20 @@ async def save_meter_reading(data: dict):
 
     if not address or not month_period:
         raise HTTPException(400, "address 和 monthPeriod 必填")
+
+    # 电表类型范围：受限账号只能写范围内电表的读数（地址不存在或范围外一律拒绝）
+    if request is not None and (scope_meter_tag(request) or scope_landlord_ids(request) is not None):
+        conn = get_connection()
+        cur = get_dict_cursor(conn)
+        try:
+            cur.execute("SELECT tag, landlord_id FROM meters WHERE meter_no = %s", (address,))
+            meter = cur.fetchone()
+        finally:
+            cur.close()
+            conn.close()
+        if not meter:
+            raise HTTPException(403, "电表不存在，无法录入读数")
+        ensure_meter_in_scope(request, meter.get("tag"), meter.get("landlord_id"))
 
     # 如果提供了起始度数和抄表度数，自动计算区间度数
     if kwh is None and prev_reading is not None and curr_reading is not None:

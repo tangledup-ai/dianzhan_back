@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException, Request, UploadFile, File
 from ..repositories import meter_repo
-from ..infra.auth_scope import scope_landlord_ids
+from ..infra.auth_scope import scope_landlord_ids, scope_meter_tag, ensure_meter_in_scope
 from ..infra.meter_api import tq_client
 from ..infra.database import get_connection, get_dict_cursor
 from .base import CamelJSONResponse
@@ -169,6 +169,7 @@ async def import_meters(request: Request, file: UploadFile = File(...)):
                         updates.append("brand_id = %s"); vals.append(brand_id)
                     if entity_id and entity_id != meter.get("entity_id"):
                         updates.append("entity_id = %s"); vals.append(entity_id)
+                        updates.append("entity_source = %s"); vals.append("manual")
                     if meter_name:
                         updates.append("meter_name = %s"); vals.append(meter_name)
                     if ratio:
@@ -230,17 +231,19 @@ async def import_meters(request: Request, file: UploadFile = File(...)):
 
 @router.get("")
 async def list_meters(request: Request, stationId: int = None, brandId: int = None, landlordId: int = None):
-    # 股东：只能看到关联场地的电表
+    # 股东：只能看到关联场地的电表；财务指定电表类型范围：再按类型过滤
     allowed = scope_landlord_ids(request)
     return meter_repo.list_meters(station_id=stationId, brand_id=brandId, landlord_id=landlordId,
-                                  allowed_landlord_ids=allowed)
+                                  allowed_landlord_ids=allowed, allowed_tag=scope_meter_tag(request))
 
 
 @router.get("/{meter_id}")
-async def get_meter(meter_id: int):
+async def get_meter(meter_id: int, request: Request = None):
     meter = meter_repo.get_meter(meter_id)
     if not meter:
         raise HTTPException(404, "电表不存在")
+    if request is not None:
+        ensure_meter_in_scope(request, meter.get("tag"), meter.get("landlord_id"), hide=True)
 
     # 获取实时状态（从新数据库的 meter_status_cache 表读取）
     status = meter_repo.get_meter_status(meter["meter_no"])
@@ -276,7 +279,9 @@ async def get_meter(meter_id: int):
 
 
 @router.post("", status_code=201)
-async def create_meter(data: dict):
+async def create_meter(request: Request, data: dict):
+    # 电表类型范围校验：受限账号创建的电表必须落在自己范围内
+    ensure_meter_in_scope(request, data.get("tag") or "合作商电表", data.get("landlordId"))
     try:
         result = meter_repo.create_meter(data)
     except Exception as e:
@@ -299,9 +304,16 @@ async def create_meter(data: dict):
 
 
 @router.put("/{meter_id}")
-async def update_meter(meter_id: int, data: dict):
+async def update_meter(meter_id: int, request: Request, data: dict):
     # 归属变更会同时影响新旧两个场地的分红分摊，先记下旧归属
     old_meter = meter_repo.get_meter(meter_id)
+    if not old_meter:
+        raise HTTPException(404, "电表不存在")
+    # 电表类型范围：原电表须在范围内；改类型/改场地后的落点也须在范围内
+    ensure_meter_in_scope(request, old_meter.get("tag"), old_meter.get("landlord_id"), hide=True)
+    ensure_meter_in_scope(request,
+                          data.get("tag") or old_meter.get("tag"),
+                          data.get("landlordId") if data.get("landlordId") is not None else old_meter.get("landlord_id"))
     try:
         result = meter_repo.update_meter(meter_id, data)
     except ValueError as e:
@@ -326,8 +338,11 @@ async def update_meter(meter_id: int, data: dict):
 
 
 @router.delete("/{meter_id}")
-async def delete_meter(meter_id: int):
+async def delete_meter(meter_id: int, request: Request):
     old_meter = meter_repo.get_meter(meter_id)
+    if not old_meter:
+        raise HTTPException(404, "电表不存在")
+    ensure_meter_in_scope(request, old_meter.get("tag"), old_meter.get("landlord_id"), hide=True)
     meter_repo.delete_meter(meter_id)
     # 分红联动：重算原场地已有分红记录（失败不影响删除）
     try:

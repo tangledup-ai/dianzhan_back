@@ -7,6 +7,8 @@ export interface AuthUser {
   shareholderId: number | null;
   shareholderName?: string | null;
   landlordIds: number[];
+  /** 数据隔离：限定可见的电表类型（合作商电表/民用电表/共享电表）；null=不限制 */
+  meterTagScope?: string | null;
   phone?: string | null;
 }
 

@@ -2,7 +2,7 @@ from fastapi import APIRouter, HTTPException, Request
 from ..repositories import electricity_repo
 from ..domain.electricity_calc import calc_electricity
 from ..domain.electricity_pricing import split_tax
-from ..infra.auth_scope import scope_landlord_ids
+from ..infra.auth_scope import scope_landlord_ids, ensure_meter_in_scope
 from ..infra.period import to_compact
 from .base import CamelJSONResponse
 
@@ -159,6 +159,8 @@ async def reading_detail(request: Request, meterNo: str, period: str):
         meter = cur.fetchone()
         if not meter:
             raise HTTPException(404, "电表不存在")
+        # 电表类型范围：受限账号只能看范围内电表的抄表信息
+        ensure_meter_in_scope(request, meter.get("tag"), meter.get("landlord_id"), hide=True)
 
         # 抄表链（当期行自带 上月读数/日期 → 本月读数/日期 → 区间度数）
         cur.execute("""
@@ -729,17 +731,29 @@ async def generate_all_ledger() -> int:
 # ─── 电费月台账（Electricity 页，v2 重设计，只含电费）──────────
 
 @router.get("/monthly-ledger")
-async def monthly_ledger(period: str, dim: str = "landlord"):
+async def monthly_ledger(period: str, dim: str = "landlord", request: Request = None):
     """电费月台账：按场地方(landlord)/品牌方(brand) × 单月 汇总 + 明细"""
     from ..infra.database import get_connection, get_dict_cursor
+    from ..infra.auth_scope import scope_landlord_ids, scope_meter_tag
     period = str(period).replace("-", "")
+
+    # 数据隔离：股东按可见场地过滤；指定电表类型范围的账号另按类型过滤电表明细行
+    allowed = scope_landlord_ids(request) if request is not None else None
+    tag_scope = scope_meter_tag(request) if request is not None else None
 
     conn = get_connection()
     cur = get_dict_cursor(conn)
     try:
         if dim == "brand":
             # 品牌维度：按电费分表明细（每表有 付款/收款）按品牌聚合（共享电表无品牌，单独一组）
-            cur.execute("""
+            brand_scope_sql, brand_scope_vals = "", []
+            if allowed is not None:
+                brand_scope_sql += " AND m.landlord_id = ANY(%s::int[])"
+                brand_scope_vals.append(allowed)
+            if tag_scope:
+                brand_scope_sql += " AND m.tag = %s"
+                brand_scope_vals.append(tag_scope)
+            cur.execute(f"""
                 SELECT m.brand_id AS key, COALESCE(b.name, '全品牌共享') AS name,
                        COALESCE(SUM(d.kwh), 0) AS kwh,
                        COALESCE(SUM(d.pay_amount), 0) AS pay_amount,
@@ -749,10 +763,10 @@ async def monthly_ledger(period: str, dim: str = "landlord"):
                 JOIN electricity_records e ON e.id = d.electricity_id
                 JOIN meters m ON d.meter_id = m.id
                 LEFT JOIN brands b ON m.brand_id = b.id
-                WHERE e.period = %s
+                WHERE e.period = %s{brand_scope_sql}
                 GROUP BY m.brand_id, b.name
                 ORDER BY name
-            """, (period,))
+            """, (period, *brand_scope_vals))
             rows = cur.fetchall()
             # 品牌明细：该品牌该月的 电表行（含 互感器倍数/单价/金额/状态）
             for r in rows:
@@ -770,13 +784,17 @@ async def monthly_ledger(period: str, dim: str = "landlord"):
                     JOIN electricity_records e ON e.id = d.electricity_id
                     JOIN meters m ON d.meter_id = m.id
                     LEFT JOIN brands b ON m.brand_id = b.id
-                    WHERE e.period = %s AND {brand_cond}
+                    WHERE e.period = %s AND {brand_cond}{brand_scope_sql}
                     ORDER BY m.meter_name, m.meter_no
-                """, brand_vals)
+                """, (*brand_vals, *brand_scope_vals))
                 r["details"] = cur.fetchall()
         else:
             # 场地维度：台账按 landlord 聚合（v3 直挂）；entity_name = 场地方关联的公司主体（场地合同优先）
-            cur.execute("""
+            landlord_scope_sql, landlord_scope_vals = "", []
+            if allowed is not None:
+                landlord_scope_sql = " AND e.landlord_id = ANY(%s::int[])"
+                landlord_scope_vals.append(allowed)
+            cur.execute(f"""
                 SELECT e.landlord_id AS key, COALESCE(l.name, '未指定场地') AS name,
                        MAX(COALESCE(
                          (SELECT ent.name FROM contracts c JOIN entities ent ON ent.id = c.entity_id
@@ -795,14 +813,18 @@ async def monthly_ledger(period: str, dim: str = "landlord"):
                        END AS pay_status
                 FROM electricity_records e
                 LEFT JOIN landlords l ON e.landlord_id = l.id
-                WHERE e.period = %s
+                WHERE e.period = %s{landlord_scope_sql}
                 GROUP BY e.landlord_id, l.name
                 ORDER BY name
-            """, (period,))
+            """, (period, *landlord_scope_vals))
             rows = cur.fetchall()
-            # 场地明细：该场地该月的 电表行（含 互感器倍数/单价/金额/状态）
+            # 场地明细：该场地该月的 电表行（含 互感器倍数/单价/金额/状态）；受限账号只看范围内类型的电表行
+            detail_scope_sql, detail_scope_vals = "", []
+            if tag_scope:
+                detail_scope_sql = " AND m.tag = %s"
+                detail_scope_vals.append(tag_scope)
             for r in rows:
-                cur.execute("""
+                cur.execute(f"""
                     SELECT m.meter_name, m.meter_no, m.meter_name AS station_name,
                            m.transformer_ratio,
                            m.brand_id, b.name AS brand_name,
@@ -813,9 +835,9 @@ async def monthly_ledger(period: str, dim: str = "landlord"):
                     JOIN electricity_records e ON e.id = d.electricity_id
                     JOIN meters m ON d.meter_id = m.id
                     LEFT JOIN brands b ON m.brand_id = b.id
-                    WHERE e.period = %s AND m.landlord_id = %s
+                    WHERE e.period = %s AND m.landlord_id = %s{detail_scope_sql}
                     ORDER BY m.meter_name, m.meter_no
-                """, (period, r["key"]))
+                """, (period, r["key"], *detail_scope_vals))
                 r["details"] = cur.fetchall()
     finally:
         cur.close()
@@ -869,8 +891,10 @@ async def export_ledger(request: Request, period: str, dim: str = "landlord"):
     返回 rows（每电表一行，含 group 分组键）+ 分组后的合计，供前端生成 Excel。
     """
     from ..infra.database import get_connection, get_dict_cursor
+    from ..infra.auth_scope import scope_meter_tag
     period = str(period).replace("-", "")
     allowed = scope_landlord_ids(request)
+    tag_scope = scope_meter_tag(request)
 
     conn = get_connection()
     cur = get_dict_cursor(conn)
@@ -879,7 +903,7 @@ async def export_ledger(request: Request, period: str, dim: str = "landlord"):
         cur.execute("""
             SELECT
                 d.id AS detail_id,
-                m.id AS meter_id, m.meter_no, m.meter_name, m.transformer_ratio,
+                m.id AS meter_id, m.meter_no, m.meter_name, m.transformer_ratio, m.tag,
                 l.id AS landlord_id, l.name AS landlord_name, l.company_share,
                 b.id AS brand_id, b.name AS brand_name,
                 ent.name AS entity_name,
@@ -907,9 +931,11 @@ async def export_ledger(request: Request, period: str, dim: str = "landlord"):
         cur.close()
         conn.close()
 
-    # 权限过滤（股东只看关联场地）
+    # 权限过滤（股东只看关联场地；指定电表类型范围的账号只看该类型电表行）
     if allowed is not None:
         rows = [r for r in rows if r.get("landlord_id") in allowed]
+    if tag_scope:
+        rows = [r for r in rows if (r.get("tag") or "") == tag_scope]
 
     out = []
     for r in rows:
@@ -926,11 +952,12 @@ async def export_ledger(request: Request, period: str, dim: str = "landlord"):
         if dim == "brand":
             group = r.get("brand_name") or "全品牌共享"
             group_key = f"brand-{r.get('brand_id') or 0}"
-            collect_company = r.get("entity_name") or group  # 收款公司：实体优先，兜底品牌
+            # 收款公司 = 电表关联的公司主体；未关联时明确标注，不冒充公司名
+            collect_company = r.get("entity_name") or "未指定主体"
         else:
             group = r.get("landlord_name") or "未指定场地"
             group_key = f"landlord-{r.get('landlord_id') or 0}"
-            collect_company = r.get("entity_name") or group
+            collect_company = r.get("entity_name") or "未指定主体"
 
         out.append({
             "groupKey": group_key,

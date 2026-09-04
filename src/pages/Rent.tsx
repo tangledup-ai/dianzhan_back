@@ -3,7 +3,6 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { getMonthlyLedger, getYearlyPaymentSchedule } from "@/api/rent";
 import { updateSchedule } from "@/api/contracts";
 import { submitStationApproval } from "@/api/approvals";
-import { listEntities } from "@/api/directory";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Field, TextInput, inputCls } from "@/components/fields";
@@ -37,6 +36,50 @@ function shift(period: string, offset: number): string {
   return `${dt.getFullYear()}${String(dt.getMonth() + 1).padStart(2, "0")}`;
 }
 
+// ─── 收/付款周期 → 动态标题前缀：不同合同应付周期不同（季付 → 「本季度场地费应付」）───
+const CYCLE_PREFIX: Record<string, string> = {
+  "月付": "本月", "季付": "本季度", "半年付": "本半年度", "年付": "本年度", "年收": "本年度",
+};
+
+function cyclePrefix(method?: string | null): string | null {
+  return CYCLE_PREFIX[String(method ?? "").trim()] ?? null;
+}
+
+// 从一个月的合同行中提取统一的收/付款周期前缀；周期混合时返回 null（回退通用标题）
+function monthCyclePrefixes(rows: any[]): { income: string | null; pay: string | null } {
+  const income = new Set<string>();
+  const pay = new Set<string>();
+  for (const g of rows ?? []) {
+    for (const c of g.contracts ?? []) {
+      const p = cyclePrefix(c.payMethod);
+      // 只统计该月有分期覆盖的合同（有应付/应收金额才有「周期」语义）
+      const hasSched = (Number(c.paidAmount) || 0) + (Number(c.unpaidAmount) || 0) > 0;
+      if (!p || !hasSched) continue;
+      (c.contractType === "场地合同" ? pay : income).add(p);
+    }
+  }
+  return {
+    income: income.size === 1 ? (Array.from(income)[0] ?? null) : null,
+    pay: pay.size === 1 ? (Array.from(pay)[0] ?? null) : null,
+  };
+}
+
+// 单个场地方/品牌方行的周期标签：该行各自的场地合同（付）/品牌合同（收）周期统一时显示
+function rowCyclePrefixes(contracts: any[]): { income: string | null; pay: string | null } {
+  const income = new Set<string>();
+  const pay = new Set<string>();
+  for (const c of contracts ?? []) {
+    const p = cyclePrefix(c.payMethod);
+    const hasSched = (Number(c.paidAmount) || 0) + (Number(c.unpaidAmount) || 0) > 0;
+    if (!p || !hasSched) continue;
+    (c.contractType === "场地合同" ? pay : income).add(p);
+  }
+  return {
+    income: income.size === 1 ? (Array.from(income)[0] ?? null) : null,
+    pay: pay.size === 1 ? (Array.from(pay)[0] ?? null) : null,
+  };
+}
+
 // ─── 整年场地收支表（框外展示）：按场地×品牌，付款信息=场地合同，收款信息=品牌方合同 ───
 function YearlyTable({ yearlyRows, yearLabels }: { yearlyRows: any[]; yearLabels: string[] }) {
   return (
@@ -64,8 +107,8 @@ function YearlyTable({ yearlyRows, yearLabels }: { yearlyRows: any[]; yearLabels
                 <thead>
                   <tr className="border-b bg-slate-100 text-left text-[10px] text-slate-500">
                     <th className="px-2 py-1.5" rowSpan={2}>品牌方</th>
-                    <th className="border-x bg-rose-50/70 px-2 py-1.5 text-center" colSpan={10}>付款信息（场地合同）</th>
-                    <th className="border-x bg-emerald-50/70 px-2 py-1.5 text-center" colSpan={12}>收款信息（品牌方合同）</th>
+                    <th className="border-x bg-rose-50/70 px-2 py-1.5 text-center" colSpan={7 + yearLabels.length}>付款信息（场地合同）</th>
+                    <th className="border-x bg-emerald-50/70 px-2 py-1.5 text-center" colSpan={9 + yearLabels.length}>收款信息（品牌方合同）</th>
                   </tr>
                   <tr className="border-b bg-slate-100 text-[10px] text-slate-500">
                     <th className="border-x px-2 py-1">负责人</th>
@@ -74,13 +117,13 @@ function YearlyTable({ yearlyRows, yearLabels }: { yearlyRows: any[]; yearLabels
                     <th className="px-2 py-1">租金成本/年</th>
                     <th className="px-2 py-1">付款方式</th>
                     {yearLabels.map((yl) => (
-                      <th key={yl} className="px-2 py-1">{yl}付款情况</th>
+                      <th key={yl} className="px-2 py-1">{yl}年付款情况</th>
                     ))}
                     <th className="px-2 py-1">单台成本/年</th>
                     <th className="px-2 py-1">押金</th>
                     <th className="border-x px-2 py-1">合同日期</th>
                     {yearLabels.map((yl) => (
-                      <th key={`i-${yl}`} className="px-2 py-1">{yl}到账情况</th>
+                      <th key={`i-${yl}`} className="px-2 py-1">{yl}年到账情况</th>
                     ))}
                     <th className="px-2 py-1">柜数</th>
                     <th className="px-2 py-1">单台月租金(含税)</th>
@@ -970,18 +1013,23 @@ export default function Rent() {
 
   const months: any[] = q.data ?? [];
 
-  // 逐年付款/到账的年份列：取当前月份所有合同分期覆盖的年份并集（升序）
-  const yearLabels = useMemo(() => {
-    const years = new Set<string>();
+  // 总览表头：区间内收/付款周期统一时用动态标题（如 本季度场地费应付）；混合周期回退通用标题
+  const rangeCycles = useMemo(() => {
+    const income = new Set<string>();
+    const pay = new Set<string>();
     for (const m of months) {
-      for (const g of m.rows ?? []) {
-        for (const c of g.contracts ?? []) {
-          for (const ys of c.yearStatus ?? []) years.add(ys.year);
-        }
-      }
+      const cp = monthCyclePrefixes(m.rows ?? []);
+      if (cp.income) income.add(cp.income);
+      if (cp.pay) pay.add(cp.pay);
     }
-    return [...years].sort();
+    return {
+      income: income.size === 1 ? (Array.from(income)[0] ?? null) : null,
+      pay: pay.size === 1 ? (Array.from(pay)[0] ?? null) : null,
+    };
   }, [months]);
+
+  // 整年场地收支的年份列：只展示当前选中年份（startPeriod 所在年），不列出合同覆盖的全部年份
+  const yearLabels = useMemo(() => [(startPeriod || CUR_MONTH).slice(0, 4)], [startPeriod]);
 
   // 整年场地收支（框外）：取第一个月的 yearlyRows（后端按该年全年合同构建）
   const yearlyRows: any[] = useMemo(() => (months[0]?.yearlyRows ?? []), [months]);
@@ -1022,14 +1070,8 @@ export default function Rent() {
     setStartPeriod(shift(CUR_MONTH, -(n - 1)));
   };
 
-  // 公司主体（导出"收款公司"列）
-  const entities = useQuery({ queryKey: ["entities"], queryFn: listEntities });
-  const collectCompany = useMemo(
-    () => (entities.data ?? []).map((e: any) => e.name).join("、"),
-    [entities.data]
-  );
-
   // ── 导出 Excel（参考美团场租台账格式：每 场地×品牌 一行，整年口径）──
+  // 收款公司 = 该行品牌方合同自身关联的公司主体（缺失时回退场地合同主体）
   const doExport = () => {
     if (yearlyRows.length === 0) { toast.error("暂无数据可导出"); return; }
     const rows: unknown[][] = [];
@@ -1062,7 +1104,7 @@ export default function Rent() {
         const incomeStatus = (c.yearStatus ?? []).map((ys: any) => `${ys.year}:${ys.paid}/${ys.total}`).join(" ");
         rows.push([
           seq,
-          collectCompany, // 收款公司 = 公司主体
+          c.entityName || gy.entityName || "未指定主体", // 收款公司 = 该行品牌合同关联的公司主体
           "", // 占股（暂无数据）
           gy.landlordName,
           c.brandName || "",
@@ -1221,14 +1263,14 @@ export default function Rent() {
             <tr className="border-b bg-slate-50 text-left text-[11px] text-slate-500">
               <th className="w-8 px-2 py-2.5"></th>
               <th className="px-3 py-2.5 font-medium">月份</th>
-              <th className="px-3 py-2.5 text-right font-medium">场地费收入</th>
-              {dim === "landlord" && <th className="px-3 py-2.5 text-right font-medium">场地费成本</th>}
-              <th className="px-3 py-2.5 text-right font-medium">税费</th>
-              <th className="px-3 py-2.5 text-right font-medium">利润</th>
-              <th className="px-3 py-2.5 text-right font-medium">已收</th>
-              <th className="px-3 py-2.5 text-right font-medium">未收</th>
-              {dim === "landlord" && <th className="px-3 py-2.5 text-right font-medium">已付</th>}
-              {dim === "landlord" && <th className="px-3 py-2.5 text-right font-medium">未付</th>}
+              <th className="px-3 py-2.5 text-right font-medium">场地费收入(月)</th>
+              {dim === "landlord" && <th className="px-3 py-2.5 text-right font-medium">场地费成本(月)</th>}
+              <th className="px-3 py-2.5 text-right font-medium">税费(月)</th>
+              <th className="px-3 py-2.5 text-right font-medium">利润(月)</th>
+              <th className="px-3 py-2.5 text-right font-medium">{rangeCycles.income ? `${rangeCycles.income}场地费已收` : "已收(按周期)"}</th>
+              <th className="px-3 py-2.5 text-right font-medium">{rangeCycles.income ? `${rangeCycles.income}场地费未收` : "未收(按周期)"}</th>
+              {dim === "landlord" && <th className="px-3 py-2.5 text-right font-medium">{rangeCycles.pay ? `${rangeCycles.pay}场地费已付` : "已付(按周期)"}</th>}
+              {dim === "landlord" && <th className="px-3 py-2.5 text-right font-medium">{rangeCycles.pay ? `${rangeCycles.pay}场地费应付` : "未付(按周期)"}</th>}
             </tr>
           </thead>
           <tbody>
@@ -1239,6 +1281,7 @@ export default function Rent() {
             )}
             {months.map((m) => {
               const mt = m.totals ?? {};
+              const cyc = monthCyclePrefixes(m.rows ?? []);
               const mKey = `m-${m.period}`;
               const mOpen = expanded.has(mKey);
               return (
@@ -1281,30 +1324,45 @@ export default function Rent() {
                                 <thead>
                                   <tr className="border-b bg-slate-100 text-left text-[10px] text-slate-500">
                                     <th className="w-72 px-2 py-1">{dim === "landlord" ? "场地方" : "品牌方"}</th>
-                                    <th className="px-2 py-1 text-right">场地费收入</th>
-                                    {dim === "landlord" && <th className="px-2 py-1 text-right">场地费成本</th>}
-                                    <th className="px-2 py-1 text-right">税费</th>
-                                    <th className="px-2 py-1 text-right">利润</th>
-                                    <th className="px-2 py-1 text-right">已收</th>
-                                    <th className="px-2 py-1 text-right">未收</th>
-                                    {dim === "landlord" && <th className="px-2 py-1 text-right">已付</th>}
-                                    {dim === "landlord" && <th className="px-2 py-1 text-right">未付</th>}
+                                    <th className="px-2 py-1 text-right">场地费收入(月)</th>
+                                    {dim === "landlord" && <th className="px-2 py-1 text-right">场地费成本(月)</th>}
+                                    <th className="px-2 py-1 text-right">税费(月)</th>
+                                    <th className="px-2 py-1 text-right">利润(月)</th>
+                                    <th className="px-2 py-1 text-right">{cyc.income ? `${cyc.income}场地费已收` : "已收(按周期)"}</th>
+                                    <th className="px-2 py-1 text-right">{cyc.income ? `${cyc.income}场地费未收` : "未收(按周期)"}</th>
+                                    {dim === "landlord" && <th className="px-2 py-1 text-right">{cyc.pay ? `${cyc.pay}场地费已付` : "已付(按周期)"}</th>}
+                                    {dim === "landlord" && <th className="px-2 py-1 text-right">{cyc.pay ? `${cyc.pay}场地费应付` : "未付(按周期)"}</th>}
                                   </tr>
                                 </thead>
                                 <tbody>
-                                  {(grp.rows ?? []).map((g: any) => (
-                                  <tr key={g.key} className="border-b last:border-0">
-                                    <td className="px-2 py-1.5 font-medium text-slate-700">{g.name}</td>
-                                    <td className="px-2 py-1.5 text-right tabular-nums text-emerald-600">{fmtMoney(g.rentIncome)}</td>
-                                    {dim === "landlord" && <td className="px-2 py-1.5 text-right tabular-nums text-rose-600">{fmtMoney(g.rentCost)}</td>}
-                                    <td className="px-2 py-1.5 text-right tabular-nums text-slate-500">{fmtMoney(g.rentTax)}</td>
-                                    <td className="px-2 py-1.5 text-right tabular-nums font-medium text-slate-700">{fmtMoney(g.rentProfit)}</td>
-                                    <td className="px-2 py-1.5 text-right tabular-nums text-emerald-600">{fmtMoney(g.collectedAmount)}</td>
-                                    <td className="px-2 py-1.5 text-right tabular-nums text-amber-600">{fmtMoney(g.uncollectedAmount)}</td>
-                                    {dim === "landlord" && <td className="px-2 py-1.5 text-right tabular-nums text-slate-600">{fmtMoney(g.paidAmount)}</td>}
-                                    {dim === "landlord" && <td className="px-2 py-1.5 text-right tabular-nums text-rose-600">{fmtMoney(g.unpaidAmount)}</td>}
-                                  </tr>
-                                  ))}
+                                  {(grp.rows ?? []).map((g: any) => {
+                                    const tags = rowCyclePrefixes(g.contracts);
+                                    return (
+                                    <tr key={g.key} className="border-b last:border-0">
+                                      <td className="px-2 py-1.5 font-medium text-slate-700">{g.name}</td>
+                                      <td className="px-2 py-1.5 text-right tabular-nums text-emerald-600">{fmtMoney(g.rentIncome)}</td>
+                                      {dim === "landlord" && <td className="px-2 py-1.5 text-right tabular-nums text-rose-600">{fmtMoney(g.rentCost)}</td>}
+                                      <td className="px-2 py-1.5 text-right tabular-nums text-slate-500">{fmtMoney(g.rentTax)}</td>
+                                      <td className="px-2 py-1.5 text-right tabular-nums font-medium text-slate-700">{fmtMoney(g.rentProfit)}</td>
+                                      <td className="px-2 py-1.5 text-right tabular-nums text-emerald-600">
+                                        {!cyc.income && tags.income && <span className="mr-1 text-[9px] text-slate-400">{tags.income}</span>}
+                                        {fmtMoney(g.collectedAmount)}
+                                      </td>
+                                      <td className="px-2 py-1.5 text-right tabular-nums text-amber-600">
+                                        {!cyc.income && tags.income && <span className="mr-1 text-[9px] text-slate-400">{tags.income}</span>}
+                                        {fmtMoney(g.uncollectedAmount)}
+                                      </td>
+                                      {dim === "landlord" && <td className="px-2 py-1.5 text-right tabular-nums text-slate-600">
+                                        {!cyc.pay && tags.pay && <span className="mr-1 text-[9px] text-slate-400">{tags.pay}</span>}
+                                        {fmtMoney(g.paidAmount)}
+                                      </td>}
+                                      {dim === "landlord" && <td className="px-2 py-1.5 text-right tabular-nums text-rose-600">
+                                        {!cyc.pay && tags.pay && <span className="mr-1 text-[9px] text-slate-400">{tags.pay}</span>}
+                                        {fmtMoney(g.unpaidAmount)}
+                                      </td>}
+                                    </tr>
+                                    );
+                                  })}
                                 </tbody>
                               </table>
                               </div>
@@ -1338,8 +1396,9 @@ export default function Rent() {
       </div>
 
       <p className="text-[11px] text-slate-400">
-        口径：收入=品牌方合同月租（覆盖该月）；成本=场地合同月租；税费=启用租金税率的品牌方合同（含税月租−税后月租）；
-        已收/未收 = 品牌方合同该月覆盖期次的到账状态（已到账/未到账）；已付/未付 = 场地合同该月覆盖期次的付款状态（已付款/未付款）。不含电费。编辑合同请到「合同管理」页。
+        口径：收入/成本/税费/利润 均为当月口径（收入=品牌方合同月租·覆盖该月；成本=场地合同月租；利润=当月收入−成本−税费）；
+        已收/未收/已付/应付 = 该月覆盖期次的到账/付款状态，金额按合同周期计（季付=整季分期金额，非单月）：
+        当月周期统一时列标题随之显示（如「本季度场地费应付」），周期混合时每行金额前标注该行合同的周期。不含电费。编辑合同请到「合同管理」页。
       </p>
 
       {/* ── 整年场地收支（页面末尾，默认收起，点击展开） ── */}
