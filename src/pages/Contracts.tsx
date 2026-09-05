@@ -68,6 +68,8 @@ export default function Contracts() {
   const landlords = useQuery({ queryKey: ["landlords"], queryFn: listLandlords });
   const entitiesQ = useQuery({ queryKey: ["entities"], queryFn: listEntities });
   const metersQ = useQuery({ queryKey: ["meters"], queryFn: () => listMeters() });
+  // 柜子数据页面级加载：主体分组按「电表柜数」分摊需要它（GREATEST(1,柜数) 口径）
+  const cabinetsQ = useQuery({ queryKey: ["allCabinets"], queryFn: () => listCabinets() });
   const list = useQuery({
     queryKey: ["contracts", keyword, brandId, landlordId, contractType],
     queryFn: () => listContracts({
@@ -195,22 +197,79 @@ export default function Contracts() {
     });
   };
   const entityGroups = useMemo(() => {
-    // 每个场地方的主体：合同 entity_id 优先，其次该场地方电表的报税主体（与 Entities 页口径一致），都没有归「未指定主体」
     const entityNameById = new Map<number, string>((entitiesQ.data ?? []).map((e: any) => [e.id, e.name] as [number, string]));
-    const meterEntityByLandlord = new Map<number, string>();
-    for (const m of metersQ.data ?? []) {
-      if (m.landlordId && m.entityId && !meterEntityByLandlord.has(m.landlordId)) {
-        const name = entityNameById.get(m.entityId);
-        if (name) meterEntityByLandlord.set(m.landlordId, name);
-      }
+
+    // 电表主体权重（与主体损益表口径一致）：每块计费电表按 GREATEST(1, 柜数) 计
+    const cabCount = new Map<number, number>();
+    for (const cab of cabinetsQ.data ?? []) {
+      cabCount.set(cab.meterId, (cabCount.get(cab.meterId) || 0) + 1);
     }
-    const withEntity = groupedByLandlord.map((g: any) => ({
-      ...g,
-      entityName: (g.costContracts.find((c: any) => c.entityName) || g.incomeContracts.find((c: any) => c.entityName))?.entityName
-        || meterEntityByLandlord.get(g.landlordId) || "未指定主体",
-    }));
-    return groupByEntity(withEntity);
-  }, [groupedByLandlord, metersQ.data, entitiesQ.data]);
+    const weightIncome = new Map<string, Map<number, number>>();   // "场地:品牌" -> 主体 -> 柜数
+    const weightLandlord = new Map<number, Map<number, number>>(); // 场地 -> 主体 -> 柜数
+    for (const m of metersQ.data ?? []) {
+      if (!m.landlordId || m.entityId == null) continue;
+      if (!(m.brandId != null || m.tag === "共享电表")) continue;
+      if (String(m.meterNo || "").startsWith("TEST")) continue;
+      const cabs = Math.max(1, cabCount.get(m.id) || 0);
+      const lk = weightLandlord.get(m.landlordId) ?? new Map<number, number>();
+      lk.set(m.entityId, (lk.get(m.entityId) || 0) + cabs);
+      weightLandlord.set(m.landlordId, lk);
+      const bkey = `${m.landlordId}:${m.brandId ?? "shared"}`;
+      const bk = weightIncome.get(bkey) ?? new Map<number, number>();
+      bk.set(m.entityId, (bk.get(m.entityId) || 0) + cabs);
+      weightIncome.set(bkey, bk);
+    }
+
+    // 合同 → 主体分配：有 entity_id 精确归属；无 entity_id 按电表柜数比例分摊（收入按品牌电表，成本按场地电表）
+    const allocOf = (c: any): { entityId: number; ratio: number }[] => {
+      if (c.entityId != null) return [{ entityId: c.entityId, ratio: 1 }];
+      if (!c.landlordId) return [];
+      const wmap = c.contractType === "品牌方合同"
+        ? weightIncome.get(`${c.landlordId}:${c.brandId ?? "shared"}`)
+        : weightLandlord.get(c.landlordId);
+      const entries = wmap ? [...wmap.entries()].filter(([, w]) => w > 0) : [];
+      if (entries.length === 0) return [];
+      const totalW = entries.reduce((s, [, w]) => s + w, 0);
+      return entries.map(([eid, w]) => ({ entityId: eid, ratio: w / totalW }));
+    };
+
+    // 主体 × 场地方 切片：同一场地同一品牌电表分属不同主体时，合同按柜数比例拆到各主体名下
+    const slices = new Map<string, any>();
+    const sliceOf = (entityName: string, g: any) => {
+      const key = `${entityName}||${g.landlordId}`;
+      if (!slices.has(key)) {
+        slices.set(key, {
+          landlordId: g.landlordId,
+          landlordName: g.landlordName,
+          entityName,
+          costContracts: [],
+          incomeContracts: [],
+        });
+      }
+      return slices.get(key);
+    };
+
+    for (const g of groupedByLandlord) {
+      const push = (c: any, isIncome: boolean) => {
+        const allocs = allocOf(c);
+        const bucket = (name: string, row: any) => sliceOf(name, g)[isIncome ? "incomeContracts" : "costContracts"].push(row);
+        if (allocs.length === 0) {
+          bucket("未指定主体", { ...c, _ratio: 1 });
+          return;
+        }
+        for (const a of allocs) {
+          const name = entityNameById.get(a.entityId) || "未指定主体";
+          const row = a.ratio < 1
+            ? { ...c, monthlyRent: Math.round(Number(c.monthlyRent || 0) * a.ratio * 100) / 100, _ratio: a.ratio }
+            : { ...c, _ratio: 1 };
+          bucket(name, row);
+        }
+      };
+      for (const c of g.costContracts) push(c, false);
+      for (const c of g.incomeContracts) push(c, true);
+    }
+    return groupByEntity([...slices.values()]);
+  }, [groupedByLandlord, metersQ.data, entitiesQ.data, cabinetsQ.data]);
 
   const doExport = () => {
     // 导出全部合同（按当前筛选），样式参考"共享合同监控表"：按合同类型分 sheet
@@ -496,6 +555,7 @@ export default function Contracts() {
                               </td>
                               <td className="px-3 py-2.5 font-medium">
                                 {c.brandName || <span className="text-purple-600">全部品牌共享</span>}
+                                {c._ratio != null && c._ratio < 1 ? <span className="ml-1 text-[10px] text-amber-600">（分摊 {(c._ratio * 100).toFixed(0)}%）</span> : null}
                               </td>
                               <td className="px-3 py-2.5 text-right tabular-nums">{c.unitMonthlyRent ? fmtMoney(c.unitMonthlyRent) : "-"}</td>
                               <td className="px-3 py-2.5 text-right tabular-nums">{(c.liveCabinetsCount ?? c.cabinetsCount) ? fmtNum(c.liveCabinetsCount ?? c.cabinetsCount) : "-"}</td>
