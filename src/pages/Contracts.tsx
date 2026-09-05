@@ -9,7 +9,7 @@ import { StatusBadge } from "@/components/Stat";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Switch } from "@/components/ui/switch";
-import { Field, NumInput, TextInput, DateInput, SelectInput, inputCls } from "@/components/fields";
+import { Field, NumInput, TextInput, DateInput, SelectInput, SearchSelect, inputCls } from "@/components/fields";
 import { MapPicker } from "@/components/MapPicker";
 import * as XLSX from "xlsx";
 import { fmtMoney, fmtNum, fmtDate, numOrNull } from "@/lib/format";
@@ -951,7 +951,8 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
 
             {f.contractType === "场地合同" && (
               <Field label="场地方 *">
-                <SelectInput value={f.landlordId} onChange={set("landlordId")}
+                <SearchSelect value={f.landlordId} onChange={set("landlordId")}
+                  placeholder="请选择或搜索场地方"
                   options={[{ value: "", label: "请选择场地方" }, ...(landlords.data ?? []).map((l: any) => ({ value: String(l.id), label: l.name }))]} />
               </Field>
             )}
@@ -959,7 +960,8 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
             {f.contractType === "品牌方合同" && (
               <>
                 <Field label="关联场地 *">
-                  <SelectInput value={f.landlordId} onChange={set("landlordId")}
+                  <SearchSelect value={f.landlordId} onChange={set("landlordId")}
+                    placeholder="请选择或搜索场地方"
                     options={[{ value: "", label: "请选择场地方" }, ...(landlords.data ?? []).map((l: any) => ({ value: String(l.id), label: l.name }))]} />
                 </Field>
                 <Field label="品牌方">
