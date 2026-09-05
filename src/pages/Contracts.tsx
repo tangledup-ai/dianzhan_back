@@ -18,24 +18,31 @@ import { groupByEntity } from "@/lib/groupColors";
 import { ContractSchedule } from "@/components/ContractSchedule";
 import { toast } from "sonner";
 
-// ── 拆期预检（与后端 contract_schedule_repo._split_periods 同一算法）──
+// ── 拆期预检（与后端 contract_schedule_repo._split_periods 同一算法：按合同周年日推进）──
 const PERIOD_MONTHS: Record<string, number> = { "月付": 1, "季付": 3, "半年付": 6, "年付": 12 };
+
+function addMonths(d: Date, months: number): Date {
+  const total = d.getFullYear() * 12 + d.getMonth() + months;
+  const y = Math.floor(total / 12), m0 = total % 12;
+  const last = new Date(y, m0 + 1, 0).getDate();
+  const isLastDay = d.getDate() === new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate();
+  return new Date(y, m0, isLastDay ? last : Math.min(d.getDate(), last));
+}
 
 function splitPeriodsPreview(startDate: string, endDate: string, payMethod: string) {
   const months = PERIOD_MONTHS[payMethod] || 1;
   const s = new Date(startDate + "T00:00:00");
   const e = new Date(endDate + "T00:00:00");
   const periods: { ps: Date; pe: Date; nominalEnd: Date }[] = [];
+  let k = 0;
   let cur = new Date(s);
   while (cur <= e) {
-    const ym0 = cur.getFullYear() * 12 + cur.getMonth();
-    const nNominal = ym0 + months - 1;
-    let pe = new Date(Math.floor(nNominal / 12), nNominal % 12 + 1, 0); // 该期自然月末
-    if (pe > e) pe = new Date(e);
-    const nNext = ym0 + months;
-    const nominalEnd = new Date(Math.floor(nNext / 12), nNext % 12 + 1, 0);
+    const next = addMonths(s, (k + 1) * months);
+    const nominalEnd = new Date(next.getFullYear(), next.getMonth(), next.getDate() - 1);
+    const pe = nominalEnd > e ? new Date(e) : nominalEnd;
     periods.push({ ps: new Date(cur), pe, nominalEnd });
-    cur = new Date(Math.floor(nNext / 12), nNext % 12, 1);
+    cur = next;
+    k++;
   }
   return periods;
 }
@@ -391,9 +398,9 @@ export default function Contracts() {
                         const isExpanded = expandedContractId === c.id;
                         return (
                           <>
-                            <tr key={c.id} className={`border-b last:border-0 hover:bg-slate-50/60 ${c.status === "已到期" ? "bg-rose-50/30" : c.status === "临期" ? "bg-amber-50/30" : c.status === "提前结束" ? "bg-violet-50/30" : ""}`}>
+                            <tr key={c.id} onClick={() => setExpandedContractId(isExpanded ? null : c.id)} className={`cursor-pointer border-b last:border-0 hover:bg-slate-50/60 ${c.status === "已到期" ? "bg-rose-50/30" : c.status === "临期" ? "bg-amber-50/30" : c.status === "提前结束" ? "bg-violet-50/30" : ""}`}>
                               <td className="px-3 py-2.5">
-                                <button className="rounded p-0.5 text-slate-400 hover:text-emerald-600" onClick={() => setExpandedContractId(isExpanded ? null : c.id)} title="查看付款情况">
+                                <button className="rounded p-0.5 text-slate-400 hover:text-emerald-600" title="查看付款情况">
                                   {isExpanded ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
                                 </button>
                               </td>
@@ -410,7 +417,7 @@ export default function Contracts() {
                               </td>
                               <td className="px-3 py-2.5"><StatusBadge status={c.status} /></td>
                               <td className="max-w-[120px] truncate px-3 py-2.5 text-slate-500" title={c.remark ?? ""}>{c.remark ?? "-"}</td>
-                              <td className="px-3 py-2.5">
+                              <td className="px-3 py-2.5" onClick={(e) => e.stopPropagation()}>
                                 <div className="flex justify-center gap-0.5">
                                   <button className="rounded p-1 text-slate-400 hover:text-emerald-600" onClick={() => { setEditing(c); setFormType(c.contractType); setFormOpen(true); }}><Pencil className="h-3.5 w-3.5" /></button>
                                   <button className="rounded p-1 text-slate-400 hover:text-rose-500" onClick={() => window.confirm("删除？") && del.mutate(c.id)}><Trash2 className="h-3.5 w-3.5" /></button>
@@ -481,9 +488,9 @@ export default function Contracts() {
                         const isExpanded = expandedContractId === c.id;
                         return (
                           <>
-                            <tr key={c.id} className={`border-b last:border-0 hover:bg-slate-50/60 ${c.status === "已到期" ? "bg-rose-50/30" : c.status === "临期" ? "bg-amber-50/30" : c.status === "提前结束" ? "bg-violet-50/30" : ""}`}>
+                            <tr key={c.id} onClick={() => setExpandedContractId(isExpanded ? null : c.id)} className={`cursor-pointer border-b last:border-0 hover:bg-slate-50/60 ${c.status === "已到期" ? "bg-rose-50/30" : c.status === "临期" ? "bg-amber-50/30" : c.status === "提前结束" ? "bg-violet-50/30" : ""}`}>
                               <td className="px-3 py-2.5">
-                                <button className="rounded p-0.5 text-slate-400 hover:text-emerald-600" onClick={() => setExpandedContractId(isExpanded ? null : c.id)} title="查看收款情况">
+                                <button className="rounded p-0.5 text-slate-400 hover:text-emerald-600" title="查看收款情况">
                                   {isExpanded ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
                                 </button>
                               </td>
@@ -513,7 +520,7 @@ export default function Contracts() {
                               </td>
                               <td className="px-3 py-2.5"><StatusBadge status={c.status} /></td>
                               <td className="max-w-[120px] truncate px-3 py-2.5 text-slate-500" title={c.remark ?? ""}>{c.remark ?? "-"}</td>
-                              <td className="px-3 py-2.5">
+                              <td className="px-3 py-2.5" onClick={(e) => e.stopPropagation()}>
                                 <div className="flex justify-center gap-0.5">
                                   {Number(c.rentRefund) > 0 && (
                                     <button className="rounded p-1 text-slate-400 hover:text-sky-600" title="提交场地费退款审批" onClick={() => setRefundTarget(c)}><FileText className="h-3.5 w-3.5" /></button>
@@ -1094,6 +1101,16 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
                   <SelectInput value={f.payMethod} onChange={set("payMethod")}
                     options={[{ value: "", label: "请选择" }, { value: "月付", label: "月付" }, { value: "季付", label: "季付" }, { value: "半年付", label: "半年付" }, { value: "年付", label: "年付" }]} />
                 </Field>
+                {f.payMethod && f.startDate && (f.earlyEndDate || f.endDate) && (
+                  <div className="rounded border border-amber-200 bg-amber-50/60 px-2.5 py-1.5 text-[11px] leading-5 text-amber-800 md:col-span-2">
+                    将拆成 {splitPeriodsPreview(f.startDate, f.earlyEndDate || f.endDate, f.payMethod).length} 期：
+                    {splitPeriodsPreview(f.startDate, f.earlyEndDate || f.endDate, f.payMethod).map((p, i) => (
+                      <span key={i} className="mr-2">
+                        第{i + 1}期 {ymd(p.ps)}~{ymd(p.pe)}{p.pe < p.nominalEnd ? "（不足整期，金额留空待手填）" : ""}
+                      </span>
+                    ))}
+                  </div>
+                )}
                 <Field label="押金（元）"><NumInput value={f.deposit} onChange={set("deposit")} placeholder="0" /></Field>
                 <Field label="场地租金提前支付（天）"><NumInput value={f.rentAdvanceDays} onChange={set("rentAdvanceDays")} placeholder="0" /></Field>
               </>
@@ -1163,6 +1180,16 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
                 <SelectInput value={f.payMethod} onChange={set("payMethod")}
                   options={[{ value: "", label: "请选择" }, { value: "月付", label: "月收" }, { value: "季付", label: "季收" }, { value: "半年付", label: "半年收" }, { value: "年付", label: "年收" }]} />
               </Field>
+              {f.payMethod && f.startDate && (f.earlyEndDate || f.endDate) && (
+                <div className="rounded border border-amber-200 bg-amber-50/60 px-2.5 py-1.5 text-[11px] leading-5 text-amber-800 md:col-span-2">
+                  将拆成 {splitPeriodsPreview(f.startDate, f.earlyEndDate || f.endDate, f.payMethod).length} 期：
+                  {splitPeriodsPreview(f.startDate, f.earlyEndDate || f.endDate, f.payMethod).map((p, i) => (
+                    <span key={i} className="mr-2">
+                      第{i + 1}期 {ymd(p.ps)}~{ymd(p.pe)}{p.pe < p.nominalEnd ? "（不足整期，金额留空待手填）" : ""}
+                    </span>
+                  ))}
+                </div>
+              )}
               <Field label="押金（元）"><NumInput value={f.deposit} onChange={set("deposit")} placeholder="0" />
                 {!!Number(record?.depositRefundAmount) && (
                   <span className="mt-0.5 block text-[11px] text-rose-600">

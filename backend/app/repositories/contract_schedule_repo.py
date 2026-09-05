@@ -3,6 +3,7 @@
 - 付款分期表：rent_payment_schedule（场地合同，公司付给场地方）
 - 收款分期表：rent_income_schedule（品牌方合同，品牌方付给公司）
 """
+import calendar
 from datetime import date, timedelta
 from ..infra.database import get_connection, get_dict_cursor
 
@@ -15,54 +16,54 @@ _PERIOD_MONTHS = {
 }
 
 
+def _add_months(d: date, months: int) -> date:
+    """日期 + months 个月：按合同周年日推进；
+    月末 日（如 1 月 31 日）对齐到目标月最后一天，避免跳月"""
+    total = d.year * 12 + (d.month - 1) + months
+    y, m0 = divmod(total, 12)
+    m = m0 + 1
+    last = calendar.monthrange(y, m)[1]
+    if d.day == calendar.monthrange(d.year, d.month)[1]:
+        day = last
+    else:
+        day = min(d.day, last)
+    return date(y, m, day)
+
+
 def _nominal_period_end(ps: date, months: int) -> date:
     """本期不被合同截止日截断时的自然结束日（下一期起点的前一天）"""
-    total_m = (ps.year * 12 + ps.month - 1) + months
-    ny, nm = divmod(total_m, 12)
-    return date(ny, nm + 1, 1) - timedelta(days=1)
+    return _add_months(ps, months) - timedelta(days=1)
 
 
 def _period_amount(monthly: float, months: int, ps: date, pe: date, nominal_end: date,
                    first_ym: str, first_month_rent):
     """一期金额。
 
-    - 完整期 = 月租 × 期长月数（含首月租金特殊期）；
-    - 被合同截止日截短的尾期（不足一个完整付款周期）→ 返回 None（金额留空），
-      由用户在分期列表手动填写，系统不擅自折算（2026-09 用户确认）。
+    - 完整期 = 月租 × 期长月数；含首月租金的期 = 首月租金 + 其余月 × 月租；
+    - 被合同截止日截短的期（不足一个完整付款周期）→ 返回 None（金额留空），
+      由用户在分期列表手动填写，系统不擅自折算（2026-09 用户确认）：
+      期限正好凑成整周期 → 每期都自动算；多出零头 → 尾期留空；
+      整份合同不足一个周期 → 建一期、金额留空。
     """
     monthly = float(monthly or 0)
     if pe >= nominal_end:
         if first_ym and ps.strftime("%Y%m") == first_ym:
-            n = (pe.year * 12 + pe.month) - (ps.year * 12 + ps.month) + 1
-            return round(float(first_month_rent or 0) + monthly * (n - 1), 2)
+            return round(float(first_month_rent or 0) + monthly * (months - 1), 2)
         return round(monthly * months, 2)
     return None
 
 
 def _split_periods(start: date, end: date, months_per_period: int):
-    """把 [start, end] 按 months_per_period 拆成 [start, end] 区间列表"""
+    """把 [start, end] 按合同周年日拆期：每期 = 上一期起点 + 期长月数，
+    尾期不足时被 end 截断。返回 [(期起点, 期终点), ...]（2 元组，payment_due_months 也用）"""
     periods = []
+    k = 0
     cur = start
     while cur <= end:
-        # 本期结束 = 当前起点 + 期长月数 - 1 天
-        y, m = cur.year, cur.month
-        total_m = (y * 12 + m - 1) + months_per_period - 1
-        ny, nm = divmod(total_m, 12)
-        nm += 1
-        # 本期区间结束（月末）
-        if nm == 12:
-            next_y, next_m = ny + 1, 1
-        else:
-            next_y, next_m = ny, nm + 1
-        period_end = date(next_y, next_m, 1) - timedelta(days=1)
-        if period_end > end:
-            period_end = end
-        periods.append((cur, period_end))
-        # 下期起点
-        total_m2 = (cur.year * 12 + cur.month - 1) + months_per_period
-        ny2, nm2 = divmod(total_m2, 12)
-        nm2 += 1
-        cur = date(ny2, nm2, 1)
+        nxt = _add_months(start, (k + 1) * months_per_period)
+        periods.append((cur, min(nxt - timedelta(days=1), end)))
+        cur = nxt
+        k += 1
     return periods
 
 
