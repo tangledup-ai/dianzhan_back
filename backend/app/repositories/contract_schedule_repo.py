@@ -3,7 +3,6 @@
 - 付款分期表：rent_payment_schedule（场地合同，公司付给场地方）
 - 收款分期表：rent_income_schedule（品牌方合同，品牌方付给公司）
 """
-import calendar
 from datetime import date, timedelta
 from ..infra.database import get_connection, get_dict_cursor
 
@@ -24,38 +23,20 @@ def _nominal_period_end(ps: date, months: int) -> date:
 
 
 def _period_amount(monthly: float, months: int, ps: date, pe: date, nominal_end: date,
-                   first_ym: str, first_month_rent) -> float:
+                   first_ym: str, first_month_rent):
     """一期金额。
 
-    - 完整期 = 月租 × 期长月数；
-    - 被合同截止日截短的尾期按实际覆盖折算：整日历月照算、末月零头按天，
-      避免"6 天的尾巴也收一整期租金"（如 2025-09-06~2026-09-06 年付合同
-      被日历月切出 2026-09-01~2026-09-06 的尾期）；
-    - 首期即尾期（合同不足一个完整付款周期）按天数占比折算。
+    - 完整期 = 月租 × 期长月数（含首月租金特殊期）；
+    - 被合同截止日截短的尾期（不足一个完整付款周期）→ 返回 None（金额留空），
+      由用户在分期列表手动填写，系统不擅自折算（2026-09 用户确认）。
     """
     monthly = float(monthly or 0)
-    if first_ym and ps.strftime("%Y%m") == first_ym:
-        n = (pe.year * 12 + pe.month) - (ps.year * 12 + ps.month) + 1
-        return round(float(first_month_rent or 0) + monthly * (n - 1), 2)
-
     if pe >= nominal_end:
+        if first_ym and ps.strftime("%Y%m") == first_ym:
+            n = (pe.year * 12 + pe.month) - (ps.year * 12 + ps.month) + 1
+            return round(float(first_month_rent or 0) + monthly * (n - 1), 2)
         return round(monthly * months, 2)
-
-    # —— 截短尾期：按实际覆盖折算 ——
-    if ps.day == 1:
-        # 尾期从每月 1 号开始：整日历月照算，末月不满则按天
-        last_day = calendar.monthrange(pe.year, pe.month)[1]
-        if pe.day == last_day:
-            full_months = (pe.year * 12 + pe.month) - (ps.year * 12 + ps.month) + 1
-            return round(monthly * full_months, 2)
-        full_months = (pe.year * 12 + pe.month) - (ps.year * 12 + ps.month)
-        daily = monthly / last_day
-        return round(monthly * full_months + daily * pe.day, 2)
-
-    # 首期即被截短（合同不足一个完整付款周期）：按天数占比折算
-    nominal_days = (nominal_end - ps).days + 1
-    actual_days = (pe - ps).days + 1
-    return round(monthly * months * actual_days / nominal_days, 2)
+    return None
 
 
 def _split_periods(start: date, end: date, months_per_period: int):
@@ -113,6 +94,8 @@ def generate_schedules(contract_id: int, contract_type: str, pay_method: str,
     - 调用方需传"生效截止日"：提前结束的合同应传 early_end_date，使分期止于废弃月。
     - 填了首月场地租金（first_month_rent）时，包含合同首月的那一期金额
       = 首月租金 + 该期其余月份 × 月租，其余期仍为 月租 × 期长月数。
+    - 不足完整付款周期的尾期：金额留空（NULL），由用户在分期列表手动填写；
+      重建时若用户已填过金额则保留。
     修复 #7：重建时按 seq 保留旧分期的财务状态（已付款/已到账、付款日期、发票、备注），
     避免合同改价/改付款方式后重建丢失已标记的收付款状态。
     返回生成条数。
@@ -137,16 +120,19 @@ def generate_schedules(contract_id: int, contract_type: str, pay_method: str,
     cur = conn.cursor()
     try:
         # 保存旧分期状态（按 seq 映射），重建后回填
-        cur.execute(f"SELECT seq, status, pay_date, invoice, remark FROM {table} WHERE contract_id = %s", (contract_id,))
+        cur.execute(f"SELECT seq, status, pay_date, invoice, remark, amount FROM {table} WHERE contract_id = %s", (contract_id,))
         old_rows = {}
         for r in cur.fetchall():
-            old_rows[r[0]] = {"status": r[1], "pay_date": r[2], "invoice": r[3], "remark": r[4]}
+            old_rows[r[0]] = {"status": r[1], "pay_date": r[2], "invoice": r[3], "remark": r[4], "amount": r[5]}
 
         cur.execute(f"DELETE FROM {table} WHERE contract_id = %s", (contract_id,))
         for i, (ps, pe) in enumerate(periods, start=1):
             period_amount = _period_amount(monthly_rent, months, ps, pe,
                                            _nominal_period_end(ps, months), first_ym, first_month_rent)
             old = old_rows.get(i, {})
+            # 尾期金额留空由用户手填；用户已填过的金额在重建时保留，不被清空
+            if period_amount is None and old.get("amount") is not None:
+                period_amount = old["amount"]
             cur.execute(f"""
                 INSERT INTO {table} (contract_id, seq, period_start, period_end, amount, status, pay_date, invoice, remark)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)

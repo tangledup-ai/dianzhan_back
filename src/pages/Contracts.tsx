@@ -695,7 +695,7 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
     landlordId: "", brandId: "", contractType: defaultType || "场地合同",
     electricityPrice: "", rentAmount: "", cabinetsCount: "", unitMonthlyRent: "", monthlyRent: "",
     rentCalcMethod: defaultType === "品牌方合同" ? "按柜子数量" : "固定价格", payMethod: "", rentAdvanceDays: "0",
-    region: "", address: "", latitude: "", longitude: "", payEntity: "",
+    region: "", address: "", latitude: "", longitude: "", payEntity: "", entityId: "",
     startDate: "", endDate: "",
     taxEnabled: false, taxRate: "0.01", postTaxElectricityPrice: "",
     deposit: "", firstMonthRent: "", rentRefund: "", earlyEndDate: "",
@@ -706,6 +706,7 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
   const queryClient = useQueryClient();
   const brands = useQuery({ queryKey: ["brands"], queryFn: listBrands, enabled: open });
   const landlords = useQuery({ queryKey: ["landlords"], queryFn: listLandlords, enabled: open });
+  const entities = useQuery({ queryKey: ["entities"], queryFn: listEntities, enabled: open });
   const meters = useQuery({ queryKey: ["meters"], queryFn: () => listMeters(), enabled: open });
   const cabinets = useQuery({ queryKey: ["allCabinets"], queryFn: () => listCabinets(), enabled: open });
   const contracts = useQuery({ queryKey: ["contracts"], queryFn: () => listContracts(), enabled: open });
@@ -846,6 +847,7 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
         latitude: record.latitude != null ? String(record.latitude) : "",
         longitude: record.longitude != null ? String(record.longitude) : "",
         payEntity: record.payEntity ?? "",
+        entityId: record.entityId ? String(record.entityId) : "",
         startDate: record.startDate ? String(record.startDate).slice(0, 10) : "", endDate: record.endDate ? String(record.endDate).slice(0, 10) : "",
         taxEnabled: record.taxEnabled ?? false, taxRate: record.taxRate ? String(record.taxRate) : "0.01",
         postTaxElectricityPrice: record.postTaxElectricityPrice ? String(record.postTaxElectricityPrice) : "",
@@ -906,7 +908,7 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
       return;
     }
 
-    // 拆期预检：合同期限不足以凑成完整付款周期时提醒（尾期金额将按实际覆盖折算，不再收整期）
+    // 拆期预检：合同期限不足以凑成完整付款周期时提醒（尾期金额留空，由用户手动填写）
     const effEnd = f.earlyEndDate || f.endDate;
     if (f.payMethod && f.startDate && effEnd) {
       const periods = splitPeriodsPreview(f.startDate, effEnd, f.payMethod);
@@ -917,7 +919,7 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
         const okGo = window.confirm(
           `合同期限与「${f.payMethod}」周期不匹配：\n` +
           `最后一期 ${ymd(last.ps)} ~ ${ymd(last.pe)} 只有 ${dayLen} 天，不足一个完整的${f.payMethod}周期。\n\n` +
-          `该期金额将按实际覆盖时间折算（不再按整期收取），确定这样拆期吗？`
+          `该期金额将留空，保存后请在合同详情的分期列表中点「填金额」手动录入。确定这样拆期吗？`
         );
         if (!okGo) return;
       }
@@ -940,6 +942,7 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
       latitude: numOrNull(f.latitude),
       longitude: numOrNull(f.longitude),
       payEntity: f.payEntity || null,
+      entityId: f.entityId ? Number(f.entityId) : null,
       startDate: f.startDate || null,
       endDate: f.endDate || null,
       taxEnabled,
@@ -1019,6 +1022,16 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
                 </Field>
               </>
             )}
+            <Field label="收付款主体">
+              <SearchSelect value={f.entityId} onChange={set("entityId")}
+                placeholder="未指定（可搜索公司主体）"
+                options={(entities.data ?? []).map((e: any) => ({ value: String(e.id), label: e.name }))} />
+              <div className="-mt-1.5 text-[11px] text-slate-400">
+                {f.contractType === "品牌方合同"
+                  ? "同一场地同一品牌可按主体拆签多份合同（各自不同收款主体），电费/租金按电表主体精确匹配"
+                  : "场地成本默认全额归该主体；不指定时按柜数分摊到场地内各主体"}
+              </div>
+            </Field>
           </FormSection>
 
           {f.contractType === "场地合同" && (

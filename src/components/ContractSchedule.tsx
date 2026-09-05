@@ -22,6 +22,8 @@ export function ContractSchedule({ contractId, side, title, editable = true }: {
   const [addForm, setAddForm] = useState({ periodStart: "", periodEnd: "", amount: "", remark: "" });
   const [markingId, setMarkingId] = useState<number | null>(null);
   const [markDate, setMarkDate] = useState("");
+  const [amountEditId, setAmountEditId] = useState<number | null>(null);
+  const [amountValue, setAmountValue] = useState("");
   const fetchFn = side === "payment" ? listPaymentSchedules : listIncomeSchedules;
   const queryKey = side === "payment" ? "paymentSchedules" : "incomeSchedules";
   const { data: schedules } = useQuery({
@@ -59,6 +61,19 @@ export function ContractSchedule({ contractId, side, title, editable = true }: {
       setAddForm({ periodStart: "", periodEnd: "", amount: "", remark: "" });
     },
     onError: (e: any) => toast.error(e.message || "添加失败"),
+  });
+
+  // 补填/修改某期金额（尾期金额留空后由用户手动录入）
+  const saveAmount = useMutation({
+    mutationFn: ({ id, amount }: { id: number; amount: string }) =>
+      updateSchedule(id, { amount: Number(amount), side }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: [queryKey] });
+      toast.success("金额已保存");
+      setAmountEditId(null);
+      setAmountValue("");
+    },
+    onError: (e: any) => toast.error(e.message || "保存失败"),
   });
 
   const rows = schedules ?? [];
@@ -131,7 +146,42 @@ export function ContractSchedule({ contractId, side, title, editable = true }: {
                   <td className="px-2.5 py-1.5 text-slate-600 whitespace-nowrap">
                     {r.periodStart ? String(r.periodStart).slice(0, 10) : "-"} ~ {r.periodEnd ? String(r.periodEnd).slice(0, 10) : "-"}
                   </td>
-                  <td className="px-2.5 py-1.5 text-right tabular-nums">{fmtMoney(r.amount)}</td>
+                  <td className="px-2.5 py-1.5 text-right tabular-nums">
+                    {amountEditId === r.id ? (
+                      <div className="flex items-center justify-end gap-1">
+                        <input
+                          type="number"
+                          autoFocus
+                          className={inputCls + " w-20 text-xs text-right"}
+                          value={amountValue}
+                          onChange={(e) => setAmountValue(e.target.value)}
+                          onKeyDown={(e) => { if (e.key === "Enter" && amountValue !== "") saveAmount.mutate({ id: r.id, amount: amountValue }); }}
+                        />
+                        <button
+                          onClick={() => {
+                            if (amountValue === "") { toast.error("请输入金额"); return; }
+                            saveAmount.mutate({ id: r.id, amount: amountValue });
+                          }}
+                          disabled={saveAmount.isPending}
+                          className="rounded bg-emerald-600 px-1.5 py-0.5 text-[10px] text-white hover:bg-emerald-700 disabled:opacity-50"
+                        >存</button>
+                        <button
+                          onClick={() => { setAmountEditId(null); setAmountValue(""); }}
+                          className="rounded bg-slate-200 px-1.5 py-0.5 text-[10px] text-slate-600 hover:bg-slate-300"
+                        >取消</button>
+                      </div>
+                    ) : (
+                      <>
+                        {fmtMoney(r.amount)}
+                        {editable && r.amount == null && (
+                          <button
+                            onClick={() => { setAmountEditId(r.id); setAmountValue(""); }}
+                            className="ml-1 rounded bg-amber-100 px-1 py-0.5 text-[10px] font-medium text-amber-700 hover:bg-amber-200"
+                          >填金额</button>
+                        )}
+                      </>
+                    )}
+                  </td>
                   <td className="px-2.5 py-1.5">
                     <span className={`rounded-full px-1.5 py-0.5 text-[10px] ${done ? "bg-emerald-100 text-emerald-700" : "bg-slate-100 text-slate-600"}`}>
                       {r.status}
