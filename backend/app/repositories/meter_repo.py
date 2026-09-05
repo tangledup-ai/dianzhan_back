@@ -159,11 +159,9 @@ def update_meter(meter_id: int, data: dict):
                 inherited = _venue_entity_id(cur, data["landlordId"])
                 data = {**data, "entityId": inherited, "entitySource": "auto"}
 
-        # 一电表一主体校验：显式改主体时，若电表已关联到其他主体则拒绝
-        # （场地变更的自动跟随不受限；允许解除关联：entity_id 设为 null）
-        if data.get("entityId") is not None and data.get("entitySource") != "auto":
-            if cur_row and cur_row.get("entity_id") is not None and cur_row["entity_id"] != data["entityId"]:
-                raise ValueError("该电表已关联其他公司主体，请先解除关联后再关联")
+        # 一电表一主体：meters.entity_id 是单列，换主体 = 直接替换（仍是一电表一主体）。
+        # 不做"已关联其他主体"拦截——否则编辑电表时无法切换报税主体（2026-09 用户确认按替换处理）。
+        # 允许解除关联：entityId 显式传 null（下方 entityId/brandId 分支支持写 null）。
 
         field_map = {
             "brandId": "brand_id", "landlordId": "landlord_id",
