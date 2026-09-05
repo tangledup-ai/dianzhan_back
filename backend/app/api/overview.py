@@ -721,15 +721,24 @@ async def station_board(request: Request, landlordId: int = None, keyword: str =
         """, values)
         landlords = cur.fetchall()
 
-        # 公司主体名称（场地合同的报税主体优先，缺失回退任一合同的主体）——前端按主体分块展示
+        # 公司主体名称（归属链：场地合同主体 → 其他合同主体 → 电表主体[按电表数取多数]）
+        # ——前端按主体分块展示；合同未选主体时回退电表主体，避免全部落「未指定主体」
         cur.execute("""
-            SELECT k, MAX(entity_name) AS entity_name FROM (
-                SELECT c.landlord_id AS k, ent.name AS entity_name,
-                       CASE WHEN c.contract_type = '场地合同' THEN 0 ELSE 1 END AS pri
-                FROM contracts c LEFT JOIN entities ent ON ent.id = c.entity_id
-                WHERE c.entity_id IS NOT NULL
+            SELECT DISTINCT ON (k) k, entity_name FROM (
+                SELECT c.landlord_id AS k, ent.name AS entity_name, 0 AS pri, 1 AS w
+                FROM contracts c JOIN entities ent ON ent.id = c.entity_id
+                WHERE c.contract_type = '场地合同'
+                UNION ALL
+                SELECT c.landlord_id AS k, ent.name AS entity_name, 1 AS pri, 1 AS w
+                FROM contracts c JOIN entities ent ON ent.id = c.entity_id
+                WHERE c.contract_type <> '场地合同'
+                UNION ALL
+                SELECT m.landlord_id AS k, ent.name AS entity_name, 2 AS pri, COUNT(*) AS w
+                FROM meters m JOIN entities ent ON ent.id = m.entity_id
+                WHERE m.landlord_id IS NOT NULL AND m.meter_no NOT LIKE 'TEST%%'
+                GROUP BY m.landlord_id, ent.name
             ) t WHERE k = ANY(%s::int[])
-            GROUP BY k ORDER BY MIN(pri)
+            ORDER BY k, pri ASC, w DESC, entity_name ASC
         """, ([l["id"] for l in landlords],))
         entity_map = {r["k"]: r["entity_name"] for r in cur.fetchall()}
 

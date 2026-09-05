@@ -319,6 +319,8 @@ def _get_contract_alerts(cur, contract_type: str, expire_days: int, side: str, a
                 WHERE c2.landlord_id = c.landlord_id AND c2.contract_type = '场地合同' AND c2.entity_id IS NOT NULL LIMIT 1),
               (SELECT ent.name FROM contracts c2 JOIN entities ent ON ent.id = c2.entity_id
                 WHERE c2.landlord_id = c.landlord_id AND c2.entity_id IS NOT NULL LIMIT 1),
+              (SELECT ent2.name FROM meters m2 JOIN entities ent2 ON ent2.id = m2.entity_id
+                WHERE m2.landlord_id = c.landlord_id AND m2.meter_no NOT LIKE 'TEST%%' LIMIT 1),
               '未指定主体') AS entity_name,
             c.monthly_rent, c.rent_amount, c.pay_method,
             c.start_date, c.end_date, COALESCE(c.early_end_date, c.end_date) AS effective_end,
