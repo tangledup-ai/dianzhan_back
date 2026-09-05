@@ -1,29 +1,27 @@
 import { useState, useMemo } from "react";
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { listEntities, listLandlords } from "@/api/directory";
+import { useQuery } from "@tanstack/react-query";
+import { listEntities } from "@/api/directory";
 import { listContracts } from "@/api/contracts";
-import { listMeters, updateMeter } from "@/api/meters";
+import { listMeters } from "@/api/meters";
 import { listCabinets } from "@/api/cabinets";
 import { getLandlordMeterView } from "@/api/stations";
+import { getEntityMonthly } from "@/api/overview";
 import { StatusBadge } from "@/components/Stat";
 import { Button } from "@/components/ui/button";
-import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { inputCls } from "@/components/fields";
 import * as XLSX from "xlsx";
 import { fmtMoney, fmtNum, fmtDate } from "@/lib/format";
-import { Download, Search, ChevronDown, ChevronRight, FileText, Building2, DollarSign, Zap, Link, Trash2, Check } from "lucide-react";
+import { Download, Search, ChevronDown, ChevronRight, FileText, Building2, DollarSign, Zap, Landmark } from "lucide-react";
 import { toast } from "sonner";
 
 export default function Entities() {
   const [keyword, setKeyword] = useState("");
   const [expandedId, setExpandedId] = useState<number | null>(null);
-  const [viewMode, setViewMode] = useState<"场租" | "电租">("场租");
+  const [viewMode, setViewMode] = useState<"场租" | "电租" | "损益">("场租");
   const [selectedMonth, setSelectedMonth] = useState(() => {
     const d = new Date();
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
   });
-  const [linkDialogOpen, setLinkDialogOpen] = useState(false);
-  const [linkEntityId, setLinkEntityId] = useState<number | null>(null);
 
   const entities = useQuery({ queryKey: ["entities"], queryFn: listEntities });
   const contracts = useQuery({ queryKey: ["contracts"], queryFn: () => listContracts() });
@@ -159,11 +157,6 @@ export default function Entities() {
 
   const toggleExpand = (id: number) => {
     setExpandedId(prev => prev === id ? null : id);
-  };
-
-  const openLinkDialog = (entityId: number) => {
-    setLinkEntityId(entityId);
-    setLinkDialogOpen(true);
   };
 
   const doExport = async () => {
@@ -437,13 +430,15 @@ export default function Entities() {
         <select className={`${inputCls} w-28`} value={viewMode} onChange={e => setViewMode(e.target.value as any)}>
           <option value="场租">场租</option>
           <option value="电租">电租</option>
+          <option value="损益">损益</option>
         </select>
         <div className="ml-auto flex gap-2">
           <Button className="bg-blue-600 hover:bg-blue-700" onClick={doExport}><Download className="mr-1.5 h-4 w-4" />导出表格</Button>
         </div>
       </div>
 
-      {/* 主体列表 */}
+      {/* 主体列表（损益视图下由损益表替代） */}
+      {viewMode !== "损益" && (
       <div className="space-y-4">
         {entityData.map((entity: any) => {
           const isExpanded = expandedId === entity.id;
@@ -457,10 +452,16 @@ export default function Entities() {
               >
                 <div className="flex items-center gap-3">
                   {isExpanded ? <ChevronDown className="h-4 w-4 text-slate-400" /> : <ChevronRight className="h-4 w-4 text-slate-300" />}
-                  <div>
-                    <div className="font-semibold text-slate-800">{entity.name}</div>
-                    {entity.shortName && <div className="text-xs text-slate-400">简称：{entity.shortName}</div>}
-                  </div>
+                <div>
+                  <div className="font-semibold text-slate-800">{entity.name}</div>
+                  {entity.shortName && <div className="text-xs text-slate-400">简称：{entity.shortName}</div>}
+                  {entity.taxNo && (
+                    <div className="text-[10px] text-slate-400">
+                      税号：{entity.taxNo}{entity.taxpayerType ? ` · ${entity.taxpayerType}` : ""}
+                      {entity.status && entity.status !== "启用" ? ` · ${entity.status}` : ""}
+                    </div>
+                  )}
+                </div>
                 </div>
                 <div className="flex items-center gap-6 text-xs">
                   <div className="flex items-center gap-1">
@@ -475,9 +476,6 @@ export default function Entities() {
                     <DollarSign className="h-3.5 w-3.5 text-rose-500" />
                     月租金 <span className="tabular-nums font-medium">{fmtMoney(entity.totalMonthlyRent)}</span>
                   </div>
-                  <Button size="sm" variant="outline" onClick={(e) => { e.stopPropagation(); openLinkDialog(entity.id); }}>
-                    <Link className="mr-1 h-3 w-3" />关联电表
-                  </Button>
                 </div>
               </div>
 
@@ -672,7 +670,7 @@ export default function Entities() {
 
                   {entity.landlordDetails.length === 0 && (
                     <div className="py-6 text-center text-sm text-slate-400">
-                      暂无关联数据，请先关联电表
+                      暂无关联数据，请先在「智慧电表」中将电表关联到该公司主体
                     </div>
                   )}
                 </div>
@@ -694,13 +692,99 @@ export default function Entities() {
           </div>
         )}
       </div>
+      )}
 
-      {/* 关联电表弹窗 */}
-      <EntityMeterLinkDialog
-        open={linkDialogOpen}
-        onClose={() => { setLinkDialogOpen(false); setLinkEntityId(null); }}
-        entityId={linkEntityId}
-      />
+      {/* 主体月度损益（后端口径） */}
+      {viewMode === "损益" && <EntityPnLPanel period={selectedMonth} />}
+    </div>
+  );
+}
+
+
+// ─── 主体月度损益面板（数据源：GET /api/overview/entity-monthly）───
+
+function EntityPnLPanel({ period }: { period: string }) {
+  const q = useQuery({
+    queryKey: ["entity-monthly", period],
+    queryFn: () => getEntityMonthly(period),
+  });
+  const thL = "px-2.5 py-2 text-left text-[11px] font-medium text-slate-500 whitespace-nowrap";
+  const th = "px-2.5 py-2 text-right text-[11px] font-medium text-slate-500 whitespace-nowrap";
+
+  if (q.isLoading) {
+    return <div className="rounded-xl border bg-white py-10 text-center text-sm text-slate-400">加载主体损益中…</div>;
+  }
+  const rows = q.data?.rows ?? [];
+  const t = q.data?.totals ?? {};
+
+  return (
+    <div className="rounded-xl border bg-white shadow-sm overflow-hidden">
+      <div className="flex flex-wrap items-center gap-2 border-b bg-slate-50 px-4 py-2.5">
+        <Landmark className="h-4 w-4 text-indigo-600" />
+        <span className="text-sm font-semibold text-slate-700">公司主体损益表（{period}）</span>
+        <span className="text-[11px] text-slate-400">
+          电费按电表主体归属；场地租/公共运营费按柜数分摊到主体；税费单列不重复扣
+        </span>
+      </div>
+      <div className="overflow-x-auto">
+        <table className="w-full min-w-[1050px] text-xs">
+          <thead>
+            <tr className="border-b bg-slate-50">
+              <th className={thL}>公司主体</th>
+              <th className={th}>电量(度)</th>
+              <th className={th}>电费付款</th>
+              <th className={th}>收款(不含税)</th>
+              <th className={th}>电费税费</th>
+              <th className={th}>电费利润</th>
+              <th className={th}>租金收入</th>
+              <th className={th}>租金税费</th>
+              <th className={th}>场地租(分摊)</th>
+              <th className={th}>运营费(分摊)</th>
+              <th className={th}>净利润</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.length === 0 && (
+              <tr><td colSpan={11} className="px-3 py-8 text-center text-slate-400">该月暂无主体经营数据</td></tr>
+            )}
+            {rows.map((r: any) => (
+              <tr key={r.entityId ?? "none"} className="border-b last:border-0 hover:bg-slate-50/60">
+                <td className={`${thL} font-medium text-slate-700`}>
+                  {r.entityName}
+                  {r.entityId == null && <span className="ml-1.5 rounded bg-amber-100 px-1.5 py-0.5 text-[10px] text-amber-700">待归属</span>}
+                </td>
+                <td className={`${th} tabular-nums text-slate-600`}>{fmtNum(r.kwh)}</td>
+                <td className={`${th} tabular-nums text-rose-600`}>{fmtMoney(r.elecPay)}</td>
+                <td className={`${th} tabular-nums text-emerald-600`}>{fmtMoney(r.elecNet)}</td>
+                <td className={`${th} tabular-nums text-slate-500`}>{fmtMoney(r.elecTax)}</td>
+                <td className={`${th} tabular-nums font-medium ${r.elecProfit >= 0 ? "text-emerald-600" : "text-rose-600"}`}>{fmtMoney(r.elecProfit)}</td>
+                <td className={`${th} tabular-nums`}>{fmtMoney(r.rentIncome)}</td>
+                <td className={`${th} tabular-nums text-slate-500`}>{fmtMoney(r.rentTax)}</td>
+                <td className={`${th} tabular-nums text-rose-500`}>{fmtMoney(r.venueCost)}</td>
+                <td className={`${th} tabular-nums text-rose-500`}>{fmtMoney(r.opExpense)}</td>
+                <td className={`${th} tabular-nums font-bold ${r.netProfit >= 0 ? "text-emerald-700" : "text-rose-700"}`}>{fmtMoney(r.netProfit)}</td>
+              </tr>
+            ))}
+          </tbody>
+          {rows.length > 0 && (
+            <tfoot>
+              <tr className="border-t bg-slate-50 font-semibold">
+                <td className={thL}>合计</td>
+                <td className={`${th} tabular-nums`}>{fmtNum(t.kwh ?? 0)}</td>
+                <td className={`${th} tabular-nums text-rose-600`}>{fmtMoney(t.elecPay ?? 0)}</td>
+                <td className={`${th} tabular-nums text-emerald-600`}>{fmtMoney(t.elecNet ?? 0)}</td>
+                <td className={`${th} tabular-nums text-slate-500`}>{fmtMoney(t.elecTax ?? 0)}</td>
+                <td className={`${th} tabular-nums text-slate-700`}>{fmtMoney(t.elecProfit ?? 0)}</td>
+                <td className={`${th} tabular-nums`}>{fmtMoney(t.rentIncome ?? 0)}</td>
+                <td className={`${th} tabular-nums text-slate-500`}>{fmtMoney(t.rentTax ?? 0)}</td>
+                <td className={`${th} tabular-nums text-rose-500`}>{fmtMoney(t.venueCost ?? 0)}</td>
+                <td className={`${th} tabular-nums text-rose-500`}>{fmtMoney(t.opExpense ?? 0)}</td>
+                <td className={`${th} tabular-nums ${((t.netProfit ?? 0) >= 0) ? "text-emerald-700" : "text-rose-700"}`}>{fmtMoney(t.netProfit ?? 0)}</td>
+              </tr>
+            </tfoot>
+          )}
+        </table>
+      </div>
     </div>
   );
 }
@@ -919,179 +1003,5 @@ function ElectricityRentView({ entity, period }: { entity: any; period: string }
         </div>
       )}
     </div>
-  );
-}
-
-
-// ─── 关联电表弹窗 ───────────────────────────────────────────
-
-function EntityMeterLinkDialog({ open, onClose, entityId }: { open: boolean; onClose: () => void; entityId: number | null }) {
-  const queryClient = useQueryClient();
-  const [selectedLandlordId, setSelectedLandlordId] = useState("");
-  const [selectedMeterIds, setSelectedMeterIds] = useState<Set<number>>(new Set());
-
-  const landlords = useQuery({ queryKey: ["landlords"], queryFn: listLandlords, enabled: open });
-  const allMeters = useQuery({ queryKey: ["meters"], queryFn: () => listMeters(), enabled: open });
-
-  // 该场地下的电表（未关联到其他主体的）
-  const availableMeters = useMemo(() => {
-    if (!selectedLandlordId) return [];
-    return (allMeters.data ?? []).filter((m: any) =>
-      m.landlordId === Number(selectedLandlordId) && (m.entityId === null || m.entityId === entityId)
-    );
-  }, [allMeters.data, selectedLandlordId, entityId]);
-
-  // 已关联到该主体的电表
-  const linkedMeters = useMemo(() => {
-    if (!selectedLandlordId) return [];
-    return (allMeters.data ?? []).filter((m: any) =>
-      m.landlordId === Number(selectedLandlordId) && m.entityId === entityId
-    );
-  }, [allMeters.data, selectedLandlordId, entityId]);
-
-  const toggleMeter = (meterId: number) => {
-    setSelectedMeterIds(prev => {
-      const next = new Set(prev);
-      if (next.has(meterId)) next.delete(meterId);
-      else next.add(meterId);
-      return next;
-    });
-  };
-
-  const selectAll = () => {
-    setSelectedMeterIds(new Set(availableMeters.map((m: any) => m.id)));
-  };
-
-  const deselectAll = () => {
-    setSelectedMeterIds(new Set());
-  };
-
-  const save = useMutation({
-    mutationFn: async () => {
-      const promises = Array.from(selectedMeterIds).map(meterId =>
-        updateMeter(meterId, { entityId })
-      );
-      await Promise.all(promises);
-    },
-    onSuccess: () => {
-      toast.success("已关联");
-      setSelectedMeterIds(new Set());
-      queryClient.invalidateQueries({ queryKey: ["meters"] });
-    },
-    onError: (e: any) => toast.error(e.message),
-  });
-
-  const unlink = useMutation({
-    mutationFn: async (meterId: number) => {
-      await updateMeter(meterId, { entityId: null });
-    },
-    onSuccess: () => {
-      toast.success("已解除关联");
-      queryClient.invalidateQueries({ queryKey: ["meters"] });
-    },
-    onError: (e: any) => toast.error(e.message),
-  });
-
-  return (
-    <Dialog open={open} onOpenChange={(o) => !o && onClose()}>
-      <DialogContent className="max-w-lg">
-        <DialogHeader>
-          <DialogTitle>关联电表</DialogTitle>
-        </DialogHeader>
-        <div className="space-y-4">
-          {/* 选择场地 */}
-          <div>
-            <label className="mb-1 block text-xs font-medium text-slate-500">选择场地</label>
-            <select
-              className="w-full rounded border border-slate-200 px-3 py-1.5 text-sm"
-              value={selectedLandlordId}
-              onChange={(e) => { setSelectedLandlordId(e.target.value); setSelectedMeterIds(new Set()); }}
-            >
-              <option value="">请选择场地</option>
-              {(landlords.data ?? []).map((l: any) => (
-                <option key={l.id} value={String(l.id)}>{l.name}</option>
-              ))}
-            </select>
-          </div>
-
-          {selectedLandlordId && (
-            <>
-              {/* 已关联的电表 */}
-              {linkedMeters.length > 0 && (
-                <div>
-                  <div className="mb-1 text-xs font-semibold text-slate-600">已关联（{linkedMeters.length} 块）</div>
-                  <div className="space-y-1 max-h-32 overflow-y-auto">
-                    {linkedMeters.map((m: any) => (
-                      <div key={m.id} className="flex items-center justify-between rounded border bg-emerald-50 px-3 py-1.5">
-                        <div className="flex items-center gap-2">
-                          <Check className="h-3.5 w-3.5 text-emerald-600" />
-                          <span className="text-xs font-mono">{m.meterNo}</span>
-                          <span className="text-xs text-slate-500">{m.brandName}</span>
-                        </div>
-                        <button
-                          className="rounded p-0.5 text-slate-400 hover:text-rose-500"
-                          onClick={() => window.confirm("解除关联？") && unlink.mutate(m.id)}
-                        >
-                          <Trash2 className="h-3 w-3" />
-                        </button>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              {/* 可关联的电表 */}
-              <div>
-                <div className="mb-1 flex items-center justify-between">
-                  <span className="text-xs font-semibold text-slate-600">可关联（{availableMeters.length} 块）</span>
-                  <div className="flex gap-1">
-                    <button className="text-[10px] text-emerald-600 hover:underline" onClick={selectAll}>全选</button>
-                    <span className="text-[10px] text-slate-300">|</span>
-                    <button className="text-[10px] text-slate-500 hover:underline" onClick={deselectAll}>取消</button>
-                  </div>
-                </div>
-                <div className="space-y-1 max-h-48 overflow-y-auto rounded border p-2">
-                  {availableMeters.map((m: any) => {
-                    const isSelected = selectedMeterIds.has(m.id);
-                    return (
-                      <label
-                        key={m.id}
-                        className={`flex items-center gap-2 rounded px-2 py-1.5 cursor-pointer transition-colors ${isSelected ? "bg-emerald-50" : "hover:bg-slate-50"}`}
-                      >
-                        <input
-                          type="checkbox"
-                          checked={isSelected}
-                          onChange={() => toggleMeter(m.id)}
-                          className="rounded border-slate-300"
-                        />
-                        <span className="text-xs font-mono">{m.meterNo}</span>
-                        <span className="text-xs text-slate-500">{m.meterName ?? ""}</span>
-                        <span className="ml-auto text-[10px] text-slate-400">{m.brandName}</span>
-                      </label>
-                    );
-                  })}
-                  {availableMeters.length === 0 && (
-                    <div className="py-4 text-center text-xs text-slate-400">该场地下暂无可关联的电表</div>
-                  )}
-                </div>
-              </div>
-
-              {/* 操作按钮 */}
-              <div className="flex justify-end gap-2">
-                <Button variant="outline" size="sm" onClick={onClose}>关闭</Button>
-                <Button
-                  size="sm"
-                  className="bg-emerald-600 hover:bg-emerald-700"
-                  disabled={selectedMeterIds.size === 0 || save.isPending}
-                  onClick={() => save.mutate()}
-                >
-                  关联选中的 {selectedMeterIds.size} 块电表
-                </Button>
-              </div>
-            </>
-          )}
-        </div>
-      </DialogContent>
-    </Dialog>
   );
 }

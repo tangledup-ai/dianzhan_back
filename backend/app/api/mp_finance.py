@@ -177,20 +177,18 @@ async def finance_entities(user: dict = Depends(get_current_user)):
     conn = get_connection()
     cur = get_dict_cursor(conn)
     try:
-        # 与旧版一致：每个实体统计全量组合（原实现为 stations 全量交叉）
+        # v3.1：台账行自带 entity_id（按电表主体生成），直接按主体聚合真实口径
         cur.execute("""
             SELECT
                 e.name as entity,
-                COUNT(DISTINCT cmb.landlord_id) as station_count,
-                COUNT(DISTINCT cmb.brand_id) as brand_count,
+                COUNT(DISTINCT er.landlord_id) as station_count,
+                COUNT(DISTINCT er.brand_id) as brand_count,
                 COALESCE(SUM(er.pay_amount), 0) as elec_pay,
                 COALESCE(SUM(er.collect_net), 0) as elec_collect,
                 COALESCE(SUM(er.profit), 0) as elec_profit
             FROM entities e
-            LEFT JOIN (SELECT DISTINCT landlord_id, brand_id FROM meters
-                       WHERE landlord_id IS NOT NULL AND brand_id IS NOT NULL AND meter_no NOT LIKE 'TEST%') cmb ON TRUE
-            LEFT JOIN electricity_records er ON er.landlord_id = cmb.landlord_id AND er.brand_id = cmb.brand_id
-            GROUP BY e.name
+            LEFT JOIN electricity_records er ON er.entity_id = e.id
+            GROUP BY e.id, e.name
             ORDER BY e.id
         """)
         elec_data = cur.fetchall()

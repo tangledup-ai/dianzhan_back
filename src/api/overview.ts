@@ -17,3 +17,7 @@ export const getLandlordTrends = (landlordId: number, months: number = 6) =>
 
 export const getLandlordStationMonthly = (landlordId: number, months: number = 6) =>
   client.get("/overview/landlord-station-monthly", { params: { landlordId, months } }).then(r => r.data);
+
+// 公司主体月度损益（二期：运营归属主体口径，跨主体场地成本按柜数分摊）
+export const getEntityMonthly = (period: string) =>
+  client.get("/overview/entity-monthly", { params: { period } }).then(r => r.data);

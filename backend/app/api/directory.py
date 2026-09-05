@@ -58,18 +58,46 @@ async def list_entities(request: Request = None):
     return rows
 
 
+# 主体档案字段：API 层统一接收驼峰（snake 兼容旧调用），repo 层用 snake
+_ENTITY_ARCHIVE_CAMEL = {
+    "taxNo": "tax_no", "tax_no": "tax_no",
+    "taxpayerType": "taxpayer_type", "taxpayer_type": "taxpayer_type",
+    "invoiceBank": "invoice_bank", "invoice_bank": "invoice_bank",
+    "invoiceAccount": "invoice_account", "invoice_account": "invoice_account",
+    "invoiceAddress": "invoice_address", "invoice_address": "invoice_address",
+    "invoicePhone": "invoice_phone", "invoice_phone": "invoice_phone",
+    "status": "status",
+    "sort": "sort",
+}
+
+
+def _entity_archive_kwargs(data: dict) -> dict:
+    out = {}
+    for src, dst in _ENTITY_ARCHIVE_CAMEL.items():
+        if src in data and data[src] is not None:
+            out[dst] = data[src]
+    return out
+
+
 @router.post("/entities", status_code=201)
 async def create_entity(data: dict):
     return directory_repo.create_entity(
         name=data.get("name", ""),
-        short_name=data.get("shortName"),
+        short_name=data.get("shortName", data.get("short_name")),
         remark=data.get("remark"),
+        **_entity_archive_kwargs(data),
     )
 
 
 @router.put("/entities/{entity_id}")
 async def update_entity(entity_id: int, data: dict):
-    result = directory_repo.update_entity(entity_id, **data)
+    result = directory_repo.update_entity(
+        entity_id,
+        name=data.get("name"),
+        short_name=data.get("shortName", data.get("short_name")),
+        remark=data.get("remark"),
+        **_entity_archive_kwargs(data),
+    )
     if not result:
         raise HTTPException(404, "公司主体不存在")
     return result

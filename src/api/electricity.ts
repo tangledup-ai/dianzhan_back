@@ -22,12 +22,13 @@ export const deleteElectricity = (id: number) =>
 export const generateElectricity = (data: { period: string; landlordId?: number }) =>
   client.post("/electricity/generate", data).then(r => r.data);
 
-// 电费月台账（Electricity 页，v2）：按场地方/品牌方 × 月份 汇总+明细（只含电费）
-export const getElectricityMonthlyLedger = (period: string, dim: "landlord" | "brand" = "landlord") =>
+// 电费月台账（Electricity 页，v2）：按场地方/品牌方/公司主体 × 月份 汇总+明细（只含电费）
+export type ElecLedgerDim = "landlord" | "brand" | "entity";
+export const getElectricityMonthlyLedger = (period: string, dim: ElecLedgerDim = "landlord") =>
   client.get("/electricity/monthly-ledger", { params: { period, dim } }).then(r => r.data);
 
 // 电费收付明细导出（参考 Excel 格式：每电表一行）
-export const exportElectricityLedger = (period: string, dim: "landlord" | "brand" = "landlord") =>
+export const exportElectricityLedger = (period: string, dim: ElecLedgerDim = "landlord") =>
   client.get("/electricity/export", { params: { period, dim } }).then(r => r.data);
 
 // 单块电表的抄表核对详情（上月/本月抄表读数与日期、区间度数、台账费用）

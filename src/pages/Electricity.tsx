@@ -1,6 +1,6 @@
 import { Fragment, useMemo, useState, useEffect } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { getElectricityMonthlyLedger, exportElectricityLedger, getReadingDetail, updateElectricityStatus } from "@/api/electricity";
+import { getElectricityMonthlyLedger, exportElectricityLedger, getReadingDetail, updateElectricityStatus, type ElecLedgerDim } from "@/api/electricity";
 import { listLandlords } from "@/api/directory";
 import { submitStationApproval } from "@/api/approvals";
 import { Button } from "@/components/ui/button";
@@ -525,7 +525,7 @@ function buildLedgerSheet(data: any): XLSX.WorkSheet {
 export default function Electricity() {
   const [startPeriod, setStartPeriod] = useState(CUR_MONTH);
   const [endPeriod, setEndPeriod] = useState(CUR_MONTH);
-  const [dim, setDim] = useState<"landlord" | "brand">("landlord");
+  const [dim, setDim] = useState<ElecLedgerDim>("landlord");
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
 
   const monthRange = useMemo(() => {
@@ -653,6 +653,11 @@ export default function Electricity() {
             onClick={() => setDim("brand")}>
             <Tag className="mr-1 h-3.5 w-3.5" />按品牌方
           </Button>
+          <Button size="sm" variant={dim === "entity" ? "default" : "ghost"}
+            className={dim === "entity" ? "bg-indigo-600 hover:bg-indigo-700" : ""}
+            onClick={() => setDim("entity")}>
+            <Landmark className="mr-1 h-3.5 w-3.5" />按公司主体
+          </Button>
         </div>
         <span className="text-xs text-slate-400">{toDisplay(startPeriod)} ~ {toDisplay(endPeriod)} · 电费经营信息</span>
         <Button size="sm" className="ml-auto bg-blue-600 hover:bg-blue-700" disabled={exporting} onClick={doExport}>
@@ -714,26 +719,27 @@ export default function Electricity() {
                       <td colSpan={8} className="px-6 py-3">
                         <div className="space-y-1">
                           <div className="text-[11px] font-medium text-slate-400">
-                            {toDisplay(m.period)} · 按{dim === "landlord" ? "场地方" : "品牌方"}明细（点击展开电表）
+                            {toDisplay(m.period)} · 按{dim === "landlord" ? "场地方" : dim === "entity" ? "公司主体" : "品牌方"}明细（点击展开电表）
                           </div>
-                          {(dim === "landlord"
-                            ? groupByEntity(m.rows ?? [])
-                            : [{ entityName: "", color: GROUP_COLOR_NEUTRAL, rows: m.rows ?? [] }]
+                          {(dim === "brand"
+                            ? [{ entityName: "", color: GROUP_COLOR_NEUTRAL, rows: m.rows ?? [] }]
+                            : groupByEntity(m.rows ?? [])
                           ).map((grp, gi) => {
-                            const grpKey = `grp-${m.period}-${gi}`;
+                            const grpKey = `grp-${m.period}-${dim}-${gi}`;
                             return (
-                            <div key={grpKey} className={dim === "landlord" ? `space-y-1.5 rounded-lg border p-2 ${grp.color.border} ${grp.color.bg}` : "space-y-1"}>
-                            {dim === "landlord" && (
+                            <div key={grpKey} className={dim !== "brand" ? `space-y-1.5 rounded-lg border p-2 ${grp.color.border} ${grp.color.bg}` : "space-y-1"}>
+                            {dim !== "brand" && (
                               <div className="flex items-center gap-2 px-1">
                                 <div className={`flex h-5 w-5 items-center justify-center rounded ${grp.color.icon}`}>
                                   <Landmark className="h-3 w-3 text-white" />
                                 </div>
                                 <span className={`text-[11px] font-semibold ${grp.color.text}`}>{grp.entityName}</span>
-                                <span className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${grp.color.chip}`}>{grp.rows.length} 个场地方</span>
+                                <span className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${grp.color.chip}`}>{grp.rows.length} {dim === "landlord" ? "个场地方" : "条台账"}</span>
                               </div>
                             )}
                             {grp.rows.map((g: any) => {
-                            const rKey = `r-${m.period}-${dim}-${g.key}`;
+                            // 同场地跨主体会拆成多行，行键需带主体区分
+                            const rKey = `r-${m.period}-${dim}-${g.key}-${g.entityId ?? "x"}`;
                             const rOpen = expanded.has(rKey);
                             const hasTransformerRatio = (g.details ?? []).some((d: any) => d.transformerRatio && d.transformerRatio !== 1);
                             const hasBrandDimension = (g.details ?? []).some((d: any) => d.brandName);
@@ -791,6 +797,9 @@ export default function Electricity() {
                                             <td className="px-2 py-1.5">
                                               <div className="font-medium text-slate-700">{d.meterName ?? d.stationName ?? "—"}</div>
                                               <div className="font-mono text-[10px] text-slate-400">{d.meterNo}{d.meterName ? ` · ${d.meterName}` : ""}</div>
+                                              {dim === "entity" && d.landlordName && (
+                                                <div className="text-[10px] text-slate-400">场地：{d.landlordName}</div>
+                                              )}
                                               {d.dataSource === "manual" && (
                                                 <span className="mt-0.5 inline-block rounded bg-amber-100 px-1 text-[10px] text-amber-700">已人工修改</span>
                                               )}

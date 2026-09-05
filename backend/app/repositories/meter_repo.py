@@ -204,8 +204,19 @@ def update_meter(meter_id: int, data: dict):
             _check_meter_no_unique(cur, data["meterNo"], exclude_id=meter_id)
         values.append(meter_id)
         cur.execute(f"UPDATE meters SET {', '.join(updates)} WHERE id = %s RETURNING *", values)
+        updated = cur.fetchone()
+        # 换主体审计：entity_id 变更（含解除关联）写一条 meter_entity_changes，与电表更新同事务
+        if updated and cur_row and updated.get("entity_id") != cur_row.get("entity_id"):
+            cur.execute("""
+                INSERT INTO meter_entity_changes (meter_id, meter_no, from_entity_id, to_entity_id, operator, remark)
+                VALUES (%s, %s, %s, %s, %s, %s)
+            """, (
+                meter_id, updated.get("meter_no"),
+                cur_row.get("entity_id"), updated.get("entity_id"),
+                data.get("operator"), data.get("entityChangeRemark"),
+            ))
         conn.commit()
-        return cur.fetchone()
+        return updated
     finally:
         cur.close()
         conn.close()

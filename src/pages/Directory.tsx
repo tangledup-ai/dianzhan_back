@@ -794,8 +794,33 @@ export default function Directory() {
         </TabsContent>
         <TabsContent value="entities">
           <CrudTable title="公司主体档案" rows={entities.data}
-            columns={[{ key: "name", label: "公司全称" }, { key: "short_name", label: "简称" }, { key: "remark", label: "备注" }]}
-            onCreate={(v) => createEntity({ name: v.name, shortName: v.shortName, remark: v.remark })} onUpdate={(id, v) => updateEntity(id, { name: v.name, shortName: v.shortName, remark: v.remark })} onDelete={deleteEntity} />
+            columns={[
+              { key: "name", label: "公司全称" },
+              { key: "shortName", label: "简称" },
+              { key: "taxNo", label: "统一社会信用代码" },
+              { key: "taxpayerType", label: "纳税人类型" },
+              { key: "invoiceBank", label: "开户行" },
+              { key: "invoiceAccount", label: "账号" },
+              { key: "invoiceAddress", label: "开票地址" },
+              { key: "invoicePhone", label: "开票电话" },
+              { key: "status", label: "状态" },
+              { key: "remark", label: "备注" },
+            ]}
+            onCreate={(v) => createEntity({
+              name: v.name, shortName: v.shortName, remark: v.remark,
+              taxNo: v.taxNo, taxpayerType: v.taxpayerType,
+              invoiceBank: v.invoiceBank, invoiceAccount: v.invoiceAccount,
+              invoiceAddress: v.invoiceAddress, invoicePhone: v.invoicePhone,
+              status: v.status || "启用",
+            })}
+            onUpdate={(id, v) => updateEntity(id, {
+              name: v.name, shortName: v.shortName, remark: v.remark,
+              taxNo: v.taxNo, taxpayerType: v.taxpayerType,
+              invoiceBank: v.invoiceBank, invoiceAccount: v.invoiceAccount,
+              invoiceAddress: v.invoiceAddress, invoicePhone: v.invoicePhone,
+              status: v.status || "启用",
+            })}
+            onDelete={deleteEntity} />
         </TabsContent>
         <TabsContent value="landlords">
           <CrudTable title="场地方 / 业主档案" rows={landlords.data}

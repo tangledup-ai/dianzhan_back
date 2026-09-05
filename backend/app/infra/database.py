@@ -34,6 +34,33 @@ def init_database():
     sync_schema()
 
 
+def _split_sql_statements(sql: str) -> list:
+    """按分号切分 SQL 语句，跳过 $$...$$ dollar-quote 块内的分号（DO 块/函数体）。
+
+    行为兼容原朴素切分：纯注释/空白段丢弃；语句内的注释行保留（psycopg2 可执行）。
+    """
+    statements, buf, in_dollar = [], [], False
+    i = 0
+    n = len(sql)
+    while i < n:
+        if sql[i] == "$" and i + 1 < n and sql[i + 1] == "$":
+            in_dollar = not in_dollar
+            buf.append("$$")
+            i += 2
+            continue
+        if sql[i] == ";" and not in_dollar:
+            statements.append("".join(buf))
+            buf = []
+            i += 1
+            continue
+        buf.append(sql[i])
+        i += 1
+    statements.append("".join(buf))
+    return [s.strip() for s in statements if s.strip() and not all(
+        line.strip().startswith("--") or not line.strip() for line in s.strip().splitlines()
+    )]
+
+
 def sync_schema():
     """执行 schema_sync.sql（纯增量幂等语句），逐条执行，失败只记日志。
 
@@ -46,9 +73,7 @@ def sync_schema():
     if not os.path.exists(sql_file):
         return
     with open(sql_file, 'r', encoding='utf-8') as f:
-        statements = [s.strip() for s in f.read().split(';') if s.strip() and not all(
-            line.strip().startswith('--') or not line.strip() for line in s.strip().splitlines()
-        )]
+        statements = _split_sql_statements(f.read())
     conn = get_connection()
     cur = conn.cursor()
     applied = failed = 0

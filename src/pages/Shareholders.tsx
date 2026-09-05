@@ -1,6 +1,6 @@
 import { useState, useMemo, useEffect, useCallback, useRef } from "react";
 import { useQuery, useQueries, useMutation, useQueryClient } from "@tanstack/react-query";
-import { listShareholders, listIntroducers, createShareholder } from "@/api/directory";
+import { listShareholders, listIntroducers, createShareholder, listEntities } from "@/api/directory";
 import { getStationBoard } from "@/api/overview";
 import { listDividends, listShareholderConfigs, listIntroducerConfigs, deleteShareholderConfig, deleteIntroducerConfig, calculateDividend, createDividend, refreshDividends, shareholderSummary, saveShareholderConfig, saveIntroducerConfig, submitDividend } from "@/api/dividends";
 import { listExpenses, saveExpense, deleteExpense } from "@/api/rent";
@@ -962,27 +962,35 @@ export default function Shareholders() {
     onError: (e: any) => toast.error(e.response?.data?.detail || e.message || "重算失败"),
   });
 
-  // ── 运营费用（当前选中月 = periodEnd）──
+  // ── 运营费用（当前选中月 = periodEnd；可按主体录入，空 = 整场地公共）──
   const expenses = useQuery({
     queryKey: ["opExpenses", landlordId, periodEnd],
     queryFn: () => listExpenses({ landlordId: landlordId!, period: toCompact(periodEnd) }),
     enabled: viewMode === "landlord" && landlordId != null,
   });
-  const currentExpense = useMemo(
-    () => (expenses.data ?? []).find((x: any) => x.period === toCompact(periodEnd)) || null,
-    [expenses.data, periodEnd]
+  const entitiesQ = useQuery({
+    queryKey: ["entities"],
+    queryFn: listEntities,
+    enabled: viewMode === "landlord" && landlordId != null,
+  });
+  const [expenseEntityId, setExpenseEntityId] = useState(""); // ""=整场地公共
+  const expenseRows = (expenses.data ?? []) as any[];
+  const expenseTotal = expenseRows.reduce((s: number, x: any) => s + (Number(x.amount) || 0), 0);
+  const selectedExpenseRow = useMemo(
+    () => expenseRows.find((x: any) => (x.entityId ?? null) === (expenseEntityId ? Number(expenseEntityId) : null)) || null,
+    [expenseRows, expenseEntityId]
   );
   const [expenseAmount, setExpenseAmount] = useState("");
   const [expenseRemark, setExpenseRemark] = useState("");
   const expenseKeyRef = useRef("");
   useEffect(() => {
-    const key = `${landlordId}-${periodEnd}`;
+    const key = `${landlordId}-${periodEnd}-${expenseEntityId}`;
     if (expenseKeyRef.current !== key) {
       expenseKeyRef.current = key;
-      setExpenseAmount(currentExpense ? String(currentExpense.amount ?? "") : "");
-      setExpenseRemark(currentExpense?.remark ?? "");
+      setExpenseAmount(selectedExpenseRow ? String(selectedExpenseRow.amount ?? "") : "");
+      setExpenseRemark(selectedExpenseRow?.remark ?? "");
     }
-  }, [landlordId, periodEnd, currentExpense]);
+  }, [landlordId, periodEnd, expenseEntityId, selectedExpenseRow]);
   const invalidateOpExpense = () => {
     qc.invalidateQueries({ queryKey: ["opExpenses"] });
     qc.invalidateQueries({ queryKey: ["dividendPreview"] });
@@ -993,7 +1001,7 @@ export default function Shareholders() {
       if (!landlordId) throw new Error("请先选择场地方");
       const amount = Number(expenseAmount);
       if (expenseAmount === "" || isNaN(amount) || amount < 0) throw new Error("请输入有效的运营费用金额");
-      return saveExpense({ landlordId, period: toCompact(periodEnd), amount, remark: expenseRemark.trim() || null });
+      return saveExpense({ landlordId, period: toCompact(periodEnd), amount, remark: expenseRemark.trim() || null, entityId: expenseEntityId ? Number(expenseEntityId) : null });
     },
     onSuccess: () => {
       invalidateOpExpense();
@@ -1345,31 +1353,42 @@ export default function Shareholders() {
                 </div>
               </div>
 
-              {/* 运营费用（当前选中月） */}
+              {/* 运营费用（当前选中月，可按主体录入） */}
               <div className="rounded-xl border bg-white p-4">
                 <div className="flex items-center justify-between mb-2">
                   <div className="flex items-center gap-1.5 text-xs font-semibold text-slate-600">
                     <Wallet className="h-3.5 w-3.5 text-amber-600" />
                     运营费用（{toDisplay(periodEnd)}）
                   </div>
-                  {currentExpense && (
+                  {expenseRows.length > 0 && (
                     <span className="rounded-full bg-amber-50 px-2 py-0.5 text-[10px] text-amber-700">
-                      该月已录入 ¥{fmtMoney(currentExpense.amount)}{currentExpense.remark ? `（${currentExpense.remark}）` : ""}
+                      该月已录 {expenseRows.length} 笔，合计 ¥{fmtMoney(expenseTotal)}
                     </span>
                   )}
                 </div>
                 <div className="flex flex-wrap gap-2">
+                  <select
+                    className={`${inputCls} w-44`}
+                    value={expenseEntityId}
+                    onChange={(e) => setExpenseEntityId(e.target.value)}
+                    title="该笔费用归属：整场地公共（按柜数分摊到主体）或某主体专属"
+                  >
+                    <option value="">整场地公共（分摊）</option>
+                    {(entitiesQ.data ?? []).map((en: any) => (
+                      <option key={en.id} value={String(en.id)}>{en.name}（专属）</option>
+                    ))}
+                  </select>
                   <input
-                    className={`${inputCls} w-40`}
+                    className={`${inputCls} w-36`}
                     type="number"
                     min="0"
                     step="0.01"
                     value={expenseAmount}
                     onChange={(e) => setExpenseAmount(e.target.value)}
-                    placeholder="请输入运营费用（元）"
+                    placeholder="运营费用（元）"
                   />
                   <input
-                    className={`${inputCls} w-48`}
+                    className={`${inputCls} w-44`}
                     value={expenseRemark}
                     onChange={(e) => setExpenseRemark(e.target.value)}
                     placeholder="备注（可选）"
@@ -1379,16 +1398,27 @@ export default function Shareholders() {
                     disabled={saveExpenseMutation.isPending}
                     className="rounded-lg bg-amber-600 px-3 py-1.5 text-xs text-white hover:bg-amber-700 disabled:opacity-50"
                   >保存</button>
-                  {currentExpense && (
+                  {selectedExpenseRow && (
                     <button
-                      onClick={() => deleteExpenseMutation.mutate(currentExpense.id)}
+                      onClick={() => deleteExpenseMutation.mutate(selectedExpenseRow.id)}
                       disabled={deleteExpenseMutation.isPending}
                       className="rounded-lg border border-slate-200 px-3 py-1.5 text-xs text-slate-500 hover:border-rose-300 hover:text-rose-600"
-                    >删除</button>
+                    >删除{expenseEntityId ? "该主体费用" : "公共费用"}</button>
                   )}
                 </div>
+                {expenseRows.length > 0 && (
+                  <div className="mt-2 flex flex-wrap gap-1.5">
+                    {expenseRows.map((x: any) => (
+                      <button key={x.id}
+                        onClick={() => setExpenseEntityId(x.entityId ? String(x.entityId) : "")}
+                        className={`rounded-full px-2 py-0.5 text-[10px] ${((x.entityId ?? null) === (expenseEntityId ? Number(expenseEntityId) : null)) ? "bg-amber-100 text-amber-800" : "bg-slate-100 text-slate-500 hover:bg-slate-200"}`}>
+                        {x.entityId ? `${x.entityName ?? "主体"}：¥${fmtMoney(x.amount)}` : `公共：¥${fmtMoney(x.amount)}`}
+                      </button>
+                    ))}
+                  </div>
+                )}
                 <div className="mt-2 text-[10px] text-slate-400">
-                  运营费用计入该月总成本（分红基数 = 总收入 − 总成本），保存后分红预估、核算明细自动更新。
+                  运营费用计入该月总成本（分红基数 = 总收入 − 总成本）；「整场地公共」在主体损益中按柜数分摊，「主体专属」全额归该主体。保存后分红预估、核算明细自动更新。
                 </div>
               </div>
 

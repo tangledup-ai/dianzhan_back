@@ -83,23 +83,27 @@ async def get_landlord_meter_view(landlord_id: int, period: str = None, request:
         cabinets = cabinet_repo.list_cabinets(meter_id=mid)
         cabinets_by_meter[mid] = cabinets
 
-    # 台账状态：按 场地×品牌×月 取记录（v3：electricity_records 按 landlord_id+brand_id+period 存储）
+    # 台账状态：按 场地×品牌×月 取记录（v3.1：按 landlord+brand+entity+period 存储，同键按主体拆多行）
     brand_ids = {m.get("brand_id") for m in meters if m.get("brand_id")}
     records_by_brand = {}
+    record_by_meter = {}
     meter_detail_map = {}
     prev_meter_detail_map = {}
     y, m = int(period[:4]), int(period[5:7])
     prev_m, prev_y = (m - 1, y) if m > 1 else (12, y - 1)
     prev_period = f"{prev_y:04d}{prev_m:02d}"
     for bid in brand_ids:
-        rec = electricity_repo.get_record_by_landlord_brand_period(landlord_id, bid, elec_period)
-        if rec:
-            records_by_brand[int(bid)] = rec
+        # 主体拆行：同 场地×品牌×月 逐行合并明细，电表收付状态取该电表所在行的状态
+        recs = electricity_repo.list_records_by_landlord_brand_period(landlord_id, bid, elec_period)
+        if recs:
+            records_by_brand[int(bid)] = recs[0]
+            for rec in recs:
+                for d in electricity_repo.get_meter_details(rec["id"]):
+                    meter_detail_map[d["meter_id"]] = d
+                    record_by_meter[d["meter_id"]] = rec
+        prev_recs = electricity_repo.list_records_by_landlord_brand_period(landlord_id, bid, prev_period)
+        for rec in prev_recs:
             for d in electricity_repo.get_meter_details(rec["id"]):
-                meter_detail_map[d["meter_id"]] = d
-        prev_rec = electricity_repo.get_record_by_landlord_brand_period(landlord_id, bid, prev_period)
-        if prev_rec:
-            for d in electricity_repo.get_meter_details(prev_rec["id"]):
                 prev_meter_detail_map[d["meter_id"]] = d
 
     # 获取合同价格（场地合同=付款单价，品牌方合同=收款单价；按品牌各算各的）
@@ -297,7 +301,10 @@ async def get_landlord_meter_view(landlord_id: int, period: str = None, request:
             else:
                 collect_net = collect_amount or 0
 
-            brand_record = records_by_brand.get(int(meter_brand_id)) if meter_brand_id is not None else None
+            # 收付状态取该电表所在台账行（跨主体品牌各行的状态可能不同）；无行时回退品牌任一行
+            brand_record = record_by_meter.get(mid) or (
+                records_by_brand.get(int(meter_brand_id)) if meter_brand_id is not None else None
+            )
 
             group_meters.append({
                 "meterId": mid,

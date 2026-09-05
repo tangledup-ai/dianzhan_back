@@ -1188,3 +1188,284 @@ async def shareholder_board(request: Request):
             holder_map[hid]["details"].append(s)
 
     return list(holder_map.values())
+
+
+# ─── 公司主体月度损益（二期：运营归属主体口径）────────────────────
+# 归属原则（ENTITY_LINE_DESIGN.md §3）：
+#   电费     = 台账按 meters.entity_id 生成时已带 entity_id，直接聚合；
+#   品牌租金 = 品牌方合同覆盖该月：合同指定主体 → 全额归；否则按该 (场地,品牌) 电表柜数占比拆分；
+#   场地租   = 场地合同覆盖该月：合同指定主体 → 全额归；否则按该场地电表柜数占比分摊；
+#   运营费用 = 按主体录入的直接归；场地公共的按柜数分摊；
+#   净利润   = 电费利润 + (租金收入 − 租金税费) − 场地租分摊 − 运营费分摊（分红不扣，与 landlord_monthly_summary 一致）。
+
+def _covers_period(c: dict, period: str) -> bool:
+    """合同是否覆盖 YYYYMM 月：start <= 月末 且 (early_end 或 end) >= 月初（无日期=长期有效）"""
+    s = str(c.get("start_date") or "")[:10].replace("-", "")
+    e = str(c.get("early_end_date") or c.get("end_date") or "")[:10].replace("-", "")
+    ms, me = period + "01", period + "31"
+    if s and s > me:
+        return False
+    if e and e < ms:
+        return False
+    return True
+
+
+@router.get("/entity-monthly")
+async def entity_monthly(request: Request, period: str = None):
+    """公司主体 × 月度损益表（报表口径，非收付款口径；未指定主体单独成行）"""
+    from ..infra.auth_scope import scope_landlord_ids
+    from ..infra.period import to_compact
+    from ..domain.electricity_pricing import rent_income_for_period, rent_refund_for_period
+    from datetime import date as _date
+
+    if not period:
+        now = _date.today()
+        period = f"{now.year}{now.month:02d}"
+    period = to_compact(period)
+    if len(period) != 6 or not period.isdigit():
+        from fastapi import HTTPException
+        raise HTTPException(400, "月份格式错误，应为 YYYY-MM 或 YYYYMM")
+
+    allowed = scope_landlord_ids(request)
+    scope_cond, scope_vals = "", []
+    if allowed is not None:
+        scope_cond = " AND landlord_id = ANY(%s::int[])"
+        scope_vals = [allowed]
+
+    conn = get_connection()
+    cur = get_dict_cursor(conn)
+    try:
+        def bucket(eid):
+            return {
+                "kwh": 0.0, "elecPay": 0.0, "elecCollect": 0.0, "elecNet": 0.0,
+                "rentIncome": 0.0, "rentTax": 0.0, "venueCost": 0.0, "opExpense": 0.0,
+            }
+
+        acc: dict = {}
+
+        # 1) 电费（台账行自带 entity_id）
+        cur.execute(f"""
+            SELECT COALESCE(entity_id, 0) AS eid_key, entity_id,
+                   COALESCE(SUM(pay_kwh), 0) AS kwh,
+                   COALESCE(SUM(pay_amount), 0) AS pay_amount,
+                   COALESCE(SUM(collect_amount), 0) AS collect_amount,
+                   COALESCE(SUM(collect_net), 0) AS collect_net
+            FROM electricity_records
+            WHERE period = %s{scope_cond}
+            GROUP BY entity_id
+        """, (period, *scope_vals))
+        elec_rows = cur.fetchall()
+
+        # 2) 柜数权重：每块计费电表至少 1 柜（与分红分摊同口径）
+        cur.execute(f"""
+            SELECT m.landlord_id, m.entity_id, m.brand_id,
+                   COALESCE(SUM(GREATEST(1, cab.cnt)), 0) AS cabs
+            FROM meters m
+            LEFT JOIN LATERAL (SELECT COUNT(*) AS cnt FROM cabinets cab WHERE cab.meter_id = m.id) cab ON TRUE
+            WHERE m.landlord_id IS NOT NULL AND m.meter_no NOT LIKE 'TEST%%'
+              AND (m.brand_id IS NOT NULL OR m.tag = '共享电表'){scope_cond.replace('landlord_id', 'm.landlord_id')}
+            GROUP BY m.landlord_id, m.entity_id, m.brand_id
+        """, tuple(scope_vals))
+        weight_rows = cur.fetchall()
+        weights_ll: dict = {}    # (landlord) -> {entity_id: cabs}
+        weights_brand: dict = {} # (landlord, brand) -> {entity_id: cabs}
+        for r in weight_rows:
+            lid, eid, bid, cabs = r["landlord_id"], r["entity_id"], r["brand_id"], float(r["cabs"] or 0)
+            weights_ll.setdefault(lid, {}).setdefault(eid, 0.0)
+            weights_ll[lid][eid] += cabs
+            weights_brand.setdefault((lid, bid), {}).setdefault(eid, 0.0)
+            weights_brand[(lid, bid)][eid] += cabs
+
+        # 3) 合同（覆盖该月）
+        cur.execute("""
+            SELECT c.*, l.name AS landlord_name
+            FROM contracts c
+            LEFT JOIN landlords l ON c.landlord_id = l.id
+            WHERE c.landlord_id IS NOT NULL
+        """)
+        contracts = [c for c in cur.fetchall() if _covers_period(c, period)
+                     and (allowed is None or c["landlord_id"] in allowed)]
+
+        # 4) 运营费用（该月全部行）
+        cur.execute(f"""
+            SELECT o.*, ent.name AS entity_name
+            FROM operating_expenses o
+            LEFT JOIN entities ent ON o.entity_id = ent.id
+            WHERE o.period = %s{scope_cond}
+        """, (period, *scope_vals))
+        op_rows = cur.fetchall()
+    finally:
+        cur.close()
+        conn.close()
+
+    def split_by_weights(amount: float, wmap: dict, force_entity=None) -> list:
+        """按权重把金额拆到主体；权重为空/为 0 时整笔归 force_entity（或未指定）"""
+        total_w = sum(w for w in wmap.values() if w > 0)
+        if total_w <= 0:
+            return [(force_entity, amount)]
+        out = []
+        rest = amount
+        eids = [e for e in wmap if wmap[e] > 0]
+        for i, eid in enumerate(sorted(eids, key=lambda x: (x is None, x))):
+            share = amount * wmap[eid] / total_w
+            if i == len(eids) - 1:
+                share = rest  # 尾差归最后一家，保证合计闭合
+            rest = round(rest - share, 2)
+            out.append((eid, round(share, 2)))
+        return out
+
+    # ── 电费直接归集 ──
+    for r in elec_rows:
+        eid = r["entity_id"]
+        b = acc.setdefault(eid, bucket(eid))
+        b["kwh"] += float(r["kwh"] or 0)
+        b["elecPay"] += float(r["pay_amount"] or 0)
+        b["elecCollect"] += float(r["collect_amount"] or 0)
+        b["elecNet"] += float(r["collect_net"] or 0)
+
+    # ── 合同租金（收入=品牌方合同 / 成本=场地合同），按主体归属或柜数拆分 ──
+    for c in contracts:
+        lid = c["landlord_id"]
+        if c["contract_type"] == "场地合同":
+            amount = round(float(c.get("monthly_rent") or 0), 2)
+            if c.get("entity_id") is not None:
+                allocations = [(c["entity_id"], amount)]
+            else:
+                allocations = split_by_weights(amount, weights_ll.get(lid, {}))
+            for eid, share in allocations:
+                acc.setdefault(eid, bucket(eid))["venueCost"] += share
+        elif c["contract_type"] == "品牌方合同":
+            amount = round(rent_income_for_period(c, period) - rent_refund_for_period(c, period), 2)
+            tax = 0.0
+            if c.get("rent_tax_enabled") and c.get("post_tax_rent_price") is not None:
+                tax = round(float(c.get("monthly_rent") or 0) - float(c["post_tax_rent_price"]), 2)
+            wmap = weights_brand.get((lid, c.get("brand_id")), {})
+            if c.get("entity_id") is not None:
+                allocs = [(c["entity_id"], amount, tax)]
+            else:
+                inc_allocs = split_by_weights(amount, wmap)
+                tax_map = dict(split_by_weights(tax, wmap)) if tax > 0 else {}
+                allocs = [(eid, share, tax_map.get(eid, 0.0)) for eid, share in inc_allocs]
+            for eid, share, tshare in allocs:
+                b = acc.setdefault(eid, bucket(eid))
+                b["rentIncome"] += share
+                b["rentTax"] += tshare
+
+    # ── 运营费用 ──
+    for o in op_rows:
+        lid = o.get("landlord_id")
+        amount = float(o.get("amount") or 0)
+        if o.get("entity_id") is not None:
+            allocations = [(o["entity_id"], amount)]
+        else:
+            allocations = split_by_weights(amount, weights_ll.get(lid, {}))
+        for eid, share in allocations:
+            acc.setdefault(eid, bucket(eid))["opExpense"] += share
+
+   
+
+    # ── 主体名 ──
+    eids = [e for e in acc.keys() if e is not None]
+    if eids:
+        conn = get_connection()
+        cur = get_dict_cursor(conn)
+        try:
+            cur.execute("SELECT id, name FROM entities WHERE id = ANY(%s::int[])", (eids,))
+            ent_names = {r["id"]: r["name"] for r in cur.fetchall()}
+        finally:
+            cur.close()
+            conn.close()
+    else:
+        ent_names = {}
+
+    rows = []
+    for eid, b in acc.items():
+        elec_profit = round(b["elecNet"] - b["elecPay"], 2)
+        net_profit = round(elec_profit + b["rentIncome"] - b["rentTax"] - b["venueCost"] - b["opExpense"], 2)
+        rows.append({
+            "entityId": eid,
+            "entityName": ent_names.get(eid) if eid is not None else None,
+            "kwh": round(b["kwh"], 2),
+            "elecPay": round(b["elecPay"], 2),
+            "elecCollect": round(b["elecCollect"], 2),
+            "elecNet": round(b["elecNet"], 2),
+            "elecTax": round(b["elecCollect"] - b["elecNet"], 2),
+            "elecProfit": elec_profit,
+            "rentIncome": round(b["rentIncome"], 2),
+            "rentTax": round(b["rentTax"], 2),
+            "venueCost": round(b["venueCost"], 2),
+            "opExpense": round(b["opExpense"], 2),
+            "netProfit": net_profit,
+        })
+    rows.sort(key=lambda r: (r["entityId"] is None, -(r["elecProfit"] + r["rentIncome"])))
+
+    totals = {
+        "kwh": round(sum(r["kwh"] for r in rows), 2),
+        "elecPay": round(sum(r["elecPay"] for r in rows), 2),
+        "elecCollect": round(sum(r["elecCollect"] for r in rows), 2),
+        "elecNet": round(sum(r["elecNet"] for r in rows), 2),
+        "elecTax": round(sum(r["elecTax"] for r in rows), 2),
+        "elecProfit": round(sum(r["elecProfit"] for r in rows), 2),
+        "rentIncome": round(sum(r["rentIncome"] for r in rows), 2),
+        "rentTax": round(sum(r["rentTax"] for r in rows), 2),
+        "venueCost": round(sum(r["venueCost"] for r in rows), 2),
+        "opExpense": round(sum(r["opExpense"] for r in rows), 2),
+        "netProfit": round(sum(r["netProfit"] for r in rows), 2),
+    }
+    for r in rows:
+        r["entityName"] = r["entityName"] or "未指定主体"
+
+    return {"period": period, "rows": rows, "totals": totals}
+
+    # ── 主体名 ──
+    eids = [e for e in acc.keys() if e is not None]
+    if eids:
+        conn = get_connection()
+        cur = get_dict_cursor(conn)
+        try:
+            cur.execute("SELECT id, name FROM entities WHERE id = ANY(%s::int[])", (eids,))
+            ent_names = {r["id"]: r["name"] for r in cur.fetchall()}
+        finally:
+            cur.close()
+            conn.close()
+    else:
+        ent_names = {}
+
+    rows = []
+    for eid, b in acc.items():
+        elec_profit = round(b["elecNet"] - b["elecPay"], 2)
+        net_profit = round(elec_profit + b["rentIncome"] - b["rentTax"] - b["venueCost"] - b["opExpense"], 2)
+        rows.append({
+            "entityId": eid,
+            "entityName": ent_names.get(eid) if eid is not None else None,
+            "kwh": round(b["kwh"], 2),
+            "elecPay": round(b["elecPay"], 2),
+            "elecCollect": round(b["elecCollect"], 2),
+            "elecNet": round(b["elecNet"], 2),
+            "elecTax": round(b["elecCollect"] - b["elecNet"], 2),
+            "elecProfit": elec_profit,
+            "rentIncome": round(b["rentIncome"], 2),
+            "rentTax": round(b["rentTax"], 2),
+            "venueCost": round(b["venueCost"], 2),
+            "opExpense": round(b["opExpense"], 2),
+            "netProfit": net_profit,
+        })
+    rows.sort(key=lambda r: (r["entityId"] is None, -(r["elecProfit"] + r["rentIncome"])))
+
+    totals = {
+        "kwh": round(sum(r["kwh"] for r in rows), 2),
+        "elecPay": round(sum(r["elecPay"] for r in rows), 2),
+        "elecCollect": round(sum(r["elecCollect"] for r in rows), 2),
+        "elecNet": round(sum(r["elecNet"] for r in rows), 2),
+        "elecTax": round(sum(r["elecTax"] for r in rows), 2),
+        "elecProfit": round(sum(r["elecProfit"] for r in rows), 2),
+        "rentIncome": round(sum(r["rentIncome"] for r in rows), 2),
+        "rentTax": round(sum(r["rentTax"] for r in rows), 2),
+        "venueCost": round(sum(r["venueCost"] for r in rows), 2),
+        "opExpense": round(sum(r["opExpense"] for r in rows), 2),
+        "netProfit": round(sum(r["netProfit"] for r in rows), 2),
+    }
+    for r in rows:
+        r["entityName"] = r["entityName"] or "未指定主体"
+
+    return {"period": period, "rows": rows, "totals": totals}

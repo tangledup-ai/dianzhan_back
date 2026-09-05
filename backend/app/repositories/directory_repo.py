@@ -119,13 +119,22 @@ def list_entities():
         conn.close()
 
 
-def create_entity(name: str, short_name: str = None, remark: str = None):
+ENTITY_ARCHIVE_FIELDS = ("tax_no", "taxpayer_type", "invoice_bank", "invoice_account",
+                         "invoice_address", "invoice_phone", "status", "sort")
+
+
+def create_entity(name: str, short_name: str = None, remark: str = None, **archive):
     conn = get_connection()
     cur = get_dict_cursor(conn)
     try:
+        cols = ["name", "short_name", "remark"]
+        vals = [name, short_name, remark]
+        for f in ENTITY_ARCHIVE_FIELDS:
+            if f in archive:
+                cols.append(f); vals.append(archive[f])
         cur.execute(
-            "INSERT INTO entities (name, short_name, remark) VALUES (%s, %s, %s) RETURNING *",
-            (name, short_name, remark)
+            f"INSERT INTO entities ({', '.join(cols)}) VALUES ({', '.join(['%s'] * len(cols))}) RETURNING *",
+            vals
         )
         conn.commit()
         return cur.fetchone()
@@ -134,7 +143,7 @@ def create_entity(name: str, short_name: str = None, remark: str = None):
         conn.close()
 
 
-def update_entity(entity_id: int, name: str = None, short_name: str = None, remark: str = None):
+def update_entity(entity_id: int, name: str = None, short_name: str = None, remark: str = None, **archive):
     conn = get_connection()
     cur = get_dict_cursor(conn)
     try:
@@ -145,6 +154,9 @@ def update_entity(entity_id: int, name: str = None, short_name: str = None, rema
             updates.append("short_name = %s"); values.append(short_name)
         if remark is not None:
             updates.append("remark = %s"); values.append(remark)
+        for f in ENTITY_ARCHIVE_FIELDS:
+            if f in archive:
+                updates.append(f"{f} = %s"); values.append(archive[f])
         if not updates:
             return None
         values.append(entity_id)

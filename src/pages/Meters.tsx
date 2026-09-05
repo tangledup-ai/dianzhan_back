@@ -1,6 +1,7 @@
 import { useState, useMemo, useEffect, useCallback, useRef } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { listMeters, createMeter, updateMeter, deleteMeter, importMetersExcel } from "@/api/meters";
+import { listContracts } from "@/api/contracts";
 import { listCabinets, createCabinet, updateCabinet, deleteCabinet } from "@/api/cabinets";
 import { listBrands, listLandlords, listEntities } from "@/api/directory";
 import { generateElectricity } from "@/api/electricity";
@@ -127,6 +128,25 @@ export default function Meters() {
   const meters = useQuery({ queryKey: ["meters"], queryFn: () => listMeters() });
   const landlords = useQuery({ queryKey: ["landlords"], queryFn: listLandlords });
   const brands = useQuery({ queryKey: ["brands"], queryFn: listBrands });
+  const contractsQ = useQuery({ queryKey: ["contracts"], queryFn: () => listContracts() });
+  const entitiesQ = useQuery({ queryKey: ["entities"], queryFn: listEntities });
+
+  // §5 一致性提示（只提示不拦截）：电表运营主体 ≠ 其品牌方合同收付款主体（合法场景：代收代付）
+  const entityMismatchHint = useMemo(() => {
+    const entName = new Map<number, string>((entitiesQ.data ?? []).map((e: any) => [e.id, e.shortName || e.name]));
+    const brandContracts = (contractsQ.data ?? []).filter((c: any) => c.contractType === "品牌方合同" && c.entityId != null);
+    const map: Record<number, string> = {};
+    for (const m of meters.data ?? []) {
+      if (!m.landlordId || !m.brandId || m.entityId == null) continue;
+      const c = brandContracts
+        .filter((x: any) => x.landlordId === m.landlordId && x.brandId === m.brandId)
+        .sort((a: any, b: any) => String(b.startDate ?? "").localeCompare(String(a.startDate ?? "")))[0];
+      if (c && c.entityId !== m.entityId) {
+        map[m.id] = `收款主体「${entName.get(c.entityId) ?? c.entityId}」与电表运营主体「${entName.get(m.entityId) ?? m.entityId}」不一致，请核对`;
+      }
+    }
+    return map;
+  }, [meters.data, contractsQ.data, entitiesQ.data]);
 
   const del = useMutation({
     mutationFn: deleteMeter,
@@ -340,6 +360,7 @@ export default function Meters() {
                     onDelete={() => window.confirm("删除该电表？") && del.mutate(m.id)}
                     onReading={() => setReadingMeter(m)}
                     highlightCabinet={!!(isTargetGroup && expandedMeterId === m.id)}
+                    entityMismatchHint={entityMismatchHint[m.id]}
                   />
                 ))}
               </div>
@@ -434,8 +455,8 @@ export default function Meters() {
 }
 
 // ─── 电表卡片组件 ───
-function MeterCard({ meter, isExpanded, onToggle, onEdit, onDelete, onReading, highlightCabinet }: {
-  meter: any; isExpanded: boolean; onToggle: () => void; onEdit: () => void; onDelete: () => void; onReading: () => void; highlightCabinet?: boolean;
+function MeterCard({ meter, isExpanded, onToggle, onEdit, onDelete, onReading, highlightCabinet, entityMismatchHint }: {
+  meter: any; isExpanded: boolean; onToggle: () => void; onEdit: () => void; onDelete: () => void; onReading: () => void; highlightCabinet?: boolean; entityMismatchHint?: string;
 }) {
   const queryClient = useQueryClient();
   const cabinets = useQuery({
@@ -476,6 +497,9 @@ function MeterCard({ meter, isExpanded, onToggle, onEdit, onDelete, onReading, h
               <StatusBadge status={meter.status} />
             </div>
             <div className="text-[11px] text-slate-400">{meter.meterName ?? ""}</div>
+            {entityMismatchHint && (
+              <div className="text-[11px] text-amber-600">{entityMismatchHint}</div>
+            )}
           </div>
         </div>
         <div className="flex items-center gap-2">
@@ -561,6 +585,20 @@ function MeterForm({ open, onClose, record }: { open: boolean; onClose: () => vo
   // 编号唯一校验用（与列表页共用缓存，不额外发请求）
   const meters = useQuery({ queryKey: ["meters"], queryFn: () => listMeters(), enabled: open });
 
+  // 换主体确认：编辑时主体变了 → 列出有读数的月份，选择历史台账重算范围
+  const originalEntityId = record ? (record.entityId ? String(record.entityId) : "") : "";
+  const [regenScope, setRegenScope] = useState<"all" | "current">("all");
+  const entityChanged = !!record && f.entityId !== originalEntityId;
+  const affectedReadings = useQuery({
+    queryKey: ["meterReadings", record?.meterNo],
+    queryFn: () => getMeterReadings(record.meterNo),
+    enabled: open && entityChanged && !!record?.meterNo,
+  });
+  const affectedPeriods: string[] = useMemo(
+    () => ((affectedReadings.data ?? []) as any[]).map((r) => String(r.monthPeriod)).sort(),
+    [affectedReadings.data]
+  );
+
   useEffect(() => {
     if (!open) return;
     if (record) {
@@ -572,6 +610,7 @@ function MeterForm({ open, onClose, record }: { open: boolean; onClose: () => vo
         collectorId: record.collectorId ?? "", transformerRatio: String(record.transformerRatio ?? ""),
         tag: record.tag ?? (tagScope || "合作商电表"), remark: record.remark ?? "",
       });
+      setRegenScope("all");
     } else setF(blank);
   }, [open, record]);
 
@@ -619,6 +658,7 @@ function MeterForm({ open, onClose, record }: { open: boolean; onClose: () => vo
       brandId: !isShared && f.brandId ? Number(f.brandId) : null,
       landlordId: f.landlordId ? Number(f.landlordId) : null,
       entityId: f.entityId ? Number(f.entityId) : null,
+      ...(entityChanged ? { entityRegenerateFrom: regenScope } : {}),
       meterNo: meterNo,
       meterName: f.meterName.trim() || null,
       collectorId: f.collectorId.trim() || null,
@@ -668,6 +708,31 @@ function MeterForm({ open, onClose, record }: { open: boolean; onClose: () => vo
             <SearchSelect value={f.entityId} onChange={set("entityId")} placeholder="未指定（可搜索公司主体）"
               options={(entities.data ?? []).map((e: any) => ({ value: String(e.id), label: e.name }))} />
           </Field>
+          {entityChanged && (
+            <div className="space-y-1.5 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] text-amber-700">
+              <div className="font-semibold">更换公司主体将影响电费台账归属</div>
+              {affectedReadings.isLoading ? (
+                <div className="text-amber-600">正在检查该电表的历史读数…</div>
+              ) : affectedPeriods.length > 0 ? (
+                <div>
+                  该电表有 {affectedPeriods.length} 个月读数（{affectedPeriods.slice(0, 4).map(toDisplay).join("、")}
+                  {affectedPeriods.length > 4 ? " 等" : ""}），重算后这些月份的电费将按新主体归集
+                </div>
+              ) : (
+                <div>该电表暂无历史读数，保存后不影响台账</div>
+              )}
+              <div className="flex gap-4 pt-0.5">
+                <label className="flex cursor-pointer items-center gap-1.5">
+                  <input type="radio" name="regenScope" className="accent-amber-600" checked={regenScope === "all"} onChange={() => setRegenScope("all")} />
+                  全部历史重算（推荐）
+                </label>
+                <label className="flex cursor-pointer items-center gap-1.5">
+                  <input type="radio" name="regenScope" className="accent-amber-600" checked={regenScope === "current"} onChange={() => setRegenScope("current")} />
+                  仅从本月起
+                </label>
+              </div>
+            </div>
+          )}
           <Field label="电表编号 *"><TextInput value={f.meterNo} onChange={set("meterNo")} /></Field>
           <Field label="电表名称"><TextInput value={f.meterName} onChange={set("meterName")} /></Field>
           <Field label="标签">

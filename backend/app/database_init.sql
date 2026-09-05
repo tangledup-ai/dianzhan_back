@@ -33,10 +33,18 @@ CREATE TABLE IF NOT EXISTS entities (
     id SERIAL PRIMARY KEY,
     name VARCHAR(150) NOT NULL UNIQUE,
     short_name VARCHAR(50),
+    tax_no VARCHAR(50),
+    taxpayer_type VARCHAR(20),
+    invoice_bank VARCHAR(200),
+    invoice_account VARCHAR(100),
+    invoice_address VARCHAR(300),
+    invoice_phone VARCHAR(50),
+    status VARCHAR(20) DEFAULT '启用',
+    sort INTEGER DEFAULT 0,
     remark TEXT,
     created_at TIMESTAMP DEFAULT NOW()
 );
-COMMENT ON TABLE entities IS '公司主体（报税法人，收款/付款主体）';
+COMMENT ON TABLE entities IS '公司主体（报税法人，收款/付款主体；档案含开票信息，status 启用/停用）';
 
 CREATE TABLE IF NOT EXISTS landlords (
     id SERIAL PRIMARY KEY,
@@ -161,6 +169,19 @@ CREATE TABLE IF NOT EXISTS cabinets (
     created_at TIMESTAMP DEFAULT NOW()
 );
 COMMENT ON TABLE cabinets IS '柜子（物理资产，挂电表下）；计费柜数=实时统计本表，不落合同；品牌归属经 meter 派生（brand_id 列已于 2026-09 退役）';
+
+CREATE TABLE IF NOT EXISTS meter_entity_changes (
+    id SERIAL PRIMARY KEY,
+    meter_id INTEGER NOT NULL REFERENCES meters(id) ON DELETE CASCADE,
+    meter_no VARCHAR(100),
+    from_entity_id INTEGER REFERENCES entities(id),
+    to_entity_id INTEGER REFERENCES entities(id),
+    operator VARCHAR(64),
+    remark TEXT,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_meter_entity_changes_meter ON meter_entity_changes (meter_id, created_at DESC);
+COMMENT ON TABLE meter_entity_changes IS '电表换主体审计：meters.entity_id 变更时写一条（换主体=替换，历史台账按重算范围搬到新主体）';
 
 -- ══════════ 4. 电表·接入域（第三方缓存，只写不读业务）══════════
 
@@ -411,6 +432,7 @@ CREATE TABLE IF NOT EXISTS electricity_records (
     id SERIAL PRIMARY KEY,
     landlord_id INTEGER REFERENCES landlords(id),
     brand_id INTEGER REFERENCES brands(id),
+    entity_id INTEGER REFERENCES entities(id),
     period VARCHAR(6) NOT NULL,
     pay_start_date DATE,
     pay_start_reading NUMERIC(14,2),
@@ -434,10 +456,14 @@ CREATE TABLE IF NOT EXISTS electricity_records (
     data_source VARCHAR(16) DEFAULT 'auto',
     remark TEXT,
     created_at TIMESTAMP DEFAULT NOW(),
-    updated_at TIMESTAMP DEFAULT NOW(),
-    UNIQUE(landlord_id, brand_id, period)
+    updated_at TIMESTAMP DEFAULT NOW()
 );
 COMMENT ON TABLE electricity_records IS '电费月台账（快照，由 表码×倍数×合同单价 生成）；period 统一 6 位 YYYYMM';
+COMMENT ON COLUMN electricity_records.entity_id IS '公司主体（运营归属）：按该组电表的 meters.entity_id 生成，一表一主体；同场地同品牌跨主体拆成多行';
+-- 唯一键：场地×品牌×主体×月（brand/entity 可空，用 COALESCE 表达式索引让 NULL 参与唯一）
+CREATE UNIQUE INDEX IF NOT EXISTS uq_elec_records_group
+    ON electricity_records (landlord_id, COALESCE(brand_id, 0), COALESCE(entity_id, 0), period);
+CREATE INDEX IF NOT EXISTS idx_elec_records_entity ON electricity_records(entity_id);
 
 CREATE TABLE IF NOT EXISTS electricity_meter_details (
     id SERIAL PRIMARY KEY,
@@ -457,14 +483,16 @@ COMMENT ON TABLE electricity_meter_details IS '电费分表明细（生成时与
 CREATE TABLE IF NOT EXISTS operating_expenses (
     id SERIAL PRIMARY KEY,
     landlord_id INTEGER REFERENCES landlords(id),
+    entity_id INTEGER REFERENCES entities(id),
     period VARCHAR(6) NOT NULL,
     amount NUMERIC(12,2) NOT NULL,
     remark TEXT,
     created_at TIMESTAMP DEFAULT NOW(),
-    updated_at TIMESTAMP DEFAULT NOW(),
-    UNIQUE(landlord_id, period)
+    updated_at TIMESTAMP DEFAULT NOW()
 );
+CREATE INDEX IF NOT EXISTS idx_op_expenses_entity ON operating_expenses(entity_id);
 COMMENT ON TABLE operating_expenses IS '运营费用（独立手工输入，分红计算成本项）；period 统一 6 位 YYYYMM';
+COMMENT ON COLUMN operating_expenses.entity_id IS '公司主体：NULL=场地公共（按柜数分摊到主体），非空=该主体专属；同场地同月可 公共+多主体 并存';
 
 CREATE TABLE IF NOT EXISTS dividend_records (
     id SERIAL PRIMARY KEY,
@@ -855,6 +883,105 @@ UPDATE operating_expenses SET period = REPLACE(period, '-', '') WHERE period LIK
 -- 2.5 合同旧类型映射（两分法；歧义值留待人工）
 UPDATE contracts SET contract_type = '场地合同'   WHERE contract_type = '场租付款';
 UPDATE contracts SET contract_type = '品牌方合同' WHERE contract_type = '场租收款';
+
+-- 2.5.1 electricity_records 加主体维度（与 schema_sync.sql 第 9 节一致：加列→回填→换唯一键）
+ALTER TABLE electricity_records ADD COLUMN IF NOT EXISTS entity_id INTEGER;
+CREATE INDEX IF NOT EXISTS idx_elec_records_entity ON electricity_records(entity_id);
+UPDATE electricity_records e
+SET entity_id = (
+    SELECT m.entity_id FROM electricity_meter_details d
+    JOIN meters m ON m.id = d.meter_id
+    WHERE d.electricity_id = e.id AND m.entity_id IS NOT NULL
+    GROUP BY m.entity_id ORDER BY COUNT(*) DESC, m.entity_id LIMIT 1
+)
+WHERE e.entity_id IS NULL;
+-- 旧二元唯一键（约束或唯一索引，名字因库而异）按列组识别后移除，详见 schema_sync.sql 第 9 节
+DO $$
+DECLARE
+    r RECORD;
+BEGIN
+    FOR r IN
+        SELECT c.conname AS name, NULL::text AS schema, 'CONSTRAINT' AS kind
+        FROM pg_constraint c
+        WHERE c.conrelid = 'electricity_records'::regclass AND c.contype = 'u'
+          AND (SELECT array_agg(a.attname::text ORDER BY a.attname) FROM unnest(c.conkey) k
+               JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k)
+              = ARRAY['brand_id', 'landlord_id', 'period']::text[]
+        UNION ALL
+        SELECT i.relname AS name, ns.nspname AS schema, 'INDEX' AS kind
+        FROM pg_index x
+        JOIN pg_class i ON i.oid = x.indexrelid
+        JOIN pg_namespace ns ON ns.oid = i.relnamespace
+        WHERE x.indrelid = 'electricity_records'::regclass AND x.indisunique AND NOT x.indisprimary
+          AND (SELECT array_agg(a.attname::text ORDER BY a.attname) FROM unnest(x.indkey::smallint[]) k
+               JOIN pg_attribute a ON a.attrelid = x.indrelid AND a.attnum = k)
+              = ARRAY['brand_id', 'landlord_id', 'period']::text[]
+    LOOP
+        IF r.kind = 'CONSTRAINT' THEN
+            EXECUTE format('ALTER TABLE electricity_records DROP CONSTRAINT %I', r.name);
+        ELSE
+            EXECUTE format('DROP INDEX %I.%I', r.schema, r.name);
+        END IF;
+    END LOOP;
+END $$;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_elec_records_group
+    ON electricity_records (landlord_id, COALESCE(brand_id, 0), COALESCE(entity_id, 0), period);
+
+-- 2.5.2 电表换主体审计表（老库缺表时补建）
+CREATE TABLE IF NOT EXISTS meter_entity_changes (
+    id SERIAL PRIMARY KEY,
+    meter_id INTEGER NOT NULL REFERENCES meters(id) ON DELETE CASCADE,
+    meter_no VARCHAR(100),
+    from_entity_id INTEGER REFERENCES entities(id),
+    to_entity_id INTEGER REFERENCES entities(id),
+    operator VARCHAR(64),
+    remark TEXT,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_meter_entity_changes_meter ON meter_entity_changes (meter_id, created_at DESC);
+
+-- 2.5.3 entities 档案补全 + operating_expenses 按主体（与 schema_sync.sql 第 11/12 节一致）
+ALTER TABLE entities ADD COLUMN IF NOT EXISTS tax_no VARCHAR(50);
+ALTER TABLE entities ADD COLUMN IF NOT EXISTS taxpayer_type VARCHAR(20);
+ALTER TABLE entities ADD COLUMN IF NOT EXISTS invoice_bank VARCHAR(200);
+ALTER TABLE entities ADD COLUMN IF NOT EXISTS invoice_account VARCHAR(100);
+ALTER TABLE entities ADD COLUMN IF NOT EXISTS invoice_address VARCHAR(300);
+ALTER TABLE entities ADD COLUMN IF NOT EXISTS invoice_phone VARCHAR(50);
+ALTER TABLE entities ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT '启用';
+ALTER TABLE entities ADD COLUMN IF NOT EXISTS sort INTEGER DEFAULT 0;
+UPDATE entities SET status = '启用' WHERE status IS NULL;
+
+ALTER TABLE operating_expenses ADD COLUMN IF NOT EXISTS entity_id INTEGER;
+CREATE INDEX IF NOT EXISTS idx_op_expenses_entity ON operating_expenses(entity_id);
+-- 旧「场地×月」唯一键按列组识别后移除（详见 schema_sync.sql 第 12 节 DO 块）
+DO $$
+DECLARE
+    r RECORD;
+BEGIN
+    FOR r IN
+        SELECT c.conname AS name, NULL::text AS schema, 'CONSTRAINT' AS kind
+        FROM pg_constraint c
+        WHERE c.conrelid = 'operating_expenses'::regclass AND c.contype = 'u'
+          AND (SELECT array_agg(a.attname::text ORDER BY a.attname) FROM unnest(c.conkey) k
+               JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k)
+              = ARRAY['landlord_id', 'period']::text[]
+        UNION ALL
+        SELECT i.relname AS name, ns.nspname AS schema, 'INDEX' AS kind
+        FROM pg_index x
+        JOIN pg_class i ON i.oid = x.indexrelid
+        JOIN pg_namespace ns ON ns.oid = i.relnamespace
+        WHERE x.indrelid = 'operating_expenses'::regclass AND x.indisunique AND NOT x.indisprimary
+          AND (SELECT array_agg(a.attname::text ORDER BY a.attname) FROM unnest(x.indkey::smallint[]) k
+               JOIN pg_attribute a ON a.attrelid = x.indrelid AND a.attnum = k)
+              = ARRAY['landlord_id', 'period']::text[]
+    LOOP
+        IF r.kind = 'CONSTRAINT' THEN
+            EXECUTE format('ALTER TABLE operating_expenses DROP CONSTRAINT %I', r.name);
+        ELSE
+            EXECUTE format('DROP INDEX %I.%I', r.schema, r.name);
+        END IF;
+    END LOOP;
+END $$;
 
 -- 2.6 contracts 补列（兼容历史缺列库）
 ALTER TABLE contracts ADD COLUMN IF NOT EXISTS entity_id INTEGER REFERENCES entities(id);

@@ -314,16 +314,42 @@ async def update_meter(meter_id: int, request: Request, data: dict):
     ensure_meter_in_scope(request,
                           data.get("tag") or old_meter.get("tag"),
                           data.get("landlordId") if data.get("landlordId") is not None else old_meter.get("landlord_id"))
+    # 换主体审计的操作人（repo 内写 meter_entity_changes 用；额外键不影响字段更新）
+    operator = (getattr(request.state, "current_user", None) or {}).get("name")
+    if operator:
+        data["operator"] = operator
     try:
         result = meter_repo.update_meter(meter_id, data)
     except ValueError as e:
         raise HTTPException(400, str(e))
     if not result:
         raise HTTPException(404, "电表不存在")
-    # 动态生成：电表归属（landlord/brand）变更后，自动生成其有读数月份的台账
+
+    # 换主体：默认重算该电表全部有读数月份（历史台账整体搬到新主体）；
+    # entityRegenerateFrom="current" 时仅从本月起重算（历史月保留在原主体口径下）
+    entity_changed = result.get("entity_id") != old_meter.get("entity_id")
+    affected_months: list = []
+    if entity_changed:
+        conn = get_connection()
+        cur = get_dict_cursor(conn)
+        try:
+            cur.execute("""
+                SELECT DISTINCT month_period AS p FROM meter_monthly
+                WHERE address = %s ORDER BY p
+            """, (result.get("meter_no"),))
+            affected_months = [r["p"] for r in cur.fetchall()]
+        finally:
+            cur.close()
+            conn.close()
+
+    from_period = None
+    if entity_changed and data.get("entityRegenerateFrom") == "current":
+        from_period = datetime.now().strftime("%Y%m")
+
+    # 动态生成：电表归属（landlord/brand/entity）变更后，自动生成其有读数月份的台账
     from .electricity import auto_generate_for_meter
     try:
-        await auto_generate_for_meter(result.get("meter_no") or data.get("meterNo"))
+        await auto_generate_for_meter(result.get("meter_no") or data.get("meterNo"), from_period=from_period)
     except Exception:
         pass  # 自动生成失败不影响电表保存（可手动点「自动生成」）
     # 分红联动：重算新旧场地的已有分红记录（失败不影响保存）
@@ -334,6 +360,8 @@ async def update_meter(meter_id: int, request: Request, data: dict):
             refresh_dividend_records(lid)
     except Exception:
         pass
+    if entity_changed:
+        return {**result, "entityChanged": True, "affectedMonths": affected_months}
     return result
 
 

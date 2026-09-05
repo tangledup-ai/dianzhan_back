@@ -91,3 +91,112 @@ SELECT l.id, l.contact, l.phone, '存量业主（自动迁移）'
 FROM landlords l
 WHERE l.contact IS NOT NULL AND l.contact <> ''
   AND NOT EXISTS (SELECT 1 FROM landlord_owners o WHERE o.landlord_id = l.id AND o.owner_name = l.contact);
+
+-- ── 9) electricity_records 加公司主体维度（三元分组：场地×品牌×主体）──
+-- 归属原则：电费按电表的 meters.entity_id 归属（一表一主体）。
+ALTER TABLE electricity_records ADD COLUMN IF NOT EXISTS entity_id INTEGER;
+CREATE INDEX IF NOT EXISTS idx_elec_records_entity ON electricity_records(entity_id);
+
+-- 存量回填：按明细电表的主体众数归属（只填空 NULL，不覆盖已有值；跨主体的旧行下次重生成时自动拆行）
+UPDATE electricity_records e
+SET entity_id = (
+    SELECT m.entity_id FROM electricity_meter_details d
+    JOIN meters m ON m.id = d.meter_id
+    WHERE d.electricity_id = e.id AND m.entity_id IS NOT NULL
+    GROUP BY m.entity_id ORDER BY COUNT(*) DESC, m.entity_id LIMIT 1
+)
+WHERE e.entity_id IS NULL;
+
+-- 旧「场地×品牌×月」唯一约束/唯一索引会拦截同场地同品牌的跨主体拆行，必须移除；
+-- 唯一性改由下方表达式索引承担（COALESCE 让可空的 brand/entity 参与 != 比较）。
+-- 不依赖具体名字（各库建的约束/索引名不同），按"列组恰好 = landlord+brand+period 的唯一键"识别。
+DO $$
+DECLARE
+    r RECORD;
+BEGIN
+    FOR r IN
+        SELECT c.conname AS name, NULL::text AS schema, 'CONSTRAINT' AS kind
+        FROM pg_constraint c
+        WHERE c.conrelid = 'electricity_records'::regclass AND c.contype = 'u'
+          AND (SELECT array_agg(a.attname::text ORDER BY a.attname) FROM unnest(c.conkey) k
+               JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k)
+              = ARRAY['brand_id', 'landlord_id', 'period']::text[]
+        UNION ALL
+        SELECT i.relname AS name, ns.nspname AS schema, 'INDEX' AS kind
+        FROM pg_index x
+        JOIN pg_class i ON i.oid = x.indexrelid
+        JOIN pg_namespace ns ON ns.oid = i.relnamespace
+        WHERE x.indrelid = 'electricity_records'::regclass AND x.indisunique AND NOT x.indisprimary
+          AND (SELECT array_agg(a.attname::text ORDER BY a.attname) FROM unnest(x.indkey::smallint[]) k
+               JOIN pg_attribute a ON a.attrelid = x.indrelid AND a.attnum = k)
+              = ARRAY['brand_id', 'landlord_id', 'period']::text[]
+    LOOP
+        IF r.kind = 'CONSTRAINT' THEN
+            EXECUTE format('ALTER TABLE electricity_records DROP CONSTRAINT %I', r.name);
+        ELSE
+            EXECUTE format('DROP INDEX %I.%I', r.schema, r.name);
+        END IF;
+    END LOOP;
+END $$;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_elec_records_group
+    ON electricity_records (landlord_id, COALESCE(brand_id, 0), COALESCE(entity_id, 0), period);
+
+-- ── 10) 电表换主体审计（回答"这块表某月为什么算到某主体"）────────
+CREATE TABLE IF NOT EXISTS meter_entity_changes (
+    id SERIAL PRIMARY KEY,
+    meter_id INTEGER NOT NULL REFERENCES meters(id) ON DELETE CASCADE,
+    meter_no VARCHAR(100),
+    from_entity_id INTEGER,
+    to_entity_id INTEGER,
+    operator VARCHAR(64),
+    remark TEXT,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_meter_entity_changes_meter ON meter_entity_changes (meter_id, created_at DESC);
+
+-- ── 11) entities 报税法人档案补全 ────────────────────────────
+ALTER TABLE entities ADD COLUMN IF NOT EXISTS tax_no VARCHAR(50);
+ALTER TABLE entities ADD COLUMN IF NOT EXISTS taxpayer_type VARCHAR(20);
+ALTER TABLE entities ADD COLUMN IF NOT EXISTS invoice_bank VARCHAR(200);
+ALTER TABLE entities ADD COLUMN IF NOT EXISTS invoice_account VARCHAR(100);
+ALTER TABLE entities ADD COLUMN IF NOT EXISTS invoice_address VARCHAR(300);
+ALTER TABLE entities ADD COLUMN IF NOT EXISTS invoice_phone VARCHAR(50);
+ALTER TABLE entities ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT '启用';
+ALTER TABLE entities ADD COLUMN IF NOT EXISTS sort INTEGER DEFAULT 0;
+UPDATE entities SET status = '启用' WHERE status IS NULL;
+
+-- ── 12) operating_expenses 按主体（entity_id NULL=场地公共，按柜数分摊）──
+ALTER TABLE operating_expenses ADD COLUMN IF NOT EXISTS entity_id INTEGER;
+CREATE INDEX IF NOT EXISTS idx_op_expenses_entity ON operating_expenses(entity_id);
+
+-- 旧「场地×月」唯一键（约束或唯一索引，名字因库而异）按列组识别后移除：
+-- 同场地同月允许 公共(一条)+各主体(各一条) 多笔并存，防重由应用层按 (场地,月,主体) upsert 承担
+DO $$
+DECLARE
+    r RECORD;
+BEGIN
+    FOR r IN
+        SELECT c.conname AS name, NULL::text AS schema, 'CONSTRAINT' AS kind
+        FROM pg_constraint c
+        WHERE c.conrelid = 'operating_expenses'::regclass AND c.contype = 'u'
+          AND (SELECT array_agg(a.attname::text ORDER BY a.attname) FROM unnest(c.conkey) k
+               JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k)
+              = ARRAY['landlord_id', 'period']::text[]
+        UNION ALL
+        SELECT i.relname AS name, ns.nspname AS schema, 'INDEX' AS kind
+        FROM pg_index x
+        JOIN pg_class i ON i.oid = x.indexrelid
+        JOIN pg_namespace ns ON ns.oid = i.relnamespace
+        WHERE x.indrelid = 'operating_expenses'::regclass AND x.indisunique AND NOT x.indisprimary
+          AND (SELECT array_agg(a.attname::text ORDER BY a.attname) FROM unnest(x.indkey::smallint[]) k
+               JOIN pg_attribute a ON a.attrelid = x.indrelid AND a.attnum = k)
+              = ARRAY['landlord_id', 'period']::text[]
+    LOOP
+        IF r.kind = 'CONSTRAINT' THEN
+            EXECUTE format('ALTER TABLE operating_expenses DROP CONSTRAINT %I', r.name);
+        ELSE
+            EXECUTE format('DROP INDEX %I.%I', r.schema, r.name);
+        END IF;
+    END LOOP;
+END $$;

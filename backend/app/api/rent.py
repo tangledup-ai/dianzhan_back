@@ -30,11 +30,13 @@ async def list_expenses(request: Request, stationId: int = None, landlordId: int
 async def save_expense(data: dict):
     # period 统一为 6 位 YYYYMM 后入库，保证与分红计算（dividend_calc 用 6 位查）同口径
     period = to_compact(data.get("period"))
+    entity_id = data.get("entityId")
     result = rent_repo.save_expense(
         landlord_id=data.get("landlordId"),
         period=period,
         amount=data.get("amount"),
         remark=data.get("remark"),
+        entity_id=int(entity_id) if entity_id else None,
     )
     # 自动更新该场地该月的分红记录
     _update_dividend_records(data.get("landlordId"), period)

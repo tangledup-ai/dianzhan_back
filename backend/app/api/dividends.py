@@ -113,10 +113,14 @@ async def get_dividend(record_id: int, request: Request):
         raise HTTPException(403, "无权查看该分红记录")
     shares = dividend_repo.get_shares(record_id)
 
-    # 获取数据来源明细（v3 主源：电费台账(landlord×brand) + contracts 租金 + 运营费用）
+    # 获取数据来源明细（v3.1 主源：电费台账(landlord×brand×entity) + contracts 租金 + 运营费用）
     from ..repositories import electricity_repo, contract_repo, rent_repo
-    elec = electricity_repo.get_record_by_landlord_brand_period(record["landlord_id"], record.get("brand_id"), record["period"])
-    elec_details = electricity_repo.get_meter_details(elec["id"]) if elec else []
+    # 主体拆行：同 场地×品牌×月 可能有多行（每主体一行），明细取各行并集
+    elec_records = electricity_repo.list_records_by_landlord_brand_period(
+        record["landlord_id"], record.get("brand_id"), record["period"])
+    elec_details = []
+    for er in elec_records:
+        elec_details.extend(electricity_repo.get_meter_details(er["id"]))
     # 租金数据源：场地合同=成本，品牌方合同=收入
     contracts = contract_repo.list_contracts(landlord_id=record["landlord_id"]) if record.get("landlord_id") else []
     leases = [c for c in contracts if c.get("contract_type") == "场地合同"]
