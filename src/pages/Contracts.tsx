@@ -765,7 +765,7 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
   // 口径与后端 contract_repo live_cabinets_count/total_brand_cabinets 一致：
   // 每块电表按 1 柜计（即 GREATEST(1,柜数)），仅排除 TEST 前缀电表；
   // 场地总柜数含共享电表，全品牌合同（不指定品牌）按共享电表计
-  const venueCostLive = useMemo(() => {
+  const venueCostInfo = useMemo(() => {
     if (!f.landlordId || f.contractType !== "品牌方合同") return null;
     const landlordId = Number(f.landlordId);
     const isShared = !f.brandId || f.brandId === "shared";
@@ -775,7 +775,6 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
     const venueMonthlyRent = (contracts.data ?? [])
       .filter((c: any) => c.landlordId === landlordId && c.contractType === "场地合同")
       .reduce((sum: number, c: any) => sum + Number(c.monthlyRent || 0), 0);
-    if (!venueMonthlyRent) return null;
 
     // 2) 该场地下已归属品牌的电表 + 共享电表（排除 TEST 前缀，与后端 NOT LIKE 'TEST%' 一致）
     const siteMeters = (meters.data ?? []).filter(
@@ -787,10 +786,14 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
       ? siteMeters.filter((m: any) => !m.brandId).length
       : siteMeters.filter((m: any) => m.brandId === brandId).length;
     const totalCabs = siteMeters.length;
-    if (!totalCabs) return null;
 
-    return Math.round((venueMonthlyRent / totalCabs) * liveCabs * 100) / 100;
+    // 无场地合同（月租合计 0）与 无电表可分摊（总柜数 0）是两种不同情况，展示时区分提示
+    const value = venueMonthlyRent > 0 && totalCabs > 0
+      ? Math.round((venueMonthlyRent / totalCabs) * liveCabs * 100) / 100
+      : null;
+    return { venueMonthlyRent, liveCabs, totalCabs, value };
   }, [f.landlordId, f.brandId, f.contractType, contracts.data, meters.data]);
+  const venueCostLive = venueCostInfo?.value ?? null;
 
   // 当使用"按柜子数量"方式时，自动计算场地月租金，并同步年租金 = 月租金 × 12
   useEffect(() => {
@@ -1178,7 +1181,10 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
                   <span className="block text-[10px] font-normal text-slate-400">根据场地合同月租金和所有品牌方计费柜数自动计算，不可编辑</span>
                 </span>
                 <div className="flex h-9 items-center rounded-md border border-slate-200 bg-slate-50 px-3 text-sm text-amber-600 font-semibold tabular-nums">
-                  {venueCostLive != null ? fmtMoney(venueCostLive) : (record?.venueCost ? fmtMoney(record.venueCost) : "暂无场地合同")}
+                  {venueCostLive != null ? fmtMoney(venueCostLive)
+                    : venueCostInfo && venueCostInfo.venueMonthlyRent > 0 && venueCostInfo.totalCabs === 0
+                      ? <span className="text-[11px] font-normal text-amber-700">该场地暂未关联计费电表，无法分摊（去「智慧电表」关联后自动计算）</span>
+                      : (record?.venueCost ? fmtMoney(record.venueCost) : "暂无场地合同")}
                 </div>
               </div>
               <Field label="电费收款单价（税前·元/度）"><NumInput value={f.electricityPrice} onChange={set("electricityPrice")} placeholder="1.20" /></Field>
