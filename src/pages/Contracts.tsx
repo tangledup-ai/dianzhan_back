@@ -949,7 +949,8 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
       latitude: numOrNull(f.latitude),
       longitude: numOrNull(f.longitude),
       payEntity: f.payEntity || null,
-      entityId: f.entityId ? Number(f.entityId) : null,
+      // 主体归属：场地合同可选（默认继承来源）；品牌方合同以电表主体为准，不再携带
+      entityId: f.contractType === "场地合同" ? (f.entityId ? Number(f.entityId) : null) : null,
       startDate: f.startDate || null,
       endDate: f.endDate || null,
       taxEnabled,
@@ -1029,16 +1030,21 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
                 </Field>
               </>
             )}
-            <Field label="收付款主体">
-              <SearchSelect value={f.entityId} onChange={set("entityId")}
-                placeholder="未指定（可搜索公司主体）"
-                options={(entities.data ?? []).map((e: any) => ({ value: String(e.id), label: e.name }))} />
-              <div className="-mt-1.5 text-[11px] text-slate-400">
-                {f.contractType === "品牌方合同"
-                  ? "同一场地同一品牌可按主体拆签多份合同（各自不同收款主体），电费/租金按电表主体精确匹配"
-                  : "场地成本默认全额归该主体；不指定时按柜数分摊到场地内各主体"}
+            {f.contractType === "场地合同" && (
+              <Field label="收付款主体">
+                <SearchSelect value={f.entityId} onChange={set("entityId")}
+                  placeholder="未指定（可搜索公司主体）"
+                  options={(entities.data ?? []).map((e: any) => ({ value: String(e.id), label: e.name }))} />
+                <div className="-mt-1.5 text-[11px] text-slate-400">
+                  场地成本默认全额归该主体；不指定时按柜数分摊到场地内各主体
+                </div>
+              </Field>
+            )}
+            {f.contractType === "品牌方合同" && (
+              <div className="rounded border border-slate-200 bg-slate-50/60 px-2.5 py-1.5 text-[11px] leading-5 text-slate-500 md:col-span-2">
+                报税主体以电表关联为准（在「智慧电表」页为每块电表设置）：租金收入会按该场地该品牌电表的柜数自动分摊到各主体，无需在此选择。
               </div>
-            </Field>
+            )}
           </FormSection>
 
           {f.contractType === "场地合同" && (

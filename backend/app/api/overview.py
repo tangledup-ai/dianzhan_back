@@ -513,7 +513,7 @@ async def monthly_detail(request: Request, period: str = None):
         from ..domain.electricity_pricing import rent_income_for_period, rent_refund_for_period
         if allowed is not None:
             cur.execute("""
-                SELECT c.brand_id, b.name as brand_name, c.monthly_rent,
+                SELECT c.brand_id, c.landlord_id, b.name as brand_name, c.monthly_rent,
                        c.start_date, c.end_date, c.early_end_date, c.first_month_rent, c.rent_refund,
                        c.rent_tax_enabled, c.post_tax_rent_price,
                        c.entity_id, e.name as entity_name, c.pay_entity
@@ -531,7 +531,7 @@ async def monthly_detail(request: Request, period: str = None):
             """, (allowed,))
         else:
             cur.execute("""
-                SELECT c.brand_id, b.name as brand_name, c.monthly_rent,
+                SELECT c.brand_id, c.landlord_id, b.name as brand_name, c.monthly_rent,
                        c.start_date, c.end_date, c.early_end_date, c.first_month_rent, c.rent_refund,
                        c.rent_tax_enabled, c.post_tax_rent_price,
                        c.entity_id, e.name as entity_name, c.pay_entity
@@ -559,17 +559,73 @@ async def monthly_detail(request: Request, period: str = None):
         )
         rent_profit = round(rent_income - rent_cost - rent_tax, 2)
 
-        # 明细按公司主体汇总（首页只看主体级汇总；收入含首月/退款当月口径，成本为月租金合计）
+        # 电表柜数权重（主体归属：与主体损益表同口径；每块计费电表至少 1 柜）
+        cur.execute(f"""
+            SELECT m.landlord_id, m.entity_id, m.brand_id,
+                   COALESCE(SUM(GREATEST(1, cab.cnt)), 0) AS cabs
+            FROM meters m
+            LEFT JOIN LATERAL (SELECT COUNT(*) AS cnt FROM cabinets cab WHERE cab.meter_id = m.id) cab ON TRUE
+            WHERE m.landlord_id IS NOT NULL AND m.meter_no NOT LIKE 'TEST%%'
+              AND (m.brand_id IS NOT NULL OR m.tag = '共享电表')
+              {'AND m.landlord_id = ANY(%s::int[])' if allowed is not None else ''}
+            GROUP BY m.landlord_id, m.entity_id, m.brand_id
+        """, (allowed,) if allowed is not None else ())
+        weights_brand: dict = {}   # (landlord, brand) -> {entity_id: 柜数}
+        weights_ll: dict = {}      # landlord -> {entity_id: 柜数}
+        for r in cur.fetchall():
+            cabs = float(r["cabs"] or 0)
+            weights_brand.setdefault((r["landlord_id"], r["brand_id"]), {}).setdefault(r["entity_id"], 0.0)
+            weights_brand[(r["landlord_id"], r["brand_id"])][r["entity_id"]] += cabs
+            weights_ll.setdefault(r["landlord_id"], {}).setdefault(r["entity_id"], 0.0)
+            weights_ll[r["landlord_id"]][r["entity_id"]] += cabs
+        cur.execute("SELECT id, name FROM entities")
+        entity_names = {r["id"]: r["name"] for r in cur.fetchall()}
+
+        def _split_by_cabs(amount: float, wmap: dict) -> list:
+            """按柜数权重把金额拆到主体；无权重时整笔归未指定（None）"""
+            total_w = sum(w for w in wmap.values() if w > 0)
+            if total_w <= 0:
+                return [(None, amount)]
+            out, rest = [], amount
+            eids = sorted([e for e in wmap if wmap[e] > 0], key=lambda x: (x is None, x))
+            for i, eid in enumerate(eids):
+                share = round(amount * wmap[eid] / total_w, 2)
+                if i == len(eids) - 1:
+                    share = round(rest, 2)
+                rest = round(rest - share, 2)
+                out.append((eid, share))
+            return out
+
+        def _group_name(eid) -> str:
+            return (entity_names.get(eid) if eid is not None else None) or "未指定主体"
+
+        # 明细按公司主体汇总（收入含首月/退款当月口径，成本为月租金合计）。
+        # 品牌方合同不再携带收付款主体（主体以电表为准）：未指定主体的合同
+        # 按该场地该品牌电表柜数分摊到各主体；场地合同未指定主体按场地内柜数分摊。
         income_groups: dict = {}
         for c in rent_income_contracts:
-            g = income_groups.setdefault(_entity_group_name(c), {"entityName": _entity_group_name(c), "contractCount": 0, "amount": 0.0})
-            g["contractCount"] += 1
-            g["amount"] += rent_income_for_period(c, month_compact) - rent_refund_for_period(c, month_compact)
+            amount = rent_income_for_period(c, month_compact) - rent_refund_for_period(c, month_compact)
+            if c.get("entity_id") is not None:
+                allocs = [(c["entity_id"], amount)]
+            else:
+                allocs = _split_by_cabs(amount, weights_brand.get((c.get("landlord_id"), c.get("brand_id")), {}))
+            for eid, share in allocs:
+                name = _group_name(eid)
+                g = income_groups.setdefault(name, {"entityName": name, "contractCount": 0, "amount": 0.0})
+                g["contractCount"] += 1
+                g["amount"] += share
         cost_groups: dict = {}
         for c in rent_cost_contracts:
-            g = cost_groups.setdefault(_entity_group_name(c), {"entityName": _entity_group_name(c), "contractCount": 0, "amount": 0.0})
-            g["contractCount"] += 1
-            g["amount"] += float(c["monthly_rent"] or 0)
+            amount = float(c["monthly_rent"] or 0)
+            if c.get("entity_id") is not None:
+                allocs = [(c["entity_id"], amount)]
+            else:
+                allocs = _split_by_cabs(amount, weights_ll.get(c.get("landlord_id"), {}))
+            for eid, share in allocs:
+                name = _group_name(eid)
+                g = cost_groups.setdefault(name, {"entityName": name, "contractCount": 0, "amount": 0.0})
+                g["contractCount"] += 1
+                g["amount"] += share
         rent_income_details = sorted(income_groups.values(), key=lambda g: -g["amount"])
         rent_cost_details = sorted(cost_groups.values(), key=lambda g: -g["amount"])
 
