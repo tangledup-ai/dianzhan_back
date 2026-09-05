@@ -77,10 +77,11 @@ function AddShareholderDialog({ open, onClose }: { open: boolean; onClose: () =>
 }
 
 // ─── 配置分红弹窗（股东/介绍人；品牌范围 + 模式 + 周期 + 生效期；支持编辑已有配置）───
-function ConfigDividendDialog({ open, onClose, type, landlordId, brands, editingConfig }: { open: boolean; onClose: () => void; type: "shareholder" | "introducer"; landlordId?: number; brands?: any[]; editingConfig?: any | null }) {
+function ConfigDividendDialog({ open, onClose, type, landlordId, brands, entities, editingConfig }: { open: boolean; onClose: () => void; type: "shareholder" | "introducer"; landlordId?: number; brands?: any[]; entities?: any[]; editingConfig?: any | null }) {
   const qc = useQueryClient();
   const [targetId, setTargetId] = useState<number | null>(null);
   const [brandId, setBrandId] = useState<number | "">("");
+  const [entityId, setEntityId] = useState<number | "">("");
   const [mode, setMode] = useState("利润分红");
   const [ratio, setRatio] = useState("");
   const [fixedAmount, setFixedAmount] = useState("");
@@ -94,6 +95,7 @@ function ConfigDividendDialog({ open, onClose, type, landlordId, brands, editing
     if (open && editingConfig) {
       setTargetId(editingConfig.shareholderId ?? editingConfig.introducerId ?? null);
       setBrandId(editingConfig.brandId ?? "");
+      setEntityId(editingConfig.entityId ?? "");
       setMode(editingConfig.mode || "利润分红");
       setRatio(editingConfig.mode !== "固定金额" ? String(Math.round((editingConfig.ratio || 0) * 10000) / 100) : "");
       setFixedAmount(editingConfig.mode === "固定金额" ? String(editingConfig.fixedAmount ?? "") : "");
@@ -102,7 +104,7 @@ function ConfigDividendDialog({ open, onClose, type, landlordId, brands, editing
       setStartDate(editingConfig.startDate ? String(editingConfig.startDate).slice(0, 10) : "");
       setEndDate(editingConfig.endDate ? String(editingConfig.endDate).slice(0, 10) : "");
     } else if (open) {
-      setTargetId(null); setBrandId(""); setMode("利润分红"); setRatio("");
+      setTargetId(null); setBrandId(""); setEntityId(""); setMode("利润分红"); setRatio("");
       setFixedAmount(""); setCountAsCost(false); setDividendPeriod("月");
       setStartDate(""); setEndDate("");
     }
@@ -120,8 +122,8 @@ function ConfigDividendDialog({ open, onClose, type, landlordId, brands, editing
       if (mode !== "固定金额" && !ratio) throw new Error("请输入比例");
       if (mode === "固定金额" && !fixedAmount) throw new Error("请输入固定金额");
       const body: any = type === "shareholder"
-        ? { landlordId, shareholderId: targetId, brandId: brandId || null, mode, ratio: mode !== "固定金额" ? Number(ratio) / 100 : null, fixedAmount: mode === "固定金额" ? Number(fixedAmount) : null, settlementPeriod: dividendPeriod, startDate: startDate || null, endDate: endDate || null }
-        : { landlordId, introducerId: targetId, brandId: brandId || null, mode, ratio: mode !== "固定金额" ? Number(ratio) / 100 : null, fixedAmount: mode === "固定金额" ? Number(fixedAmount) : null, countAsCost, settlementPeriod: dividendPeriod, startDate: startDate || null, endDate: endDate || null };
+        ? { landlordId, shareholderId: targetId, brandId: brandId || null, entityId: entityId || null, mode, ratio: mode !== "固定金额" ? Number(ratio) / 100 : null, fixedAmount: mode === "固定金额" ? Number(fixedAmount) : null, settlementPeriod: dividendPeriod, startDate: startDate || null, endDate: endDate || null }
+        : { landlordId, introducerId: targetId, brandId: brandId || null, entityId: entityId || null, mode, ratio: mode !== "固定金额" ? Number(ratio) / 100 : null, fixedAmount: mode === "固定金额" ? Number(fixedAmount) : null, countAsCost, settlementPeriod: dividendPeriod, startDate: startDate || null, endDate: endDate || null };
       if (editingConfig?.id) body.configId = editingConfig.id;
       return type === "shareholder" ? saveShareholderConfig(body) : saveIntroducerConfig(body);
     },
@@ -161,6 +163,16 @@ function ConfigDividendDialog({ open, onClose, type, landlordId, brands, editing
               {brands?.map((b: any) => <option key={b.id} value={b.id}>{b.name}</option>)}
             </select>
             <div className="mt-1 text-[10px] text-slate-400">选择品牌则只参与该品牌的分红；留空参与场地全部分红</div>
+          </div>
+          <div>
+            <label className="mb-1 block text-xs text-slate-500">主体范围</label>
+            <select className={inputCls} value={entityId} onChange={e => setEntityId(e.target.value ? Number(e.target.value) : "")}>
+              <option value="">不按主体（默认）</option>
+              {(entities ?? []).map((en: any) => <option key={en.id} value={en.id}>{en.name}</option>)}
+            </select>
+            <div className="mt-1 text-[10px] text-slate-400">
+              选择主体则分红基数 = 该主体在本场地的收入/利润（跨品牌归集）；与品牌同时选择时按品牌优先
+            </div>
           </div>
           <div>
             <label className="mb-1 block text-xs text-slate-500">分红模式</label>
@@ -1743,7 +1755,7 @@ export default function Shareholders() {
 
       {/* ─── 弹窗 ─── */}
       <AddShareholderDialog open={addShareholderOpen} onClose={() => setAddShareholderOpen(false)} />
-      <ConfigDividendDialog open={configOpen.open} onClose={() => setConfigOpen({ ...configOpen, open: false, config: null })} type={configOpen.type} editingConfig={configOpen.config} landlordId={configOpen.config?.landlordId ?? landlordId ?? undefined} brands={configOpen.config?.landlordId ? brandsOfLandlord(configOpen.config.landlordId) : landlordBrands} />
+      <ConfigDividendDialog open={configOpen.open} onClose={() => setConfigOpen({ ...configOpen, open: false, config: null })} type={configOpen.type} editingConfig={configOpen.config} landlordId={configOpen.config?.landlordId ?? landlordId ?? undefined} brands={configOpen.config?.landlordId ? brandsOfLandlord(configOpen.config.landlordId) : landlordBrands} entities={entitiesQ.data ?? []} />
       <AddDividendDialog open={addDividendOpen} onClose={() => setAddDividendOpen(false)} landlordId={landlordId ?? undefined} defaultPeriod={periodEnd} estimatePreview={endMonthPreview} />
       {detail && <DividendDetailDialog open={detail.open} onClose={() => setDetail(null)} landlordName={detail.landlordName} personName={detail.personName} months={detail.months} monthDatas={detail.monthDatas} personKey={detail.personKey} personId={detail.personId} />}
     </div>

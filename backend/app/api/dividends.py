@@ -184,6 +184,7 @@ async def create_dividend(data: dict):
             dividend_repo.create_share(record["id"], {
                 "introducerId": d["introducerId"],
                 "brandId": d.get("brandId"),
+                "entityId": d.get("entityId"),
                 "mode": d["mode"],
                 "ratio": d.get("ratio"),
                 "fixedAmount": d.get("fixedAmount"),
@@ -194,6 +195,7 @@ async def create_dividend(data: dict):
             dividend_repo.create_share(record["id"], {
                 "shareholderId": d["shareholderId"],
                 "brandId": d.get("brandId"),
+                "entityId": d.get("entityId"),
                 "mode": d["mode"],
                 "ratio": d.get("ratio"),
                 "fixedAmount": d.get("fixedAmount"),

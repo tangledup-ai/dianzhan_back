@@ -585,9 +585,10 @@ function MeterForm({ open, onClose, record }: { open: boolean; onClose: () => vo
   // 编号唯一校验用（与列表页共用缓存，不额外发请求）
   const meters = useQuery({ queryKey: ["meters"], queryFn: () => listMeters(), enabled: open });
 
-  // 换主体确认：编辑时主体变了 → 列出有读数的月份，选择历史台账重算范围
+  // 换主体确认：编辑时主体变了 → 列出有读数的月份，选择历史台账重算范围（生效月）
   const originalEntityId = record ? (record.entityId ? String(record.entityId) : "") : "";
-  const [regenScope, setRegenScope] = useState<"all" | "current">("all");
+  const [regenScope, setRegenScope] = useState<"all" | "current" | "period">("all");
+  const [regenPeriod, setRegenPeriod] = useState(() => new Date().toISOString().slice(0, 7));
   const entityChanged = !!record && f.entityId !== originalEntityId;
   const affectedReadings = useQuery({
     queryKey: ["meterReadings", record?.meterNo],
@@ -658,7 +659,10 @@ function MeterForm({ open, onClose, record }: { open: boolean; onClose: () => vo
       brandId: !isShared && f.brandId ? Number(f.brandId) : null,
       landlordId: f.landlordId ? Number(f.landlordId) : null,
       entityId: f.entityId ? Number(f.entityId) : null,
-      ...(entityChanged ? { entityRegenerateFrom: regenScope } : {}),
+      ...(entityChanged ? {
+        entityRegenerateFrom: regenScope,
+        entityRegenerateFromPeriod: regenScope === "period" ? toCompact(regenPeriod) : undefined,
+      } : {}),
       meterNo: meterNo,
       meterName: f.meterName.trim() || null,
       collectorId: f.collectorId.trim() || null,
@@ -721,7 +725,7 @@ function MeterForm({ open, onClose, record }: { open: boolean; onClose: () => vo
               ) : (
                 <div>该电表暂无历史读数，保存后不影响台账</div>
               )}
-              <div className="flex gap-4 pt-0.5">
+              <div className="flex flex-wrap gap-x-4 gap-y-1.5 pt-0.5">
                 <label className="flex cursor-pointer items-center gap-1.5">
                   <input type="radio" name="regenScope" className="accent-amber-600" checked={regenScope === "all"} onChange={() => setRegenScope("all")} />
                   全部历史重算（推荐）
@@ -730,6 +734,14 @@ function MeterForm({ open, onClose, record }: { open: boolean; onClose: () => vo
                   <input type="radio" name="regenScope" className="accent-amber-600" checked={regenScope === "current"} onChange={() => setRegenScope("current")} />
                   仅从本月起
                 </label>
+                <label className="flex cursor-pointer items-center gap-1.5">
+                  <input type="radio" name="regenScope" className="accent-amber-600" checked={regenScope === "period"} onChange={() => setRegenScope("period")} />
+                  从指定月起
+                </label>
+                {regenScope === "period" && (
+                  <input type="month" className="rounded border border-amber-300 px-2 py-0.5 text-[11px]"
+                    value={regenPeriod} onChange={(e) => setRegenPeriod(e.target.value)} />
+                )}
               </div>
             </div>
           )}

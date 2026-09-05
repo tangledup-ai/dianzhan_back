@@ -343,8 +343,16 @@ async def update_meter(meter_id: int, request: Request, data: dict):
             conn.close()
 
     from_period = None
-    if entity_changed and data.get("entityRegenerateFrom") == "current":
-        from_period = datetime.now().strftime("%Y%m")
+    if entity_changed:
+        # 三期：重算范围支持 生效月 —— "all"=全部历史（默认）/"current"=本月起/"period"=指定月起
+        scope = data.get("entityRegenerateFrom")
+        if scope == "current":
+            from_period = datetime.now().strftime("%Y%m")
+        elif scope == "period" and data.get("entityRegenerateFromPeriod"):
+            cand = str(data["entityRegenerateFromPeriod"]).replace("-", "")
+            if len(cand) == 6 and cand.isdigit():
+                from_period = cand
+        data["entityEffectivePeriod"] = from_period  # 审计表记录生效月（None=全量重算）
 
     # 动态生成：电表归属（landlord/brand/entity）变更后，自动生成其有读数月份的台账
     from .electricity import auto_generate_for_meter

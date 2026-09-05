@@ -15,10 +15,10 @@ def compute_landlord_ledger(cur, landlord_id: int, period: str):
     Returns:
         (meter_details, totals) 与 generate 的明细/合计结构一致。
     """
-    from ..domain.electricity_pricing import resolve_prices, brand_collect_price
+    from ..domain.electricity_pricing import resolve_prices, brand_collect_price, brand_price_for
 
     cur.execute("""
-        SELECT m.id, m.meter_no, m.brand_id, m.transformer_ratio,
+        SELECT m.id, m.meter_no, m.brand_id, m.entity_id, m.transformer_ratio,
                b.name as brand_name
         FROM meters m
         LEFT JOIN brands b ON m.brand_id = b.id
@@ -64,8 +64,8 @@ def compute_landlord_ledger(cur, landlord_id: int, period: str):
         total_pay_kwh += actual_kwh
         total_collect_kwh += actual_kwh
 
-        # 共享电表（无品牌）取「全品牌合同」单价；无合同 → 收入为 0
-        brand_info = pricing["brand_prices"].get(int(m["brand_id"])) if m.get("brand_id") else pricing.get("shared_price")
+        # 收款单价（v3.2 主体感知）：按电表品牌+主体匹配拆签合同；共享电表（无品牌）取「全品牌合同」单价，无合同 → 收入为 0
+        brand_info = brand_price_for(pricing, m.get("brand_id"), m.get("entity_id")) if m.get("brand_id") else pricing.get("shared_price")
         brand_price = brand_info["price"] if brand_info else None
         # 税费仅在启用税率且合同有税率时按「收入×税率」扣（税费 = 含税收入 × 税率）
         detail_rate = brand_info["tax_rate"] if (brand_info and brand_info.get("tax_enabled")) else None
@@ -511,7 +511,7 @@ async def generate_electricity(data: dict):
 
             contracts = landlord_contracts_map.get(lid, []) if lid else []
             # 统一单价解析（#2）：付款=场地合同唯一单价；收款=按品牌匹配品牌方合同单价
-            from ..domain.electricity_pricing import resolve_prices, brand_collect_price
+            from ..domain.electricity_pricing import resolve_prices, brand_collect_price, brand_price_for
             pricing = resolve_prices(contracts)
             landlord_price = pricing["pay_price"]
 
@@ -528,8 +528,8 @@ async def generate_electricity(data: dict):
             first_brand_info = next(iter(pricing["brand_prices"].values()), None) or pricing.get("shared_price")
             tax_rate = float(first_brand_info["tax_rate"]) if first_brand_info else 0.01
 
-            # 记录级收款单价（表头展示用）：取该品牌合同单价（共享组取全品牌合同单价）
-            brand_info0 = pricing["brand_prices"].get(bid) if bid is not None else pricing.get("shared_price")
+            # 记录级收款单价（表头展示用）：按组主体取该品牌合同单价（共享组取全品牌合同单价）
+            brand_info0 = brand_price_for(pricing, bid, eid)
             record_collect_price = brand_info0["price"] if brand_info0 else None
 
             # 计算度数（按电表分别匹配）
@@ -549,8 +549,8 @@ async def generate_electricity(data: dict):
                 total_pay_kwh += actual_kwh
                 total_collect_kwh += actual_kwh
 
-                # 收款单价：按电表品牌匹配；共享电表（无品牌）取「全品牌合同」单价，无合同 → 收入为 0
-                brand_info = pricing["brand_prices"].get(int(m["brand_id"])) if m.get("brand_id") else pricing.get("shared_price")
+                # 收款单价（v3.2 主体感知）：按电表品牌+主体匹配拆签合同；共享电表（无品牌）取「全品牌合同」单价，无合同 → 收入为 0
+                brand_info = brand_price_for(pricing, m.get("brand_id"), m.get("entity_id")) if m.get("brand_id") else pricing.get("shared_price")
                 brand_price = brand_info["price"] if brand_info else None
                 # 税费仅在启用税率且合同有税率时按「收入×税率」扣（税费 = 含税收入 × 税率）
                 detail_rate = brand_info["tax_rate"] if (brand_info and brand_info.get("tax_enabled")) else None

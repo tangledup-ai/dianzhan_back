@@ -16,11 +16,12 @@ def list_shareholder_configs(landlord_id: int = None, brand_id: int = None):
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         cur.execute(f"""
             SELECT c.*, sh.name as shareholder_name, l.name as landlord_name,
-                   b.name as brand_name
+                   b.name as brand_name, ent.name as entity_name
             FROM landlord_shareholder_configs c
             LEFT JOIN shareholders sh ON c.shareholder_id = sh.id
             LEFT JOIN landlords l ON c.landlord_id = l.id
             LEFT JOIN brands b ON c.brand_id = b.id
+            LEFT JOIN entities ent ON c.entity_id = ent.id
             {where}
             ORDER BY c.id
         """, values)
@@ -35,10 +36,11 @@ def save_shareholder_config(data: dict):
     cur = get_dict_cursor(conn)
     try:
         brand_id = data.get("brandId")
+        entity_id = data.get("entityId")
         landlord_id = data.get("landlordId")
         shareholder_id = data.get("shareholderId")
         config_id = data.get("configId")
-        # v3：按 (场地, 股东, 品牌, 生效期) 匹配；start_date 为空视为 1970-01-01
+        # v3.2：按 (场地, 股东, 品牌, 主体, 生效期) 匹配；start_date 为空视为 1970-01-01
         existing = None
         if config_id:
             cur.execute("SELECT id FROM landlord_shareholder_configs WHERE id = %s", (config_id,))
@@ -48,8 +50,9 @@ def save_shareholder_config(data: dict):
                 SELECT id FROM landlord_shareholder_configs
                 WHERE landlord_id = %s AND shareholder_id = %s
                   AND COALESCE(brand_id, 0) = COALESCE(%s, 0)
+                  AND COALESCE(entity_id, 0) = COALESCE(%s, 0)
                   AND COALESCE(start_date, DATE '1970-01-01') = COALESCE(%s::date, DATE '1970-01-01')
-            """, (landlord_id, shareholder_id, brand_id, data.get("startDate")))
+            """, (landlord_id, shareholder_id, brand_id, entity_id, data.get("startDate")))
             existing = cur.fetchone()
 
         fields = (
@@ -61,20 +64,20 @@ def save_shareholder_config(data: dict):
         if existing:
             cur.execute("""
                 UPDATE landlord_shareholder_configs SET
-                    landlord_id = %s, shareholder_id = %s, brand_id = %s,
+                    landlord_id = %s, shareholder_id = %s, brand_id = %s, entity_id = %s,
                     mode = %s, ratio = %s, fixed_amount = %s,
                     settlement_period = %s, start_date = %s, end_date = %s,
                     remark = %s
                 WHERE id = %s
                 RETURNING *
-            """, (landlord_id, shareholder_id, brand_id, *fields, existing["id"]))
+            """, (landlord_id, shareholder_id, brand_id, entity_id, *fields, existing["id"]))
         else:
             cur.execute("""
                 INSERT INTO landlord_shareholder_configs
-                (landlord_id, shareholder_id, brand_id, mode, ratio, fixed_amount, settlement_period, start_date, end_date, remark)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                (landlord_id, shareholder_id, brand_id, entity_id, mode, ratio, fixed_amount, settlement_period, start_date, end_date, remark)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING *
-            """, (landlord_id, shareholder_id, brand_id, *fields))
+            """, (landlord_id, shareholder_id, brand_id, entity_id, *fields))
         conn.commit()
         return cur.fetchone()
     finally:
@@ -107,11 +110,12 @@ def list_introducer_configs(landlord_id: int = None, brand_id: int = None):
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         cur.execute(f"""
             SELECT c.*, i.name as introducer_name, l.name as landlord_name,
-                   b.name as brand_name
+                   b.name as brand_name, ent.name as entity_name
             FROM landlord_introducer_configs c
             LEFT JOIN introducers i ON c.introducer_id = i.id
             LEFT JOIN landlords l ON c.landlord_id = l.id
             LEFT JOIN brands b ON c.brand_id = b.id
+            LEFT JOIN entities ent ON c.entity_id = ent.id
             {where}
             ORDER BY c.id
         """, values)
@@ -126,10 +130,11 @@ def save_introducer_config(data: dict):
     cur = get_dict_cursor(conn)
     try:
         brand_id = data.get("brandId")
+        entity_id = data.get("entityId")
         landlord_id = data.get("landlordId")
         introducer_id = data.get("introducerId")
         config_id = data.get("configId")
-        # v3：按 (场地, 介绍人, 品牌, 生效期) 匹配；start_date 为空视为 1970-01-01
+        # v3.2：按 (场地, 介绍人, 品牌, 主体, 生效期) 匹配；start_date 为空视为 1970-01-01
         existing = None
         if config_id:
             cur.execute("SELECT id FROM landlord_introducer_configs WHERE id = %s", (config_id,))
@@ -139,8 +144,9 @@ def save_introducer_config(data: dict):
                 SELECT id FROM landlord_introducer_configs
                 WHERE landlord_id = %s AND introducer_id = %s
                   AND COALESCE(brand_id, 0) = COALESCE(%s, 0)
+                  AND COALESCE(entity_id, 0) = COALESCE(%s, 0)
                   AND COALESCE(start_date, DATE '1970-01-01') = COALESCE(%s::date, DATE '1970-01-01')
-            """, (landlord_id, introducer_id, brand_id, data.get("startDate")))
+            """, (landlord_id, introducer_id, brand_id, entity_id, data.get("startDate")))
             existing = cur.fetchone()
 
         fields = (
@@ -153,20 +159,20 @@ def save_introducer_config(data: dict):
         if existing:
             cur.execute("""
                 UPDATE landlord_introducer_configs SET
-                    landlord_id = %s, introducer_id = %s, brand_id = %s,
+                    landlord_id = %s, introducer_id = %s, brand_id = %s, entity_id = %s,
                     mode = %s, ratio = %s, fixed_amount = %s,
                     settlement_period = %s, count_as_cost = %s,
                     start_date = %s, end_date = %s, remark = %s
                 WHERE id = %s
                 RETURNING *
-            """, (landlord_id, introducer_id, brand_id, *fields, existing["id"]))
+            """, (landlord_id, introducer_id, brand_id, entity_id, *fields, existing["id"]))
         else:
             cur.execute("""
                 INSERT INTO landlord_introducer_configs
-                (landlord_id, introducer_id, brand_id, mode, ratio, fixed_amount, settlement_period, count_as_cost, start_date, end_date, remark)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                (landlord_id, introducer_id, brand_id, entity_id, mode, ratio, fixed_amount, settlement_period, count_as_cost, start_date, end_date, remark)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING *
-            """, (landlord_id, introducer_id, brand_id, *fields))
+            """, (landlord_id, introducer_id, brand_id, entity_id, *fields))
         conn.commit()
         return cur.fetchone()
     finally:
@@ -313,12 +319,12 @@ def create_share(dividend_id: int, data: dict):
     try:
         cur.execute("""
             INSERT INTO dividend_shares
-            (dividend_id, introducer_id, shareholder_id, brand_id, mode, ratio, fixed_amount, amount, remark)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            (dividend_id, introducer_id, shareholder_id, brand_id, entity_id, mode, ratio, fixed_amount, amount, remark)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING *
         """, (
             dividend_id,
-            data.get("introducerId"), data.get("shareholderId"), data.get("brandId"),
+            data.get("introducerId"), data.get("shareholderId"), data.get("brandId"), data.get("entityId"),
             data.get("mode"), data.get("ratio"),
             data.get("fixedAmount"), data.get("amount"), data.get("remark")
         ))

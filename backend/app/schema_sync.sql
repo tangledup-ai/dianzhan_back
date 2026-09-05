@@ -200,3 +200,51 @@ BEGIN
         END IF;
     END LOOP;
 END $$;
+
+-- ── 13) 品牌方合同支持按主体拆签（D4）────────────────────────
+-- 旧 (场地×品牌×租期) 唯一键按列组识别删除（列组含 brand_id，不会误删场地合同的 uq_contracts_venue），
+-- 新键加入主体：同场地同品牌不同主体可各签一份，收付款主体与运营主体对齐。
+-- 拆签后电价/租金按电表主体精确匹配（electricity_pricing.brand_price_for），报表层柜数拆分退为兜底。
+DO $$
+DECLARE
+    r RECORD;
+BEGIN
+    FOR r IN
+        SELECT c.conname AS name, NULL::text AS schema, 'CONSTRAINT' AS kind
+        FROM pg_constraint c
+        WHERE c.conrelid = 'contracts'::regclass AND c.contype = 'u'
+          AND (SELECT array_agg(a.attname::text ORDER BY a.attname) FROM unnest(c.conkey) k
+               JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k)
+              = ARRAY['brand_id', 'end_date', 'landlord_id', 'start_date']::text[]
+        UNION ALL
+        SELECT i.relname AS name, ns.nspname AS schema, 'INDEX' AS kind
+        FROM pg_index x
+        JOIN pg_class i ON i.oid = x.indexrelid
+        JOIN pg_namespace ns ON ns.oid = i.relnamespace
+        WHERE x.indrelid = 'contracts'::regclass AND x.indisunique AND NOT x.indisprimary
+          AND (SELECT array_agg(a.attname::text ORDER BY a.attname) FROM unnest(x.indkey::smallint[]) k
+               JOIN pg_attribute a ON a.attrelid = x.indrelid AND a.attnum = k)
+              = ARRAY['brand_id', 'end_date', 'landlord_id', 'start_date']::text[]
+    LOOP
+        IF r.kind = 'CONSTRAINT' THEN
+            EXECUTE format('ALTER TABLE contracts DROP CONSTRAINT %I', r.name);
+        ELSE
+            EXECUTE format('DROP INDEX %I.%I', r.schema, r.name);
+        END IF;
+    END LOOP;
+END $$;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_contracts_brand_split
+    ON contracts (landlord_id, COALESCE(brand_id, 0), COALESCE(entity_id, 0), start_date, end_date)
+    WHERE contract_type = '品牌方合同';
+
+-- ── 14) 电表换主体支持生效月（三期：时点维度）────────────────
+-- effective_period = 台账从该月（6 位 YYYYMM）起归新主体；NULL=立即（全量重算）
+ALTER TABLE meter_entity_changes ADD COLUMN IF NOT EXISTS effective_period VARCHAR(6);
+
+-- ── 15) 分红配置/明细支持按主体（三期：主体分红基数）──────────
+-- 配置 entity_id：NULL=不按主体（沿用 整场地/按品牌）；非空=以该主体在该场地的收入/利润为基数
+-- （与品牌同时配置时品牌优先——品牌是更细维度，主体基数供跨品牌归集场景）
+ALTER TABLE landlord_shareholder_configs ADD COLUMN IF NOT EXISTS entity_id INTEGER;
+ALTER TABLE landlord_introducer_configs ADD COLUMN IF NOT EXISTS entity_id INTEGER;
+ALTER TABLE dividend_shares ADD COLUMN IF NOT EXISTS entity_id INTEGER;

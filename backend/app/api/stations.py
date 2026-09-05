@@ -106,13 +106,12 @@ async def get_landlord_meter_view(landlord_id: int, period: str = None, request:
             for d in electricity_repo.get_meter_details(rec["id"]):
                 prev_meter_detail_map[d["meter_id"]] = d
 
-    # 获取合同价格（场地合同=付款单价，品牌方合同=收款单价；按品牌各算各的）
+    # 获取合同价格（场地合同=付款单价，品牌方合同=收款单价；按品牌各算各的；拆签合同按电表主体精确匹配）
     from ..repositories import contract_repo
-    from ..domain.electricity_pricing import resolve_prices, split_tax
+    from ..domain.electricity_pricing import resolve_prices, split_tax, brand_price_for
     contracts = contract_repo.list_contracts(landlord_id=landlord_id) or []
     pricing = resolve_prices(contracts)
     pay_price = pricing["pay_price"]  # 场地合同唯一付款单价
-    brand_prices = pricing["brand_prices"]  # brand_id -> {price, tax_rate, tax_enabled, post_tax}
 
     # 获取能耗数据（日用电量 + 月用电量）
     from ..infra.database import get_connection, get_dict_cursor
@@ -289,7 +288,8 @@ async def get_landlord_meter_view(landlord_id: int, period: str = None, request:
 
             pay_kwh = this_month_kwh
             collect_kwh = this_month_kwh
-            brand_info = brand_prices.get(int(meter_brand_id)) if meter_brand_id is not None else None
+            # v3.2：拆签合同按电表主体精确取收款单价
+            brand_info = brand_price_for(pricing, meter_brand_id, meter.get("entity_id")) if meter_brand_id is not None else None
             collect_price = float(brand_info["price"]) if brand_info and brand_info.get("price") is not None else None
             tax_enabled_m = bool(brand_info["tax_enabled"]) if brand_info else False
             tax_rate_m = float(brand_info["tax_rate"]) if brand_info else None

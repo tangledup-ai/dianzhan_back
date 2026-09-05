@@ -178,6 +178,7 @@ CREATE TABLE IF NOT EXISTS meter_entity_changes (
     to_entity_id INTEGER REFERENCES entities(id),
     operator VARCHAR(64),
     remark TEXT,
+    effective_period VARCHAR(6),
     created_at TIMESTAMP DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_meter_entity_changes_meter ON meter_entity_changes (meter_id, created_at DESC);
@@ -525,6 +526,7 @@ CREATE TABLE IF NOT EXISTS dividend_shares (
     introducer_id INTEGER REFERENCES introducers(id),
     shareholder_id INTEGER REFERENCES shareholders(id),
     brand_id INTEGER REFERENCES brands(id),
+    entity_id INTEGER REFERENCES entities(id),
     mode VARCHAR(20) NOT NULL,
     ratio NUMERIC(6,4),
     fixed_amount NUMERIC(12,2),
@@ -540,6 +542,7 @@ CREATE TABLE IF NOT EXISTS landlord_shareholder_configs (
     landlord_id INTEGER NOT NULL REFERENCES landlords(id),
     shareholder_id INTEGER NOT NULL REFERENCES shareholders(id),
     brand_id INTEGER REFERENCES brands(id),
+    entity_id INTEGER REFERENCES entities(id),
     mode VARCHAR(20) NOT NULL,
     ratio NUMERIC(6,4),
     fixed_amount NUMERIC(12,2),
@@ -560,6 +563,7 @@ CREATE TABLE IF NOT EXISTS landlord_introducer_configs (
     landlord_id INTEGER NOT NULL REFERENCES landlords(id),
     introducer_id INTEGER NOT NULL REFERENCES introducers(id),
     brand_id INTEGER REFERENCES brands(id),
+    entity_id INTEGER REFERENCES entities(id),
     mode VARCHAR(20) NOT NULL,
     ratio NUMERIC(6,4),
     fixed_amount NUMERIC(12,2),
@@ -936,6 +940,7 @@ CREATE TABLE IF NOT EXISTS meter_entity_changes (
     to_entity_id INTEGER REFERENCES entities(id),
     operator VARCHAR(64),
     remark TEXT,
+    effective_period VARCHAR(6),
     created_at TIMESTAMP DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_meter_entity_changes_meter ON meter_entity_changes (meter_id, created_at DESC);
@@ -1109,12 +1114,14 @@ BEGIN
 END $$;
 DO $$
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'uq_contracts_brand')
+    -- v3.2（D4）：品牌方合同唯一键加入主体，支持同场地同品牌按主体拆签
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'uq_contracts_brand_split')
        AND NOT EXISTS (SELECT 1 FROM contracts
                        WHERE contract_type = '品牌方合同'
-                       GROUP BY landlord_id, brand_id, start_date, end_date HAVING COUNT(*) > 1) THEN
-        CREATE UNIQUE INDEX uq_contracts_brand
-            ON contracts (landlord_id, brand_id, start_date, end_date) WHERE contract_type = '品牌方合同';
+                       GROUP BY landlord_id, brand_id, COALESCE(entity_id, 0), start_date, end_date HAVING COUNT(*) > 1) THEN
+        CREATE UNIQUE INDEX uq_contracts_brand_split
+            ON contracts (landlord_id, COALESCE(brand_id, 0), COALESCE(entity_id, 0), start_date, end_date)
+            WHERE contract_type = '品牌方合同';
     END IF;
 END $$;
 

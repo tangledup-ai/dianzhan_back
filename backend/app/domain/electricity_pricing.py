@@ -50,14 +50,18 @@ def resolve_prices(contracts: list) -> dict:
     pay_price = site_prices[0] if site_prices else None
     pay_price_conflict = len(set(site_prices)) > 1
 
-    # ── 收款单价：按品牌匹配 ──
+    # ── 收款单价：按品牌匹配（v3.2 主体感知：同品牌可按主体拆签多份合同）──
     # brand_id 为空的品牌方合同 = 「全品牌合同」，其单价仅对共享电表（无品牌）生效，
     # 存放在独立的 shared_price 字段，不进入 brand_prices（避免被误当作某品牌的兜底单价）。
+    # brand_prices[bid]      = 默认合同单价（优先未指定主体的合同，其次 id 最小）——兼容旧调用方；
+    # brand_price_options[bid] = 该品牌全部合同单价列表（含 entity_id），供按电表主体精确匹配。
     brand_prices = {}
+    brand_price_options = {}
     shared_price = None
-    for c in brand_contracts:
+    for c in sorted(brand_contracts, key=lambda x: x.get("id") or 0):
         bid = c.get("brand_id")
         info = {
+            "entity_id": c.get("entity_id"),
             "price": float(c.get("electricity_price")) if c.get("electricity_price") is not None else None,
             "tax_rate": float(c.get("tax_rate") or 0.01),
             "tax_enabled": bool(c.get("tax_enabled")),
@@ -67,14 +71,40 @@ def resolve_prices(contracts: list) -> dict:
             if shared_price is None:
                 shared_price = info
             continue
-        brand_prices[int(bid)] = info
+        brand_price_options.setdefault(int(bid), []).append(info)
+
+    for bid, opts in brand_price_options.items():
+        without_entity = [o for o in opts if o.get("entity_id") is None]
+        brand_prices[bid] = without_entity[0] if without_entity else opts[0]
 
     return {
         "pay_price": pay_price,
         "pay_price_conflict": pay_price_conflict,
         "brand_prices": brand_prices,
+        "brand_price_options": brand_price_options,
         "shared_price": shared_price,
     }
+
+
+def brand_price_for(pricing: dict, brand_id, entity_id=None):
+    """按 (品牌, 电表主体) 取收款单价信息（v3.2：拆签合同按主体精确匹配）。
+
+    匹配规则：该品牌下 电表主体对应合同 优先；其次未指定主体的合同；再退第一份。
+    brand_id=None → 共享电表，取「全品牌合同」单价。
+    """
+    if brand_id is None:
+        return pricing.get("shared_price")
+    opts = pricing.get("brand_price_options", {}).get(int(brand_id))
+    if not opts:
+        return None
+    if entity_id is not None:
+        for o in opts:
+            if o.get("entity_id") == entity_id:
+                return o
+    for o in opts:
+        if o.get("entity_id") is None:
+            return o
+    return opts[0]
 
 
 def brand_collect_price(brand_id, pricing: dict):

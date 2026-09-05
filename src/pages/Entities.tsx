@@ -11,7 +11,7 @@ import { Button } from "@/components/ui/button";
 import { inputCls } from "@/components/fields";
 import * as XLSX from "xlsx";
 import { fmtMoney, fmtNum, fmtDate } from "@/lib/format";
-import { Download, Search, ChevronDown, ChevronRight, FileText, Building2, DollarSign, Zap, Landmark } from "lucide-react";
+import { Download, Search, ChevronDown, ChevronRight, FileText, Building2, DollarSign, Landmark } from "lucide-react";
 import { toast } from "sonner";
 
 export default function Entities() {
@@ -342,12 +342,14 @@ export default function Entities() {
       const allRows: any[][] = [];
 
       for (const entity of entityData) {
+        // v3.2：同一场地可挂多个主体，场地电表视图只取本主体的电表
+        const ownMeterNos = new Set((entity.meters ?? []).map((m: any) => m.meterNo));
         for (const landlord of entity.landlordDetails || []) {
           const landlordRows: any[][] = [];
           const mv = views[landlord.landlordId];
           if (mv) {
             for (const group of mv.brandGroups || []) {
-              for (const meter of group.meters || []) {
+              for (const meter of (group.meters || []).filter((m: any) => ownMeterNos.has(m.meterNo))) {
                 const meterRecord = meterList.find((m: any) => m.meterNo === meter.meterNo);
                 const transformerRatio = meterRecord?.transformerRatio ?? 1;
 
@@ -465,10 +467,6 @@ export default function Entities() {
                 </div>
                 <div className="flex items-center gap-6 text-xs">
                   <div className="flex items-center gap-1">
-                    <Zap className="h-3.5 w-3.5 text-amber-500" />
-                    <span className="tabular-nums">{entity.meterCount}</span> 电表
-                  </div>
-                  <div className="flex items-center gap-1">
                     <FileText className="h-3.5 w-3.5 text-emerald-500" />
                     <span className="tabular-nums">{entity.contractCount}</span> 合同
                   </div>
@@ -483,11 +481,7 @@ export default function Entities() {
               {isExpanded && viewMode === "场租" && (
                 <div className="border-t px-5 py-4 space-y-6">
                   {/* 汇总数据 */}
-                  <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-                    <div className="rounded-lg border bg-slate-50 px-3 py-2">
-                      <div className="text-[10px] text-slate-400">电表数量</div>
-                      <div className="text-lg font-semibold tabular-nums">{entity.meterCount}</div>
-                    </div>
+                  <div className="grid grid-cols-2 gap-3 lg:grid-cols-3">
                     <div className="rounded-lg border bg-slate-50 px-3 py-2">
                       <div className="text-[10px] text-slate-400">合同总数</div>
                       <div className="text-lg font-semibold tabular-nums">{entity.contractCount}</div>
@@ -509,42 +503,7 @@ export default function Entities() {
                       <div className="flex items-center gap-2 bg-slate-50 px-4 py-2.5 border-b">
                         <Building2 className="h-4 w-4 text-emerald-600" />
                         <span className="text-sm font-semibold text-slate-700">{landlord.landlordName}</span>
-                        <span className="text-xs text-slate-400">（{landlord.brands.length} 个品牌，{landlord.meters.length} 块电表）</span>
-                      </div>
-
-                      {/* 品牌配置表（v3：站点 → 品牌） */}
-                      <div className="px-4 py-3">
-                        <h4 className="mb-2 text-xs font-semibold text-slate-600">品牌配置</h4>
-                        <div className="overflow-x-auto rounded-lg border">
-                          <table className="w-full text-xs">
-                            <thead>
-                              <tr className="border-b bg-slate-50">
-                                <th className={th}>品牌</th>
-                                <th className={`${th} text-right`}>充电柜数量</th>
-                                <th className={`${th} text-right`}>储电柜数量</th>
-                                <th className={`${th} text-right`}>合计数量</th>
-                              </tr>
-                            </thead>
-                            <tbody>
-                              {landlord.brands.map((station: any) => (
-                                <tr key={station.brandId} className="border-b last:border-0">
-                                  <td className="px-3 py-2 font-medium">{station.brandName}</td>
-                                  <td className="px-3 py-2 text-right tabular-nums">{station.chargeCabinets}</td>
-                                  <td className="px-3 py-2 text-right tabular-nums">{station.storageCabinets}</td>
-                                  <td className="px-3 py-2 text-right tabular-nums font-semibold">{station.totalCabinets}</td>
-                                </tr>
-                              ))}
-                              {landlord.brands.length > 1 && (
-                                <tr className="bg-slate-50 font-semibold">
-                                  <td className="px-3 py-2">合计</td>
-                                  <td className="px-3 py-2 text-right tabular-nums">{landlord.brands.reduce((s: number, st: any) => s + st.chargeCabinets, 0)}</td>
-                                  <td className="px-3 py-2 text-right tabular-nums">{landlord.brands.reduce((s: number, st: any) => s + st.storageCabinets, 0)}</td>
-                                  <td className="px-3 py-2 text-right tabular-nums">{landlord.brands.reduce((s: number, st: any) => s + st.totalCabinets, 0)}</td>
-                                </tr>
-                              )}
-                            </tbody>
-                          </table>
-                        </div>
+                        <span className="text-xs text-slate-400">（场地合同 {landlord.costContracts.length} · 品牌合同 {landlord.incomeContracts.length}）</span>
                       </div>
 
                       {/* 付款信息表（场地合同） */}
@@ -670,7 +629,7 @@ export default function Entities() {
 
                   {entity.landlordDetails.length === 0 && (
                     <div className="py-6 text-center text-sm text-slate-400">
-                      暂无关联数据，请先在「智慧电表」中将电表关联到该公司主体
+                      该主体暂无场租数据（合同请在「合同管理」中维护并选择收付款主体）
                     </div>
                   )}
                 </div>
@@ -832,12 +791,14 @@ function ElectricityRentView({ entity, period }: { entity: any; period: string }
   const meterList = meters.data ?? [];
 
   // 按场地方分组构建数据（v3：一个场地一个视图，无站点层级）
+  // v3.2：同一场地可挂多个主体，场地电表视图只取本主体的电表
+  const ownMeterNos = new Set((entity.meters ?? []).map((m: any) => m.meterNo));
   const landlordGroups = (entity.landlordDetails || []).map((landlord: any) => {
     const rows: any[] = [];
     const mv = views[landlord.landlordId];
     if (mv) {
       for (const group of mv.brandGroups || []) {
-        for (const meter of group.meters || []) {
+        for (const meter of (group.meters || []).filter((m: any) => ownMeterNos.has(m.meterNo))) {
           const meterRecord = meterList.find((m: any) => m.meterNo === meter.meterNo);
           const transformerRatio = meterRecord?.transformerRatio ?? 1;
 
