@@ -13,6 +13,7 @@ import {
   ChevronDown, ChevronRight, Check, X, ArrowRight,
 } from "lucide-react";
 import { toast } from "sonner";
+import { useAuth } from "@/providers/auth";
 
 // ─── 审批操作弹窗 ───
 function ActDialog(props: {
@@ -538,7 +539,9 @@ export default function Approvals() {
 
   // 操作弹窗
   const [actState, setActState] = useState<{ req: any; action: "通过" | "驳回" | "转办" | "加签" } | null>(null);
-  const [operator, setOperator] = useState("陈总");
+  // 操作人 = 当前登录用户（后端会强制校验，防止冒名审批）
+  const { user } = useAuth();
+  const operator = user?.name || "";
   const urge = useMutation({
     mutationFn: (data: any) => actOnApproval(data.requestId, data),
     onSuccess: () => { toast.success("已催办"); queryClient.invalidateQueries(); },
@@ -649,8 +652,7 @@ export default function Approvals() {
           ))}
         </div>
         <div className="ml-auto flex items-center gap-2 text-xs text-slate-500">
-          当前操作人：
-          <input className={`${inputCls} w-28`} value={operator} onChange={(e) => setOperator(e.target.value)} placeholder="审批人姓名" />
+          当前操作人：<span className="font-medium text-slate-700">{operator || "未登录"}</span>
         </div>
       </div>
 

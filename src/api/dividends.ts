@@ -40,12 +40,7 @@ export const refreshDividends = (data: { landlordId: number; period?: string }) 
 export const submitDividend = (id: number, data: any) =>
   client.post(`/dividends/${id}/submit`, data).then(r => r.data);
 
-export const approveDividend = (id: number, data: any) =>
-  client.post(`/dividends/${id}/approve`, data).then(r => r.data);
-
-export const rejectDividend = (id: number, data: any) =>
-  client.post(`/dividends/${id}/reject`, data).then(r => r.data);
-
+// 标记已结算（后端仅允许「已通过 → 已结算」，审批通过与驳回统一走 /approvals 审批流）
 export const settleDividend = (id: number, data: any) =>
   client.post(`/dividends/${id}/settle`, data).then(r => r.data);
 

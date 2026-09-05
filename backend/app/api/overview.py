@@ -6,6 +6,11 @@ from .base import CamelJSONResponse
 router = APIRouter(prefix="/api/overview", tags=["看板"], default_response_class=CamelJSONResponse)
 
 
+def _entity_group_name(c: dict) -> str:
+    """合同归属公司主体名：优先 entity_id 外键，旧数据回退 pay_entity 文本（与公司主体看板口径一致）"""
+    return c.get("entity_name") or (c.get("pay_entity") or "").strip() or "未指定主体"
+
+
 @router.get("")
 async def overview(request: Request):
     """经营总览 API（股东账号只统计其关联场地的数据）- 热重载测试"""
@@ -510,28 +515,36 @@ async def monthly_detail(request: Request, period: str = None):
             cur.execute("""
                 SELECT c.brand_id, b.name as brand_name, c.monthly_rent,
                        c.start_date, c.end_date, c.early_end_date, c.first_month_rent, c.rent_refund,
-                       c.rent_tax_enabled, c.post_tax_rent_price
+                       c.rent_tax_enabled, c.post_tax_rent_price,
+                       c.entity_id, e.name as entity_name, c.pay_entity
                 FROM contracts c LEFT JOIN brands b ON c.brand_id = b.id
+                LEFT JOIN entities e ON c.entity_id = e.id
                 WHERE c.contract_type = '品牌方合同' AND c.landlord_id = ANY(%s::int[])
             """, (allowed,))
             rent_income_contracts = cur.fetchall()
             cur.execute("""
-                SELECT c.landlord_id, l.name as landlord_name, c.monthly_rent
+                SELECT c.landlord_id, l.name as landlord_name, c.monthly_rent,
+                       c.entity_id, e.name as entity_name, c.pay_entity
                 FROM contracts c LEFT JOIN landlords l ON c.landlord_id = l.id
+                LEFT JOIN entities e ON c.entity_id = e.id
                 WHERE c.contract_type = '场地合同' AND c.landlord_id = ANY(%s::int[])
             """, (allowed,))
         else:
             cur.execute("""
                 SELECT c.brand_id, b.name as brand_name, c.monthly_rent,
                        c.start_date, c.end_date, c.early_end_date, c.first_month_rent, c.rent_refund,
-                       c.rent_tax_enabled, c.post_tax_rent_price
+                       c.rent_tax_enabled, c.post_tax_rent_price,
+                       c.entity_id, e.name as entity_name, c.pay_entity
                 FROM contracts c LEFT JOIN brands b ON c.brand_id = b.id
+                LEFT JOIN entities e ON c.entity_id = e.id
                 WHERE c.contract_type = '品牌方合同'
             """)
             rent_income_contracts = cur.fetchall()
             cur.execute("""
-                SELECT c.landlord_id, l.name as landlord_name, c.monthly_rent
+                SELECT c.landlord_id, l.name as landlord_name, c.monthly_rent,
+                       c.entity_id, e.name as entity_name, c.pay_entity
                 FROM contracts c LEFT JOIN landlords l ON c.landlord_id = l.id
+                LEFT JOIN entities e ON c.entity_id = e.id
                 WHERE c.contract_type = '场地合同'
             """)
         rent_cost_contracts = cur.fetchall()
@@ -545,6 +558,20 @@ async def monthly_detail(request: Request, period: str = None):
             if c.get("rent_tax_enabled") and c.get("post_tax_rent_price")
         )
         rent_profit = round(rent_income - rent_cost - rent_tax, 2)
+
+        # 明细按公司主体汇总（首页只看主体级汇总；收入含首月/退款当月口径，成本为月租金合计）
+        income_groups: dict = {}
+        for c in rent_income_contracts:
+            g = income_groups.setdefault(_entity_group_name(c), {"entityName": _entity_group_name(c), "contractCount": 0, "amount": 0.0})
+            g["contractCount"] += 1
+            g["amount"] += rent_income_for_period(c, month_compact) - rent_refund_for_period(c, month_compact)
+        cost_groups: dict = {}
+        for c in rent_cost_contracts:
+            g = cost_groups.setdefault(_entity_group_name(c), {"entityName": _entity_group_name(c), "contractCount": 0, "amount": 0.0})
+            g["contractCount"] += 1
+            g["amount"] += float(c["monthly_rent"] or 0)
+        rent_income_details = sorted(income_groups.values(), key=lambda g: -g["amount"])
+        rent_cost_details = sorted(cost_groups.values(), key=lambda g: -g["amount"])
 
         # 4) 运营费用（v3：挂 landlord_id）
         if allowed is not None:
@@ -591,8 +618,8 @@ async def monthly_detail(request: Request, period: str = None):
                 "income": round(rent_income, 2),
                 "cost": round(rent_cost, 2),
                 "profit": rent_profit,
-                "incomeDetails": [{ "brandName": c["brand_name"] or "未指定", "monthlyRent": float(c["monthly_rent"] or 0) } for c in rent_income_contracts],
-                "costDetails": [{ "landlordName": c["landlord_name"] or "未指定", "monthlyRent": float(c["monthly_rent"] or 0) } for c in rent_cost_contracts],
+                "incomeDetails": [{**g, "amount": round(g["amount"], 2)} for g in rent_income_details],
+                "costDetails": [{**g, "amount": round(g["amount"], 2)} for g in rent_cost_details],
             },
             "opExpense": {
                 "total": round(op_total, 2),

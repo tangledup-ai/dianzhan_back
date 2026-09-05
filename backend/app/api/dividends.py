@@ -201,11 +201,14 @@ async def create_dividend(data: dict):
 
 @router.post("/{record_id}/submit")
 async def submit_dividend(record_id: int, data: dict):
-    """提交分红审批（关联分红记录，审核人员可展开查看详细分红核算信息）"""
+    """提交分红审批（关联分红记录，审核人员可展开查看详细分红核算信息）
+
+    允许从未结算提交，也允许被驳回后重新提交。
+    """
     record = dividend_repo.get_record(record_id)
     if not record:
         raise HTTPException(404, "分红记录不存在")
-    if record["status"] != "未结算":
+    if record["status"] not in ("未结算", "已驳回"):
         raise HTTPException(400, f"当前状态 {record['status']} 不允许提交")
 
     # 审批金额 = 该记录所有分红明细之和（实际要发放的金额）；无明细时退回用净利润
@@ -214,16 +217,19 @@ async def submit_dividend(record_id: int, data: dict):
     amount = dividend_total if dividend_total > 0 else (record.get("profit") or 0)
 
     # 创建审批单（bizType 需与 approval_flows 流程配置一致，Approvals 页按此类型展示分红详情）
-    approval = approval_repo.create_request({
-        "bizType": "分红审批",
-        "title": f"{record.get('landlord_name', '')} {record['period']} 分红",
-        "reason": data.get("reason"),
-        "amount": amount,
-        "applicant": data.get("applicant", "系统"),
-        "dividendRecordId": record_id,
-        "landlordId": record.get("landlord_id"),
-        "period": record.get("period"),
-    })
+    try:
+        approval = approval_repo.create_request({
+            "bizType": "分红审批",
+            "title": f"{record.get('landlord_name', '')} {record['period']} 分红",
+            "reason": data.get("reason"),
+            "amount": amount,
+            "applicant": data.get("applicant", "系统"),
+            "dividendRecordId": record_id,
+            "landlordId": record.get("landlord_id"),
+            "period": record.get("period"),
+        })
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
     # 更新分红状态
     dividend_repo.update_status(record_id, "申报中")
@@ -231,41 +237,30 @@ async def submit_dividend(record_id: int, data: dict):
     return {"ok": True, "approvalRequestId": approval["id"]}
 
 
-@router.post("/{record_id}/approve")
-async def approve_dividend(record_id: int, data: dict):
-    """审批通过"""
-    record = dividend_repo.get_record(record_id)
-    if not record:
-        raise HTTPException(404, "分红记录不存在")
-
-    dividend_repo.update_status(record_id, "已通过")
-    return {"ok": True}
-
-
-@router.post("/{record_id}/reject")
-async def reject_dividend(record_id: int, data: dict):
-    """审批驳回"""
-    record = dividend_repo.get_record(record_id)
-    if not record:
-        raise HTTPException(404, "分红记录不存在")
-
-    dividend_repo.update_status(record_id, "已驳回")
-    return {"ok": True}
-
-
+# 说明：分红的状态流转只有一条合法路径：
+#   未结算/已驳回 → submit 提交审批 → 审批流通过/驳回（approval_repo.act_on_request 回写状态）
+#   → 已通过 → settle 标记已结算（打款完成）。
+# 不提供任意改状态的接口；settle 仅允许「已通过 → 已结算」，防止绕过审批直接放款。
 @router.post("/{record_id}/settle")
 async def settle_dividend(record_id: int, data: dict):
-    """标记已结算"""
+    """标记已结算（仅限审批已通过的记录，表示分红款已实际发放）"""
     record = dividend_repo.get_record(record_id)
     if not record:
         raise HTTPException(404, "分红记录不存在")
-
+    if record["status"] != "已通过":
+        raise HTTPException(400, f"只有审批「已通过」的分红才能标记已结算，当前状态为「{record['status']}」")
     dividend_repo.update_status(record_id, "已结算")
     return {"ok": True}
 
 
 @router.delete("/{record_id}")
 async def delete_dividend(record_id: int):
+    record = dividend_repo.get_record(record_id)
+    if not record:
+        raise HTTPException(404, "分红记录不存在")
+    # 已进入审批或已发放的分红记录是财务凭证，不允许直接删除
+    if record["status"] in ("申报中", "已通过", "已结算"):
+        raise HTTPException(400, f"当前状态「{record['status']}」不允许删除（已进入审批/发放流程）")
     dividend_repo.delete_record(record_id)
     return {"ok": True}
 

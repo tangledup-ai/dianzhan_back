@@ -138,18 +138,28 @@ export default function Dashboard() {
               </div>
               <div className="grid grid-cols-2 gap-3 text-xs">
                 <div className="rounded-lg border">
-                  <div className="border-b bg-emerald-50/50 px-2 py-1 font-medium text-emerald-700">收入明细（品牌方合同）</div>
+                  <div className="border-b bg-emerald-50/50 px-2 py-1 font-medium text-emerald-700">收入明细（按公司主体汇总）</div>
+                  {md.rent.incomeDetails.length === 0 && <div className="py-4 text-center text-slate-400">该月暂无场租收入</div>}
                   {md.rent.incomeDetails.map((d: any, i: number) => (
-                    <div key={i} className="flex justify-between border-b px-2 py-1 last:border-0">
-                      <span>{d.brandName}</span><span className="tabular-nums">{fmtMoney(d.monthlyRent)}/月</span>
+                    <div key={i} className="flex items-center justify-between border-b px-2 py-1 last:border-0">
+                      <span>
+                        {d.entityName}
+                        <span className="ml-1 text-[10px] text-slate-400">{d.contractCount} 份合同</span>
+                      </span>
+                      <span className="tabular-nums">{fmtMoney(d.amount)}</span>
                     </div>
                   ))}
                 </div>
                 <div className="rounded-lg border">
-                  <div className="border-b bg-rose-50/50 px-2 py-1 font-medium text-rose-700">成本明细（场地合同）</div>
+                  <div className="border-b bg-rose-50/50 px-2 py-1 font-medium text-rose-700">成本明细（按公司主体汇总）</div>
+                  {md.rent.costDetails.length === 0 && <div className="py-4 text-center text-slate-400">该月暂无场租成本</div>}
                   {md.rent.costDetails.map((d: any, i: number) => (
-                    <div key={i} className="flex justify-between border-b px-2 py-1 last:border-0">
-                      <span>{d.landlordName}</span><span className="tabular-nums">{fmtMoney(d.monthlyRent)}/月</span>
+                    <div key={i} className="flex items-center justify-between border-b px-2 py-1 last:border-0">
+                      <span>
+                        {d.entityName}
+                        <span className="ml-1 text-[10px] text-slate-400">{d.contractCount} 份合同</span>
+                      </span>
+                      <span className="tabular-nums">{fmtMoney(d.amount)}/月</span>
                     </div>
                   ))}
                 </div>

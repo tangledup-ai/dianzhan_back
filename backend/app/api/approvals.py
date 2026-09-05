@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from ..repositories import approval_repo
 from .base import CamelJSONResponse
 
@@ -50,22 +50,35 @@ async def create_request(data: dict):
             nodes.append({"name": "老板审批", "approver": approvers["boss"]})
         if nodes:
             data["flowNodes"] = nodes
-    return approval_repo.create_request(data)
+    try:
+        return approval_repo.create_request(data)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
 
 @router.post("/{request_id}/act")
-async def act_on_request(request_id: int, data: dict):
+async def act_on_request(request_id: int, data: dict, request: Request):
     action = data.get("action")
-    approver = data.get("approver")
-    if not action or not approver:
-        raise HTTPException(400, "action 和 approver 必填")
+    if not action:
+        raise HTTPException(400, "action 必填")
 
-    result = approval_repo.act_on_request(
-        request_id=request_id,
-        action=action,
-        approver=approver,
-        comment=data.get("comment"),
-    )
+    # 操作人一律取当前登录用户，不信任请求体里的名字（防止冒名审批）
+    current_user = getattr(request.state, "current_user", None)
+    if not current_user:
+        raise HTTPException(401, "未登录")
+    approver = current_user.get("name") or ""
+
+    try:
+        result = approval_repo.act_on_request(
+            request_id=request_id,
+            action=action,
+            approver=approver,
+            comment=data.get("comment"),
+        )
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     if not result:
         raise HTTPException(404, "审批单不存在")
     return result

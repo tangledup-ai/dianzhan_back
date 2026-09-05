@@ -87,16 +87,25 @@ async def monthly_ledger(request: Request, period: str = Query(..., description=
     from ..infra.database import get_connection, get_dict_cursor
 
     period = to_compact(period)
+    if len(period) != 6 or not period.isdigit():
+        raise HTTPException(400, "月份格式错误，应为 YYYY-MM 或 YYYYMM")
     y, m = int(period[:4]), int(period[4:6])
     month_end = (date(y + 1, 1, 1) - timedelta(days=1)) if m == 12 else (date(y, m + 1, 1) - timedelta(days=1))
     ms = period + "01"  # 月初 YYYYMMDD
     me = month_end.strftime("%Y%m%d")
 
+    # 数据隔离：股东只能查看关联场地的租金台账；财务按电表类型范围派生场地范围
+    allowed = scope_landlord_ids(request)
+    scope_cond, scope_val = "", []
+    if allowed is not None:
+        scope_cond = " AND c.landlord_id = ANY(%s::int[])"
+        scope_val = [allowed]
+
     conn = get_connection()
     cur = get_dict_cursor(conn)
     try:
         # 覆盖该月的全部场地费合同（场地合同=成本，品牌方合同=收入）
-        cur.execute("""
+        cur.execute(f"""
             SELECT c.id AS contract_id, c.contract_type, c.landlord_id, l.name AS landlord_name,
                    l.contact AS landlord_contact, l.phone AS landlord_phone,
                    c.brand_id, b.name AS brand_name, c.monthly_rent, c.rent_amount,
@@ -109,9 +118,9 @@ async def monthly_ledger(request: Request, period: str = Query(..., description=
             LEFT JOIN brands b ON c.brand_id = b.id
             LEFT JOIN entities ent ON ent.id = c.entity_id
             WHERE (c.start_date IS NULL OR c.start_date <= %s)
-              AND (COALESCE(c.early_end_date, c.end_date) IS NULL OR COALESCE(c.early_end_date, c.end_date) >= %s)
+              AND (COALESCE(c.early_end_date, c.end_date) IS NULL OR COALESCE(c.early_end_date, c.end_date) >= %s){scope_cond}
             ORDER BY c.landlord_id, c.contract_type, c.id
-        """, (me, ms))
+        """, [me, ms] + scope_val)
         contracts = cur.fetchall()
 
         # 全年合同（含已结束/未开始的品牌合同）：用于「承担场地成本按合同周期逐月分摊」——
@@ -119,7 +128,7 @@ async def monthly_ledger(request: Request, period: str = Query(..., description=
         # 但分摊 2026 年 1-6 月场地费时它仍参与，故需单独查全年。
         year_start_s = period[:4] + "0101"
         year_end_s = period[:4] + "1231"
-        cur.execute("""
+        cur.execute(f"""
             SELECT c.id AS contract_id, c.contract_type, c.landlord_id, l.name AS landlord_name,
                    l.contact AS landlord_contact, l.phone AS landlord_phone,
                    c.brand_id, b.name AS brand_name, c.monthly_rent, c.rent_amount,
@@ -132,9 +141,9 @@ async def monthly_ledger(request: Request, period: str = Query(..., description=
             LEFT JOIN brands b ON c.brand_id = b.id
             LEFT JOIN entities ent ON ent.id = c.entity_id
             WHERE (c.start_date IS NULL OR c.start_date <= %s)
-              AND (COALESCE(c.early_end_date, c.end_date) IS NULL OR COALESCE(c.early_end_date, c.end_date) >= %s)
+              AND (COALESCE(c.early_end_date, c.end_date) IS NULL OR COALESCE(c.early_end_date, c.end_date) >= %s){scope_cond}
             ORDER BY c.landlord_id, c.contract_type, c.id
-        """, (year_end_s, year_start_s))
+        """, [year_end_s, year_start_s] + scope_val)
         year_contracts = cur.fetchall()
 
         # 实时计费柜数：{landlord_id: {brand_id: 柜数}}。口径与合同列表 live_cabinets_count 一致：

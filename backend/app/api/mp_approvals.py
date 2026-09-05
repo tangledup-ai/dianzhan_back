@@ -133,13 +133,12 @@ async def create_approval(data: dict, user: dict = Depends(get_current_user)):
         if flow:
             flow_nodes = json.loads(flow["nodes"]) if isinstance(flow["nodes"], str) else flow["nodes"]
         else:
-            # 默认流程
-            flow_nodes = [
-                {"name": "经办人", "approver": user["name"]},
-                {"name": "部门负责人", "approver": ""},
-                {"name": "总经理审批", "approver": ""},
-                {"name": "财务审核付款", "approver": ""},
-            ]
+            # 未配置流程：默认交老板审批（节点审批人留空会导致任何人都能审批）
+            cur.execute("SELECT name FROM platform_users WHERE role = 'boss' ORDER BY id LIMIT 1")
+            boss = cur.fetchone()
+            if not boss:
+                raise HTTPException(400, "该业务类型未配置审批流程，且平台没有老板账号")
+            flow_nodes = [{"name": "老板审批", "approver": boss["name"]}]
 
         applicant = user["name"]
 
@@ -190,10 +189,19 @@ async def approve(request_id: int, data: dict, user: dict = Depends(get_current_
         request = cur.fetchone()
         if not request:
             raise HTTPException(404, "审批单不存在")
+        # 状态机：终态审批单不允许再操作
+        if request["status"] != "审批中":
+            raise HTTPException(400, f"该审批单当前状态为「{request['status']}」，不能再审批")
 
         flow_nodes = json.loads(request["flow_nodes"]) if isinstance(request["flow_nodes"], str) else request["flow_nodes"]
         current_node = request["current_node"]
         comment = data.get("comment", "同意")
+
+        # 审批人身份校验：须与当前节点配置的审批人一致（节点未配置审批人时放行，兼容历史流程）
+        if current_node < len(flow_nodes):
+            node_approver = str((flow_nodes[current_node] or {}).get("approver") or "").strip()
+            if node_approver and str(user["name"]).strip() != node_approver:
+                raise HTTPException(403, f"该节点应由「{node_approver}」审批，您无权审批")
 
         next_node = current_node + 1
         if next_node >= len(flow_nodes):
@@ -233,10 +241,19 @@ async def reject(request_id: int, data: dict, user: dict = Depends(get_current_u
         request = cur.fetchone()
         if not request:
             raise HTTPException(404, "审批单不存在")
+        # 状态机：终态审批单不允许再操作
+        if request["status"] != "审批中":
+            raise HTTPException(400, f"该审批单当前状态为「{request['status']}」，不能再驳回")
 
         flow_nodes = json.loads(request["flow_nodes"]) if isinstance(request["flow_nodes"], str) else request["flow_nodes"]
         current_node = request["current_node"]
         comment = data.get("comment", "驳回")
+
+        # 审批人身份校验：须与当前节点配置的审批人一致（节点未配置审批人时放行，兼容历史流程）
+        if current_node < len(flow_nodes):
+            node_approver = str((flow_nodes[current_node] or {}).get("approver") or "").strip()
+            if node_approver and str(user["name"]).strip() != node_approver:
+                raise HTTPException(403, f"该节点应由「{node_approver}」审批，您无权审批")
 
         cur.execute(
             "UPDATE approval_requests SET status = '已驳回', finished_at = NOW() WHERE id = %s",
@@ -266,6 +283,8 @@ async def transfer(request_id: int, data: dict, user: dict = Depends(get_current
         request = cur.fetchone()
         if not request:
             raise HTTPException(404, "审批单不存在")
+        if request["status"] != "审批中":
+            raise HTTPException(400, f"该审批单当前状态为「{request['status']}」，不能转办")
 
         flow_nodes = json.loads(request["flow_nodes"]) if isinstance(request["flow_nodes"], str) else request["flow_nodes"]
         current_node = request["current_node"]

@@ -112,7 +112,15 @@ def create_request(data: dict):
         else:
             cur.execute("SELECT nodes FROM approval_flows WHERE biz_type = %s", (data.get("bizType"),))
             flow = cur.fetchone()
-            flow_nodes = json.loads(flow["nodes"]) if flow else [{"name": "经办人", "approver": data.get("applicant")}]
+            if flow:
+                flow_nodes = json.loads(flow["nodes"])
+            else:
+                # 未配置流程：默认交老板审批，绝不允许申请人自审（资金安全）
+                cur.execute("SELECT name FROM platform_users WHERE role = 'boss' ORDER BY id LIMIT 1")
+                boss = cur.fetchone()
+                if not boss:
+                    raise ValueError("该业务类型未配置审批流程，且平台没有老板账号，请先在审批中心配置流程")
+                flow_nodes = [{"name": "老板审批", "approver": boss["name"]}]
 
         cur.execute("""
             INSERT INTO approval_requests
@@ -174,17 +182,20 @@ def apply_payment_links(cur, request: dict):
     landlord_id = request.get("landlord_id")
     period = request.get("period")  # YYYY-MM 或 YYYYMM
 
-    # ── 场地费退款 → 回写合同押金退还（押金退还金额 = 审批总额 − 场地费退款部分）──
-    if biz == "场地费退款" and request.get("contract_id"):
-        try:
-            deposit_part = float(request.get("amount") or 0) - float(request.get("rent_amount") or 0)
-        except (TypeError, ValueError):
-            deposit_part = 0
-        cur.execute("""
-            UPDATE contracts
-            SET deposit_refund_amount = %s, deposit_refund_date = CURRENT_DATE, deposit_refund_approval_id = %s
-            WHERE id = %s
-        """, (deposit_part, request["id"], request["contract_id"]))
+    # ── 场地费退款 → 只回写合同押金退还，绝不联动租金分期/电费台账 ──
+    # （退款是业主退钱给公司，不能因为子串匹配"场地费"而误把分期标成已付款）
+    if biz == "场地费退款":
+        if request.get("contract_id"):
+            try:
+                deposit_part = float(request.get("amount") or 0) - float(request.get("rent_amount") or 0)
+            except (TypeError, ValueError):
+                deposit_part = 0
+            cur.execute("""
+                UPDATE contracts
+                SET deposit_refund_amount = %s, deposit_refund_date = CURRENT_DATE, deposit_refund_approval_id = %s
+                WHERE id = %s
+            """, (deposit_part, request["id"], request["contract_id"]))
+        return
 
     # ── 场地费付款 → 联动付款分期 ──
     if "场地费" in biz and landlord_id and period:
@@ -240,9 +251,23 @@ def act_on_request(request_id: int, action: str, approver: str, comment: str = N
         request = cur.fetchone()
         if not request:
             return None
+        # 状态机：终态（已通过/已驳回）的审批单不允许再操作，
+        # 否则会重复回写付款状态、或"通过后再驳回"造成账实不符
+        if request["status"] != "审批中":
+            raise ValueError(f"该审批单当前状态为「{request['status']}」，不能再执行「{action}」操作")
 
         flow_nodes = json.loads(request["flow_nodes"]) if isinstance(request["flow_nodes"], str) else request["flow_nodes"]
         current_node = request["current_node"]
+
+        # 审批人身份校验：通过/驳回必须由当前节点配置的审批人执行
+        # （节点未配置审批人时允许任何登录用户操作，兼容历史流程）
+        if action in ("通过", "驳回") and current_node < len(flow_nodes):
+            node_approver = str((flow_nodes[current_node] or {}).get("approver") or "").strip()
+            if node_approver and approver.strip() != node_approver:
+                raise PermissionError(
+                    f"该节点应由「{node_approver}」审批，当前操作人「{approver}」无权审批；"
+                    f"如需改派他人请使用转办，或调整审批流程配置"
+                )
 
         # 获取关联的所有分红记录（含兼容单条的 dividend_record_id）
         def _linked_dividend_ids():
