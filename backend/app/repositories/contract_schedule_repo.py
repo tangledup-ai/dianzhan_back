@@ -3,6 +3,7 @@
 - 付款分期表：rent_payment_schedule（场地合同，公司付给场地方）
 - 收款分期表：rent_income_schedule（品牌方合同，品牌方付给公司）
 """
+import calendar
 from datetime import date, timedelta
 from ..infra.database import get_connection, get_dict_cursor
 
@@ -13,6 +14,48 @@ _PERIOD_MONTHS = {
     "半年付": 6,
     "年付": 12,
 }
+
+
+def _nominal_period_end(ps: date, months: int) -> date:
+    """本期不被合同截止日截断时的自然结束日（下一期起点的前一天）"""
+    total_m = (ps.year * 12 + ps.month - 1) + months
+    ny, nm = divmod(total_m, 12)
+    return date(ny, nm + 1, 1) - timedelta(days=1)
+
+
+def _period_amount(monthly: float, months: int, ps: date, pe: date, nominal_end: date,
+                   first_ym: str, first_month_rent) -> float:
+    """一期金额。
+
+    - 完整期 = 月租 × 期长月数；
+    - 被合同截止日截短的尾期按实际覆盖折算：整日历月照算、末月零头按天，
+      避免"6 天的尾巴也收一整期租金"（如 2025-09-06~2026-09-06 年付合同
+      被日历月切出 2026-09-01~2026-09-06 的尾期）；
+    - 首期即尾期（合同不足一个完整付款周期）按天数占比折算。
+    """
+    monthly = float(monthly or 0)
+    if first_ym and ps.strftime("%Y%m") == first_ym:
+        n = (pe.year * 12 + pe.month) - (ps.year * 12 + ps.month) + 1
+        return round(float(first_month_rent or 0) + monthly * (n - 1), 2)
+
+    if pe >= nominal_end:
+        return round(monthly * months, 2)
+
+    # —— 截短尾期：按实际覆盖折算 ——
+    if ps.day == 1:
+        # 尾期从每月 1 号开始：整日历月照算，末月不满则按天
+        last_day = calendar.monthrange(pe.year, pe.month)[1]
+        if pe.day == last_day:
+            full_months = (pe.year * 12 + pe.month) - (ps.year * 12 + ps.month) + 1
+            return round(monthly * full_months, 2)
+        full_months = (pe.year * 12 + pe.month) - (ps.year * 12 + ps.month)
+        daily = monthly / last_day
+        return round(monthly * full_months + daily * pe.day, 2)
+
+    # 首期即被截短（合同不足一个完整付款周期）：按天数占比折算
+    nominal_days = (nominal_end - ps).days + 1
+    actual_days = (pe - ps).days + 1
+    return round(monthly * months * actual_days / nominal_days, 2)
 
 
 def _split_periods(start: date, end: date, months_per_period: int):
@@ -82,7 +125,6 @@ def generate_schedules(contract_id: int, contract_type: str, pay_method: str,
         end_date = date.fromisoformat(str(end_date)[:10])
 
     months = _PERIOD_MONTHS.get(pay_method, 1)
-    amount = round(float(monthly_rent or 0) * months, 2)
     periods = _split_periods(start_date, end_date, months)
     # 首月场地租金所在期（按月判断）：该期金额单独计算
     first_ym = ""
@@ -102,10 +144,8 @@ def generate_schedules(contract_id: int, contract_type: str, pay_method: str,
 
         cur.execute(f"DELETE FROM {table} WHERE contract_id = %s", (contract_id,))
         for i, (ps, pe) in enumerate(periods, start=1):
-            period_amount = amount
-            if first_ym and ps.strftime("%Y%m") == first_ym:
-                n = (pe.year * 12 + pe.month) - (ps.year * 12 + ps.month) + 1
-                period_amount = round(float(first_month_rent) + float(monthly_rent or 0) * (n - 1), 2)
+            period_amount = _period_amount(monthly_rent, months, ps, pe,
+                                           _nominal_period_end(ps, months), first_ym, first_month_rent)
             old = old_rows.get(i, {})
             cur.execute(f"""
                 INSERT INTO {table} (contract_id, seq, period_start, period_end, amount, status, pay_date, invoice, remark)

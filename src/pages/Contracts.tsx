@@ -18,6 +18,30 @@ import { groupByEntity } from "@/lib/groupColors";
 import { ContractSchedule } from "@/components/ContractSchedule";
 import { toast } from "sonner";
 
+// ── 拆期预检（与后端 contract_schedule_repo._split_periods 同一算法）──
+const PERIOD_MONTHS: Record<string, number> = { "月付": 1, "季付": 3, "半年付": 6, "年付": 12 };
+
+function splitPeriodsPreview(startDate: string, endDate: string, payMethod: string) {
+  const months = PERIOD_MONTHS[payMethod] || 1;
+  const s = new Date(startDate + "T00:00:00");
+  const e = new Date(endDate + "T00:00:00");
+  const periods: { ps: Date; pe: Date; nominalEnd: Date }[] = [];
+  let cur = new Date(s);
+  while (cur <= e) {
+    const ym0 = cur.getFullYear() * 12 + cur.getMonth();
+    const nNominal = ym0 + months - 1;
+    let pe = new Date(Math.floor(nNominal / 12), nNominal % 12 + 1, 0); // 该期自然月末
+    if (pe > e) pe = new Date(e);
+    const nNext = ym0 + months;
+    const nominalEnd = new Date(Math.floor(nNext / 12), nNext % 12 + 1, 0);
+    periods.push({ ps: new Date(cur), pe, nominalEnd });
+    cur = new Date(Math.floor(nNext / 12), nNext % 12, 1);
+  }
+  return periods;
+}
+
+const ymd = (x: Date) => `${x.getFullYear()}-${String(x.getMonth() + 1).padStart(2, "0")}-${String(x.getDate()).padStart(2, "0")}`;
+
 export default function Contracts() {
   const currentYear = new Date().getFullYear();
   const [year, setYear] = useState(currentYear);
@@ -880,6 +904,23 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
     if (f.earlyEndDate && !(f.rentRefund && Number(f.rentRefund) > 0)) {
       toast.error("填写了合同提前结束日期，必须同时填写场地费退款金额");
       return;
+    }
+
+    // 拆期预检：合同期限不足以凑成完整付款周期时提醒（尾期金额将按实际覆盖折算，不再收整期）
+    const effEnd = f.earlyEndDate || f.endDate;
+    if (f.payMethod && f.startDate && effEnd) {
+      const periods = splitPeriodsPreview(f.startDate, effEnd, f.payMethod);
+      const shortOnes = periods.filter(p => p.pe < p.nominalEnd);
+      if (shortOnes.length > 0) {
+        const last = shortOnes[shortOnes.length - 1];
+        const dayLen = Math.round((last.pe.getTime() - last.ps.getTime()) / 86400000) + 1;
+        const okGo = window.confirm(
+          `合同期限与「${f.payMethod}」周期不匹配：\n` +
+          `最后一期 ${ymd(last.ps)} ~ ${ymd(last.pe)} 只有 ${dayLen} 天，不足一个完整的${f.payMethod}周期。\n\n` +
+          `该期金额将按实际覆盖时间折算（不再按整期收取），确定这样拆期吗？`
+        );
+        if (!okGo) return;
+      }
     }
 
     save.mutate({
