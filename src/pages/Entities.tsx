@@ -34,34 +34,60 @@ export default function Entities() {
     const meterList = meters.data ?? [];
     const cabinetList = cabinets.data ?? [];
 
-    return entityList
+    // 合同主体归属（与主体损益表口径一致）：
+    // - 有 entity_id：精确归属
+    // - 无 entity_id：按「场地+品牌」的电表数比例分摊到相关主体（收入按品牌电表，场地成本按场地电表）
+    // - 电表还没关联主体的合同：进入「未指定主体（待归属）」，关联后自动归位
+    const contractAllocs = new Map<number, { entityId: number; ratio: number }[]>();
+    const unattributedContracts: any[] = [];
+    const weightIncome = new Map<string, Map<number, number>>();   // "场地:品牌" -> 主体 -> 电表数
+    const weightLandlord = new Map<number, Map<number, number>>(); // 场地 -> 主体 -> 电表数
+    for (const m of meterList) {
+      if (!m.landlordId || m.entityId == null) continue;
+      if (!(m.brandId != null || m.tag === "共享电表")) continue;
+      const lk = weightLandlord.get(m.landlordId) ?? new Map<number, number>();
+      lk.set(m.entityId, (lk.get(m.entityId) || 0) + 1);
+      weightLandlord.set(m.landlordId, lk);
+      const bkey = `${m.landlordId}:${m.brandId ?? "shared"}`;
+      const bk = weightIncome.get(bkey) ?? new Map<number, number>();
+      bk.set(m.entityId, (bk.get(m.entityId) || 0) + 1);
+      weightIncome.set(bkey, bk);
+    }
+    for (const c of contractList) {
+      if (c.entityId != null) {
+        contractAllocs.set(c.id, [{ entityId: c.entityId, ratio: 1 }]);
+        continue;
+      }
+      if (c.landlordId == null) { unattributedContracts.push(c); continue; }
+      const wmap = c.contractType === "品牌方合同"
+        ? weightIncome.get(`${c.landlordId}:${c.brandId ?? "shared"}`)
+        : weightLandlord.get(c.landlordId);
+      const entries = wmap ? [...wmap.entries()].filter(([, w]) => w > 0) : [];
+      if (entries.length === 0) { unattributedContracts.push(c); continue; }
+      const totalW = entries.reduce((s, [, w]) => s + w, 0);
+      contractAllocs.set(c.id, entries.map(([eid, w]) => ({ entityId: eid, ratio: w / totalW })));
+    }
+
+    const mapped = entityList
       .filter((e: any) => !keyword || e.name?.includes(keyword) || e.shortName?.includes(keyword))
       .map((entity: any) => {
         // 该主体的电表（通过entity_id关联）
         const entityMeters = meterList.filter((m: any) => m.entityId === entity.id);
 
         // 该主体关联的场地ID集合（来自电表的landlord_id）
-        const entityLandlordIds = new Set(entityMeters.map((m: any) => m.landlordId).filter(Boolean));
+        // （entityLandlordIds 已由上方 weightLandlord/contractAllocs 的归属逻辑取代）
 
-        // 该主体的合同：优先按 entity_id 外键关联（改名自动同步）；无 entity_id 时回退 pay_entity 文本
-        const entityContracts = contractList.filter((c: any) => {
-          if (c.entityId !== undefined && c.entityId !== null) {
-            if (entityLandlordIds.size > 0) {
-              return c.entityId === entity.id && c.landlordId && entityLandlordIds.has(c.landlordId);
-            }
-            return c.entityId === entity.id;
-          }
-          // 旧数据回退：pay_entity 文本匹配
-          if (c.payEntity !== entity.name && c.payEntity !== entity.shortName) return false;
-          if (entityLandlordIds.size > 0) {
-            return c.landlordId && entityLandlordIds.has(c.landlordId);
-          }
-          return true;
-        });
+        // 该主体的合同：entity_id 精确归属 + 未指定主体的合同按电表数分摊（_ratio 为分摊比例）
+        const entityContracts = contractList
+          .filter((c: any) => (contractAllocs.get(c.id) ?? []).some((a: any) => a.entityId === entity.id))
+          .map((c: any) => {
+            const alloc = (contractAllocs.get(c.id) ?? []).find((a: any) => a.entityId === entity.id);
+            return { ...c, _ratio: alloc ? alloc.ratio : 1 };
+          });
 
         // 汇总数据
-        const totalMonthlyRent = entityContracts.reduce((sum: number, c: any) => sum + (Number(c.monthlyRent) || 0), 0);
-        const totalAnnualRent = entityContracts.reduce((sum: number, c: any) => sum + (Number(c.rentAmount) || 0), 0);
+        const totalMonthlyRent = entityContracts.reduce((sum: number, c: any) => sum + (Number(c.monthlyRent) || 0) * (c._ratio ?? 1), 0);
+        const totalAnnualRent = entityContracts.reduce((sum: number, c: any) => sum + (Number(c.rentAmount) || 0) * (c._ratio ?? 1), 0);
         const costContracts = entityContracts.filter((c: any) => c.contractType === "场地合同");
         const incomeContracts = entityContracts.filter((c: any) => c.contractType === "品牌方合同");
 
@@ -153,6 +179,42 @@ export default function Entities() {
           totalAnnualRent,
         };
       });
+
+    // 未归属主体：电表还没关联报税主体的合同集中到这里，关联后自动归位
+    let result = mapped;
+    if (unattributedContracts.length > 0) {
+      const byLandlord = new Map<number, any>();
+      for (const c of unattributedContracts) {
+        const lid = c.landlordId || 0;
+        if (!byLandlord.has(lid)) {
+          byLandlord.set(lid, {
+            landlordId: lid,
+            landlordName: c.landlordName || "未设置场地方",
+            meters: [],
+            brands: [],
+            costContracts: [],
+            incomeContracts: [],
+          });
+        }
+        const g = byLandlord.get(lid);
+        (c.contractType === "品牌方合同" ? g.incomeContracts : g.costContracts).push({ ...c, _ratio: 1 });
+      }
+      result = [...mapped, {
+        id: -1,
+        name: "未指定主体（待归属）",
+        shortName: "",
+        contracts: unattributedContracts,
+        costContracts: unattributedContracts.filter((c: any) => c.contractType === "场地合同"),
+        incomeContracts: unattributedContracts.filter((c: any) => c.contractType === "品牌方合同"),
+        landlordDetails: [...byLandlord.values()],
+        meterCount: 0,
+        contractCount: unattributedContracts.length,
+        totalMonthlyRent: unattributedContracts.reduce((s: number, c: any) => s + (Number(c.monthlyRent) || 0), 0),
+        totalAnnualRent: unattributedContracts.reduce((s: number, c: any) => s + (Number(c.rentAmount) || 0), 0),
+        isUnattributed: true,
+      }];
+    }
+    return result;
   }, [entities.data, contracts.data, meters.data, cabinets.data, keyword]);
 
   const toggleExpand = (id: number) => {
@@ -536,7 +598,7 @@ export default function Entities() {
                                     <tr key={c.id} className="border-b last:border-0">
                                       <td className="px-3 py-2 whitespace-nowrap">{fmtDate(c.startDate)} ~ {fmtDate(c.endDate)}</td>
                                       <td className="px-3 py-2 text-right tabular-nums">{years ? `${years}年` : "-"}</td>
-                                      <td className="px-3 py-2 text-right tabular-nums font-medium">{c.monthlyRent ? fmtMoney(Number(c.monthlyRent)) : "-"}</td>
+                                      <td className="px-3 py-2 text-right tabular-nums font-medium">{c.monthlyRent ? fmtMoney(Math.round(Number(c.monthlyRent) * (c._ratio ?? 1) * 100) / 100) : "-"}</td>
                                       <td className="px-3 py-2">{c.payMethod ?? "-"}</td>
                                       <td className="px-3 py-2">
                                         <StatusBadge status={c.payStatus || "未付款"} />
@@ -572,7 +634,7 @@ export default function Entities() {
                               </thead>
                               <tbody>
                                 {landlord.incomeContracts.map((c: any) => {
-                                  const monthlyRent = Number(c.monthlyRent) || 0;
+                                  const monthlyRent = (Number(c.monthlyRent) || 0) * (c._ratio ?? 1);
                                   const annualIncome = monthlyRent * 12;
                                   const taxRate = c.taxEnabled ? Number(c.taxRate) || 0 : 0;
                                   const netIncome = taxRate > 0
@@ -581,7 +643,7 @@ export default function Entities() {
 
                                   return (
                                     <tr key={c.id} className="border-b last:border-0">
-                                      <td className="px-3 py-2 font-medium">{c.brandName ?? "-"}</td>
+                                      <td className="px-3 py-2 font-medium">{c.brandName ?? "-"}{c._ratio != null && c._ratio < 1 ? <span className="ml-1 text-[10px] text-amber-600">（分摊 {(c._ratio * 100).toFixed(0)}%）</span> : null}</td>
                                       <td className="px-3 py-2 whitespace-nowrap">{fmtDate(c.startDate)} ~ {fmtDate(c.endDate)}</td>
                                       <td className="px-3 py-2 text-right tabular-nums">{c.unitMonthlyRent ? fmtMoney(Number(c.unitMonthlyRent)) : "-"}</td>
                                       <td className="px-3 py-2 text-right tabular-nums">{c.unitMonthlyRent ? fmtMoney(Number(c.unitMonthlyRent) * 12) : "-"}</td>
@@ -599,11 +661,11 @@ export default function Entities() {
                                     <td className="px-3 py-2">-</td>
                                     <td className="px-3 py-2">-</td>
                                     <td className="px-3 py-2">-</td>
-                                    <td className="px-3 py-2 text-right tabular-nums">{fmtMoney(landlord.incomeContracts.reduce((s: number, c: any) => s + (Number(c.monthlyRent) || 0), 0))}</td>
+                                    <td className="px-3 py-2 text-right tabular-nums">{fmtMoney(landlord.incomeContracts.reduce((s: number, c: any) => s + (Number(c.monthlyRent) || 0) * (c._ratio ?? 1), 0))}</td>
                                     <td className="px-3 py-2">-</td>
                                     <td className="px-3 py-2 text-right tabular-nums text-emerald-600">
                                       {fmtMoney(landlord.incomeContracts.reduce((s: number, c: any) => {
-                                        const mr = Number(c.monthlyRent) || 0;
+                                        const mr = (Number(c.monthlyRent) || 0) * (c._ratio ?? 1);
                                         const tr = c.taxEnabled ? Number(c.taxRate) || 0 : 0;
                                         return s + (tr > 0 ? mr * (1 - tr) * 12 : mr * 12);
                                       }, 0))}
@@ -629,7 +691,7 @@ export default function Entities() {
 
                   {entity.landlordDetails.length === 0 && (
                     <div className="py-6 text-center text-sm text-slate-400">
-                      该主体暂无场租数据（合同请在「合同管理」中维护并选择收付款主体）
+                      该主体暂无场租数据（合同按电表主体自动归属：请在「智慧电表」页把该主体名下的电表关联到场地方并指定报税主体）
                     </div>
                   )}
                 </div>
