@@ -39,8 +39,8 @@ class DividendCalculator:
         estimate=True = 预估模式：本月预估分红（multiplier 恒为 1，不管周期），
                        并返回 settlementMonth（本月是否结算月）与 periodStartMonth（当前周期起点月），
                        供前端累加「周期内待结算金额」。
+        estimate 通过参数逐层传递（不挂实例状态，避免全局单例并发互相污染）。
         """
-        self._estimate_mode = estimate
         conn = get_connection()
         cur = get_dict_cursor(conn)
         try:
@@ -475,7 +475,7 @@ class DividendCalculator:
             }
 
         # 7. 计算商务分红
-        biz_dividends = self._calc_business_dividends(landlord_id, income, cost, period, brand_map, entity_map)
+        biz_dividends = self._calc_business_dividends(landlord_id, income, cost, period, brand_map, entity_map, estimate)
 
         # 8. 如果商务分红计入成本，更新总成本（税费已独立展示，不参与 totalCost/profit）
         biz_cost = sum(d["amount"] for d in biz_dividends if d.get("countAsCost"))
@@ -489,7 +489,7 @@ class DividendCalculator:
         profit = round(income["totalIncome"] - cost["totalCost"], 2)
 
         # 10. 计算股东分红
-        shareholder_dividends = self._calc_shareholder_dividends(landlord_id, income, profit, period, brand_map, entity_map)
+        shareholder_dividends = self._calc_shareholder_dividends(landlord_id, income, profit, period, brand_map, entity_map, estimate)
 
         # 11. 计算结算日期
         settlement_date = self._calc_settlement_date(period)
@@ -727,7 +727,7 @@ class DividendCalculator:
             result.append(cfg)
         return result
 
-    def _calc_business_dividends(self, landlord_id: int, income: dict, cost: dict, period: str = None, brand_map: dict = None, entity_map: dict = None) -> list:
+    def _calc_business_dividends(self, landlord_id: int, income: dict, cost: dict, period: str = None, brand_map: dict = None, entity_map: dict = None, estimate: bool = False) -> list:
         """计算商务分红（v3.2：配置挂场地；brand_id → 品牌基数，entity_id → 主体基数，均空 → 整场地）"""
         configs = dividend_repo.list_introducer_configs(landlord_id=landlord_id)
         if period:
@@ -760,7 +760,7 @@ class DividendCalculator:
                 base_income = total_income
                 base_profit_brand = base_profit
 
-            period_multiplier = self._get_period_multiplier(settlement_period, period)
+            period_multiplier = self._get_period_multiplier(settlement_period, period, estimate)
 
             if mode == "收入分红":
                 amount = round(base_income * ratio * period_multiplier, 2)
@@ -795,7 +795,7 @@ class DividendCalculator:
 
         return results
 
-    def _calc_shareholder_dividends(self, landlord_id: int, income: dict, profit: float, period: str = None, brand_map: dict = None, entity_map: dict = None) -> list:
+    def _calc_shareholder_dividends(self, landlord_id: int, income: dict, profit: float, period: str = None, brand_map: dict = None, entity_map: dict = None, estimate: bool = False) -> list:
         """计算股东分红（v3.2：配置挂场地；entity_id → 主体基数；各拿各的比例，互不影响）"""
         configs = dividend_repo.list_shareholder_configs(landlord_id=landlord_id)
         if period:
@@ -821,7 +821,7 @@ class DividendCalculator:
             ratio = float(cfg.get("ratio") or 0)
             fixed_amount = float(cfg.get("fixed_amount") or 0)
             settlement_period = cfg.get("settlement_period", "月")
-            period_multiplier = self._get_period_multiplier(settlement_period, period)
+            period_multiplier = self._get_period_multiplier(settlement_period, period, estimate)
 
             if mode == "收入分红":
                 amount = round(base_income_total * ratio * period_multiplier, 2)
@@ -855,12 +855,12 @@ class DividendCalculator:
 
         return results
 
-    def _get_period_multiplier(self, settlement_period: str, current_period: str) -> int:
+    def _get_period_multiplier(self, settlement_period: str, current_period: str, estimate: bool = False) -> int:
         """根据分红周期计算倍数
         月分红：1；季度分红：3（季度末）；半年分红：6（6/12月）；年分红：12（12月）。
         预估模式（estimate=True）：恒返回 1（本月预估，不乘周期倍数）。
         """
-        if getattr(self, "_estimate_mode", False):
+        if estimate:
             return 1
         if settlement_period == "月":
             return 1

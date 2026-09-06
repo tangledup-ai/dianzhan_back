@@ -44,13 +44,13 @@ def refresh_dividend_records(landlord_id, periods: list = None) -> dict:
             dividend_repo.delete_shares(record["id"])
             if record.get("type", "股东分红") == "商务分红":
                 shares = [{"introducerId": d["introducerId"],
-                           "brandId": d.get("brandId"), "mode": d["mode"],
-                           "ratio": d.get("ratio"), "fixedAmount": d.get("fixedAmount"),
+                           "brandId": d.get("brandId"), "entityId": d.get("entityId"),
+                           "mode": d["mode"], "ratio": d.get("ratio"), "fixedAmount": d.get("fixedAmount"),
                            "amount": d["amount"]} for d in calc["bizDividends"]]
             else:
                 shares = [{"shareholderId": d["shareholderId"],
-                           "brandId": d.get("brandId"), "mode": d["mode"],
-                           "ratio": d.get("ratio"), "fixedAmount": d.get("fixedAmount"),
+                           "brandId": d.get("brandId"), "entityId": d.get("entityId"),
+                           "mode": d["mode"], "ratio": d.get("ratio"), "fixedAmount": d.get("fixedAmount"),
                            "amount": d["amount"]} for d in calc["shareholderDividends"]]
             for d in shares:
                 dividend_repo.create_share(record["id"], d)

@@ -440,7 +440,21 @@ async def monthly_ledger(request: Request, period: str = Query(..., description=
         conn2 = _gc()
         cur2 = _gdc(conn2)
         ent_map = {}
+        meter_ent_by_landlord = {}
+        meter_ent_by_brand = {}
         try:
+            # 电表主体兜底映射（合同未选主体时按电表归属，与合同页/主体损益表同口径）
+            cur2.execute("""
+                SELECT m.landlord_id AS lid, m.brand_id AS bid, ent.name AS entity_name
+                FROM meters m JOIN entities ent ON ent.id = m.entity_id
+                WHERE m.meter_no NOT LIKE 'TEST%%'
+                  AND (m.brand_id IS NOT NULL OR m.tag = '共享电表')
+                GROUP BY m.landlord_id, m.brand_id, ent.name
+            """)
+            for r in cur2.fetchall():
+                meter_ent_by_landlord.setdefault(r["lid"], r["entity_name"])
+                if r["bid"] is not None:
+                    meter_ent_by_brand.setdefault(r["bid"], r["entity_name"])
             keys = [g["key"] for g in result_rows if g.get("key") is not None]
             if keys:
                 if dim == "landlord":
@@ -462,7 +476,18 @@ async def monthly_ledger(request: Request, period: str = Query(..., description=
             cur2.close()
             conn2.close()
         for g in result_rows:
-            g["entityName"] = ent_map.get(g.get("key")) or "未指定主体"
+            # 归属链：合同主体 → 电表主体 → 未指定主体
+            if dim == "landlord":
+                g["entityName"] = ent_map.get(g.get("key")) or meter_ent_by_landlord.get(g.get("key")) or "未指定主体"
+            else:
+                g["entityName"] = ent_map.get(g.get("key")) or meter_ent_by_brand.get(g.get("key")) or "未指定主体"
+        # 年度行主体兜底（场地合同主体 → 品牌合同主体之后，补电表主体）并重排序
+        for gy in yearly_rows:
+            if (gy.get("entityName") or "未指定主体") == "未指定主体":
+                name = meter_ent_by_landlord.get(gy.get("landlordId"))
+                if name:
+                    gy["entityName"] = name
+        yearly_rows.sort(key=lambda x: (x.get("entityName") or "", x.get("landlordName") or ""))
 
     return {"period": period, "dim": dim, "rows": result_rows, "totals": totals, "yearlyRows": yearly_rows}
 

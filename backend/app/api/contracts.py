@@ -463,7 +463,8 @@ async def import_contracts(request: Request, file: UploadFile = File(...)):
                     "contractType": "品牌方合同",
                     "landlordId": landlord_id,
                     "brandId": brand_id,
-                    "entityId": entity_id,
+                    # 主体归属以电表为准（品牌方合同不携带 entity_id，收入按电表柜数分摊）
+                    "entityId": None,
                     "rentCalcMethod": rcm,
                     "unitMonthlyRent": unit_monthly_rent,
                     # 计费柜数/年租金不导入（场地方未关联电表前无意义），电表关联后由实时口径接管
