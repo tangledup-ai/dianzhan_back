@@ -32,7 +32,7 @@ def _covers_month(period_year: int, period_month: int, c: dict) -> bool:
 class DividendCalculator:
     """分红计算器 - 核心业务逻辑（v3：calculate(landlord_id, brand_id=None, period)）"""
 
-    def calculate(self, landlord_id: int, brand_id, period: str, estimate: bool = False) -> dict:
+    def calculate(self, landlord_id: int, brand_id, period: str, estimate: bool = False, _cycle_sum_depth: int = 0) -> dict:
         """计算某场地（或场地×品牌）某月的分红（预览，不入库）。
 
         brand_id 传 None = 整场地分红；传品牌 id = 指定品牌分红（只算该品牌电表/合同）。
@@ -40,6 +40,7 @@ class DividendCalculator:
                        并返回 settlementMonth（本月是否结算月）与 periodStartMonth（当前周期起点月），
                        供前端累加「周期内待结算金额」。
         estimate 通过参数逐层传递（不挂实例状态，避免全局单例并发互相污染）。
+        _cycle_sum_depth：周期累加的递归深度（累加子调用传 1，防止无限递归）。
         """
         conn = get_connection()
         cur = get_dict_cursor(conn)
@@ -475,7 +476,7 @@ class DividendCalculator:
             }
 
         # 7. 计算商务分红
-        biz_dividends = self._calc_business_dividends(landlord_id, income, cost, period, brand_map, entity_map, estimate)
+        biz_dividends = self._calc_business_dividends(landlord_id, income, cost, period, brand_map, entity_map, estimate, _cycle_sum_depth)
 
         # 8. 如果商务分红计入成本，更新总成本（税费已独立展示，不参与 totalCost/profit）
         biz_cost = sum(d["amount"] for d in biz_dividends if d.get("countAsCost"))
@@ -489,7 +490,7 @@ class DividendCalculator:
         profit = round(income["totalIncome"] - cost["totalCost"], 2)
 
         # 10. 计算股东分红
-        shareholder_dividends = self._calc_shareholder_dividends(landlord_id, income, profit, period, brand_map, entity_map, estimate)
+        shareholder_dividends = self._calc_shareholder_dividends(landlord_id, income, profit, period, brand_map, entity_map, estimate, _cycle_sum_depth)
 
         # 11. 计算结算日期
         settlement_date = self._calc_settlement_date(period)
@@ -727,7 +728,47 @@ class DividendCalculator:
             result.append(cfg)
         return result
 
-    def _calc_business_dividends(self, landlord_id: int, income: dict, cost: dict, period: str = None, brand_map: dict = None, entity_map: dict = None, estimate: bool = False) -> list:
+    def _cycle_months(self, settlement_period: str, current_period: str) -> list:
+        """当前周期覆盖的月份列表（YYYYMM，从周期起点月到当前月）"""
+        start = self.period_start_month(settlement_period, current_period)
+        sy, sm = int(start[:4]), int(start[4:])
+        if "-" in current_period:
+            cy, cm = map(int, current_period.split("-"))
+        else:
+            cy, cm = int(current_period[:4]), int(current_period[4:])
+        months = []
+        y, m = sy, sm
+        while (y, m) <= (cy, cm) and len(months) < 24:
+            months.append(f"{y}{m:02d}")
+            m += 1
+            if m > 12:
+                y, m = y + 1, 1
+        return months or [str(current_period).replace("-", "")]
+
+    def _cycle_base(self, landlord_id: int, brand_id, entity_id, settlement_period: str, period: str):
+        """周期内各月收入/利润累加（结算月计算金额用）。返回 (base_income, base_profit, 每月明细)。
+
+        逐月调用 calculate（_cycle_sum_depth=1 防递归）；
+        绑定品牌 → 该品牌 P&L；绑定主体 → 该主体 P&L；均未绑定 → 整场地。
+        """
+        bi = bp = 0.0
+        detail = []
+        for m in self._cycle_months(settlement_period, period):
+            sub = self.calculate(landlord_id, brand_id, m, False, _cycle_sum_depth=1)
+            if brand_id:
+                row = next((b for b in (sub.get("brandBreakdown") or []) if b.get("brandId") == brand_id), None)
+                mi, mp = (row["income"], row["profit"]) if row else (0.0, 0.0)
+            elif entity_id:
+                row = (sub.get("entityMap") or {}).get(entity_id)
+                mi, mp = (row["income"], row["profit"]) if row else (0.0, 0.0)
+            else:
+                mi, mp = sub["income"]["totalIncome"], sub["profit"]
+            bi = round(bi + mi, 2)
+            bp = round(bp + mp, 2)
+            detail.append({"period": m, "income": mi, "profit": mp})
+        return bi, bp, detail
+
+    def _calc_business_dividends(self, landlord_id: int, income: dict, cost: dict, period: str = None, brand_map: dict = None, entity_map: dict = None, estimate: bool = False, _cycle_sum_depth: int = 0) -> list:
         """计算商务分红（v3.2：配置挂场地；brand_id → 品牌基数，entity_id → 主体基数，均空 → 整场地）"""
         configs = dividend_repo.list_introducer_configs(landlord_id=landlord_id)
         if period:
@@ -752,6 +793,10 @@ class DividendCalculator:
             if brand:
                 base_income = brand["income"]
                 base_profit_brand = brand["profit"]
+            elif brand_id:
+                # 绑定了品牌但该品牌当月无在期合同/电表 → 本期不参与（基数 0）
+                base_income = 0.0
+                base_profit_brand = 0.0
             elif entity:
                 # v3.2 主体基数：该主体在该场地的收入/利润（跨品牌归集场景）
                 base_income = entity["income"]
@@ -761,13 +806,24 @@ class DividendCalculator:
                 base_profit_brand = base_profit
 
             period_multiplier = self._get_period_multiplier(settlement_period, period, estimate)
+            is_settle = self.is_settlement_month(settlement_period, period)
 
+            cycle_detail = None
             if mode == "收入分红":
-                amount = round(base_income * ratio * period_multiplier, 2)
                 base_amount = base_income
+                amount = round(base_income * ratio * period_multiplier, 2)
+                # 季/半年/年的结算月：金额 = 周期内各月累加（cycleDetail 返回每月构成，让用户看清每期金额来源）
+                if is_settle and not estimate and not _cycle_sum_depth and settlement_period != "月":
+                    bi, _, cycle_detail = self._cycle_base(landlord_id, brand_id, entity_id, settlement_period, period)
+                    amount = round(bi * ratio, 2)
+                    base_amount = bi
             elif mode == "利润分红":
-                amount = round(base_profit_brand * ratio * period_multiplier, 2)
                 base_amount = base_profit_brand
+                amount = round(base_profit_brand * ratio * period_multiplier, 2)
+                if is_settle and not estimate and not _cycle_sum_depth and settlement_period != "月":
+                    _, bp, cycle_detail = self._cycle_base(landlord_id, brand_id, entity_id, settlement_period, period)
+                    amount = round(bp * ratio, 2)
+                    base_amount = bp
             elif mode == "固定金额":
                 amount = round(fixed_amount * period_multiplier, 2)
                 base_amount = None
@@ -788,14 +844,15 @@ class DividendCalculator:
                 "countAsCost": cfg.get("count_as_cost", False),
                 "baseAmount": base_amount,
                 "amount": amount,
+                "cycleDetail": cycle_detail,
                 "settlementPeriod": settlement_period,
-                "isSettlementMonth": self.is_settlement_month(settlement_period, period),
+                "isSettlementMonth": is_settle,
                 "periodStartMonth": self.period_start_month(settlement_period, period),
             })
 
         return results
 
-    def _calc_shareholder_dividends(self, landlord_id: int, income: dict, profit: float, period: str = None, brand_map: dict = None, entity_map: dict = None, estimate: bool = False) -> list:
+    def _calc_shareholder_dividends(self, landlord_id: int, income: dict, profit: float, period: str = None, brand_map: dict = None, entity_map: dict = None, estimate: bool = False, _cycle_sum_depth: int = 0) -> list:
         """计算股东分红（v3.2：配置挂场地；entity_id → 主体基数；各拿各的比例，互不影响）"""
         configs = dividend_repo.list_shareholder_configs(landlord_id=landlord_id)
         if period:
@@ -809,8 +866,16 @@ class DividendCalculator:
             entity_id = cfg.get("entity_id")
             brand = brand_map.get(brand_id) if brand_id and brand_map else None
             entity = entity_map.get(entity_id) if entity_id and entity_map and not brand_id else None
-            # v3.2：配置了主体的股东用该主体的收入/利润作基数；未配置保持整场地口径
-            if entity:
+
+            # 基数口径（用户确认 2026-09）：绑定品牌 → 该品牌的收入/利润（该品牌当月无在期合同/电表则本期不参与）；
+            # 绑定主体 → 该主体的收入/利润；均未绑定 → 整场地。股东情况多样，基数随配置自由组合。
+            if brand:
+                base_income_total = brand["income"]
+                base_profit_total = brand["profit"]
+            elif brand_id:
+                base_income_total = 0.0
+                base_profit_total = 0.0
+            elif entity:
                 base_income_total = entity["income"]
                 base_profit_total = entity["profit"]
             else:
@@ -822,13 +887,24 @@ class DividendCalculator:
             fixed_amount = float(cfg.get("fixed_amount") or 0)
             settlement_period = cfg.get("settlement_period", "月")
             period_multiplier = self._get_period_multiplier(settlement_period, period, estimate)
+            is_settle = self.is_settlement_month(settlement_period, period)
 
+            cycle_detail = None
             if mode == "收入分红":
-                amount = round(base_income_total * ratio * period_multiplier, 2)
                 base_amount = base_income_total
+                amount = round(base_income_total * ratio * period_multiplier, 2)
+                # 季/半年/年的结算月：金额 = 周期内各月累加（cycleDetail 返回每月构成，让用户看清每期金额来源）
+                if is_settle and not estimate and not _cycle_sum_depth and settlement_period != "月":
+                    bi, _, cycle_detail = self._cycle_base(landlord_id, brand_id, entity_id, settlement_period, period)
+                    amount = round(bi * ratio, 2)
+                    base_amount = bi
             elif mode == "利润分红":
-                amount = round(base_profit_total * ratio * period_multiplier, 2)
                 base_amount = base_profit_total
+                amount = round(base_profit_total * ratio * period_multiplier, 2)
+                if is_settle and not estimate and not _cycle_sum_depth and settlement_period != "月":
+                    _, bp, cycle_detail = self._cycle_base(landlord_id, brand_id, entity_id, settlement_period, period)
+                    amount = round(bp * ratio, 2)
+                    base_amount = bp
             elif mode == "固定金额":
                 amount = round(fixed_amount * period_multiplier, 2)
                 base_amount = None
@@ -848,8 +924,9 @@ class DividendCalculator:
                 "fixedAmount": fixed_amount if mode == "固定金额" else None,
                 "baseAmount": base_amount,
                 "amount": amount,
+                "cycleDetail": cycle_detail,
                 "settlementPeriod": settlement_period,
-                "isSettlementMonth": self.is_settlement_month(settlement_period, period),
+                "isSettlementMonth": is_settle,
                 "periodStartMonth": self.period_start_month(settlement_period, period),
             })
 
