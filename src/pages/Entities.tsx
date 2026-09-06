@@ -1,4 +1,5 @@
 import { useState, useMemo } from "react";
+import { useNavigate } from "react-router";
 import { useQuery } from "@tanstack/react-query";
 import { listEntities } from "@/api/directory";
 import { listContracts } from "@/api/contracts";
@@ -11,7 +12,7 @@ import { Button } from "@/components/ui/button";
 import { inputCls } from "@/components/fields";
 import * as XLSX from "xlsx";
 import { fmtMoney, fmtNum, fmtDate } from "@/lib/format";
-import { Download, Search, ChevronDown, ChevronRight, FileText, Building2, DollarSign, Landmark } from "lucide-react";
+import { Download, Search, ChevronDown, ChevronRight, FileText, Building2, DollarSign, Landmark, ExternalLink } from "lucide-react";
 import { toast } from "sonner";
 
 export default function Entities() {
@@ -23,6 +24,7 @@ export default function Entities() {
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
   });
 
+  const navigate = useNavigate();
   const entities = useQuery({ queryKey: ["entities"], queryFn: listEntities });
   const contracts = useQuery({ queryKey: ["contracts"], queryFn: () => listContracts() });
   const meters = useQuery({ queryKey: ["meters"], queryFn: () => listMeters() });
@@ -567,6 +569,25 @@ export default function Entities() {
                         <span className="text-sm font-semibold text-slate-700">{landlord.landlordName}</span>
                         <span className="text-xs text-slate-400">（场地合同 {landlord.costContracts.length} · 品牌合同 {landlord.incomeContracts.length}）</span>
                       </div>
+
+                      {/* 电表已关联主体但未设置场地方：列出具体电表，点击直达智慧电表页 */}
+                      {!landlord.landlordId && landlord.meters?.length > 0 && (
+                        <div className="border-b bg-amber-50/70 px-4 py-2.5">
+                          <div className="mb-1.5 text-[11px] font-medium text-amber-700">
+                            以下电表已关联本主体，但还没设置场地方（点击去智慧电表补设，设置后本组自动消失）：
+                          </div>
+                          <div className="flex flex-wrap gap-2">
+                            {landlord.meters.map((m: any) => (
+                              <button key={m.id} type="button"
+                                onClick={() => navigate(`/meters?meter=${encodeURIComponent(m.meterNo)}`)}
+                                className="inline-flex items-center gap-1 rounded-md border border-amber-300 bg-white px-2 py-1 text-[11px] text-amber-700 hover:border-amber-500">
+                                {m.meterNo}{m.meterName ? ` · ${m.meterName}` : ""}
+                                <ExternalLink className="h-3 w-3" />
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      )}
 
                       {/* 付款信息表（场地合同） */}
                       {landlord.costContracts.length > 0 && (

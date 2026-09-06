@@ -111,6 +111,7 @@ export default function Meters() {
     const landlord = params.get("landlord");
     const brand = params.get("brand");
     const highlight = params.get("highlight");
+    const meter = params.get("meter");
     if (landlord) setLandlordId(landlord);
     if (brand) setBrandId(brand);
     if (highlight === "cabinet") {
@@ -118,8 +119,9 @@ export default function Meters() {
       // 5秒后取消高亮
       setTimeout(() => setHighlightCabinet(false), 5000);
     }
+    if (meter) setKeyword(meter); // 直达某块电表：预填搜索框
     // 清除 URL 参数
-    if (landlord || brand || highlight) {
+    if (landlord || brand || highlight || meter) {
       window.history.replaceState({}, "", window.location.pathname);
     }
   }, []);
