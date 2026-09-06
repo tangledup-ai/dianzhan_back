@@ -10,7 +10,7 @@ import { fmtMoney } from "@/lib/format";
 import { toCompact, toDisplay } from "@/lib/period";
 import { inputCls } from "@/components/fields";
 import { groupByEntity } from "@/lib/groupColors";
-import { Users, MapPin, X, Trash2, UserPlus, Wallet, Settings, Pencil, Search } from "lucide-react";
+import { Users, MapPin, X, Trash2, UserPlus, Wallet, Settings, Pencil, Search, Landmark, ChevronDown, ChevronRight } from "lucide-react";
 import { toast } from "sonner";
 
 // ════════════════════════════════════════════════════════════════
@@ -805,6 +805,16 @@ export default function Shareholders() {
 
   // 场地方列表：搜索（场地名称/公司主体模糊匹配）+ 按公司主体分块
   const [landlordKeyword, setLandlordKeyword] = useState("");
+  // 公司主体分组展开状态：点击公司主体展开/收起场地方明细
+  const [openEntityGroups, setOpenEntityGroups] = useState<Set<string>>(new Set());
+  const toggleEntityGroup = (name: string) => {
+    setOpenEntityGroups((prev) => {
+      const next = new Set(prev);
+      if (next.has(name)) next.delete(name);
+      else next.add(name);
+      return next;
+    });
+  };
   const filteredLandlords = useMemo(() => {
     const kw = landlordKeyword.trim();
     if (!kw) return landlords;
@@ -1269,28 +1279,42 @@ export default function Shareholders() {
                 {landlords.data?.length ? "没有匹配的场地方 / 公司主体" : "暂无场地"}
               </div>
             ) : (
-              filteredLandlordGroups.map((grp: any) => (
-                <div key={grp.entityName} className={grp.color.bg}>
-                  <div className="sticky top-0 z-10 border-b bg-white/95 px-3 py-1.5 text-[10px] font-semibold text-slate-500 backdrop-blur">
-                    公司主体：{grp.entityName}（{grp.rows.length}）
-                  </div>
-                  {grp.rows.map((r: any) => (
+              filteredLandlordGroups.map((grp: any) => {
+                const isOpen = openEntityGroups.has(grp.entityName);
+                const profitSum = grp.rows.reduce((s: number, r: any) => s + (Number(r.totalProfit) || 0), 0);
+                return (
+                  <div key={grp.entityName} className={grp.color.bg}>
                     <button
-                      key={r.landlord.id}
-                      onClick={() => setSelectedLandlordId(r.landlord.id)}
-                      className={`flex w-full items-center gap-2 border-b px-3 py-2.5 text-left text-xs transition-colors ${selectedLandlordId === r.landlord.id ? "bg-emerald-50 border-l-2 border-l-emerald-500" : "hover:bg-slate-50"}`}
+                      type="button"
+                      onClick={() => toggleEntityGroup(grp.entityName)}
+                      className="sticky top-0 z-10 flex w-full items-center gap-2 border-b bg-white/95 px-3 py-2 text-left text-xs font-semibold text-slate-600 backdrop-blur hover:bg-slate-50"
                     >
-                      <MapPin className="h-4 w-4 shrink-0 text-slate-400" />
-                      <div className="min-w-0 flex-1">
-                        <div className="font-medium text-slate-800 truncate">{r.landlord.name}</div>
-                        <div className="text-[11px] text-slate-400">
-                          {isRange ? "末月利润" : "总利润"} <span className={r.totalProfit >= 0 ? "text-emerald-600" : "text-rose-600"}>{fmtMoney(r.totalProfit)}</span>
-                        </div>
-                      </div>
+                      {isOpen ? <ChevronDown className="h-3.5 w-3.5 text-slate-400" /> : <ChevronRight className="h-3.5 w-3.5 text-slate-400" />}
+                      <Landmark className={`h-3.5 w-3.5 ${grp.color.icon} rounded p-0.5 text-white`} />
+                      <span>公司主体：{grp.entityName}</span>
+                      <span className="rounded-full bg-slate-100 px-1.5 py-0.5 text-[10px] font-normal text-slate-500">{grp.rows.length} 个场地方</span>
+                      <span className={`ml-auto rounded-full px-1.5 py-0.5 text-[10px] font-normal tabular-nums ${profitSum >= 0 ? "bg-emerald-50 text-emerald-600" : "bg-rose-50 text-rose-600"}`}>
+                        {isRange ? "区间利润" : "总利润"} {fmtMoney(profitSum)}
+                      </span>
                     </button>
-                  ))}
-                </div>
-              ))
+                    {isOpen && grp.rows.map((r: any) => (
+                      <button
+                        key={r.landlord.id}
+                        onClick={() => setSelectedLandlordId(r.landlord.id)}
+                        className={`flex w-full items-center gap-2 border-b px-3 py-2.5 pl-6 text-left text-xs transition-colors ${selectedLandlordId === r.landlord.id ? "bg-emerald-50 border-l-2 border-l-emerald-500" : "hover:bg-slate-50"}`}
+                      >
+                        <MapPin className="h-4 w-4 shrink-0 text-slate-400" />
+                        <div className="min-w-0 flex-1">
+                          <div className="font-medium text-slate-800 truncate">{r.landlord.name}</div>
+                          <div className="text-[11px] text-slate-400">
+                            {isRange ? "末月利润" : "总利润"} <span className={r.totalProfit >= 0 ? "text-emerald-600" : "text-rose-600"}>{fmtMoney(r.totalProfit)}</span>
+                          </div>
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                );
+              })
             )
           ) : (
             (shareholders.data ?? []).length === 0 ? (
