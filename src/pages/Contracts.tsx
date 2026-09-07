@@ -523,7 +523,7 @@ export default function Contracts() {
                       <th className={thR}>押金</th>
                       <th className={thR}>首月场地租金</th>
                       <th className={thR}>场地费退款</th>
-                      <th className={th}>场地租金付款方式</th>
+                      <th className={th}>场地租金收款方式</th>
                       <th className={th}>合同期限</th>
                       <th className={thR}>剩余天数</th>
                       <th className={th}>状态</th>
