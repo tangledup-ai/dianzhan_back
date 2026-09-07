@@ -12,6 +12,7 @@ import { Button } from "@/components/ui/button";
 import { inputCls } from "@/components/fields";
 import * as XLSX from "xlsx";
 import { fmtMoney, fmtNum, fmtDate } from "@/lib/format";
+import { cabinetCounter, splitByAllocs } from "@/lib/alloc";
 import { Download, Search, ChevronDown, ChevronRight, FileText, Building2, DollarSign, Landmark, ExternalLink } from "lucide-react";
 import { toast } from "sonner";
 
@@ -36,30 +37,28 @@ export default function Entities() {
     const meterList = meters.data ?? [];
     const cabinetList = cabinets.data ?? [];
 
-    // 合同主体归属（与主体损益表口径一致）：
-    // - 有 entity_id：精确归属
-    // - 无 entity_id：按「场地+品牌」的电表数比例分摊到相关主体（收入按品牌电表，场地成本按场地电表）
-    // - 电表还没关联主体的合同：进入「未指定主体（待归属）」，关联后自动归位
+    // 合同主体归属（与合同页/主体损益表口径一致）：
+    // - 一律按电表柜数比例分摊（收入按「场地+品牌」电表，场地成本按场地全部计费电表；每块表按 max(1, 实际柜数) 计）
+    // - contracts.entity_id 仅作电表默认报税主体（新表跟随值），不参与金额分摊
+    // - 场地下暂无已归属主体的电表时：合同进入「未指定主体（待归属）」，关联后自动归位
     const contractAllocs = new Map<number, { entityId: number; ratio: number }[]>();
     const unattributedContracts: any[] = [];
-    const weightIncome = new Map<string, Map<number, number>>();   // "场地:品牌" -> 主体 -> 电表数
-    const weightLandlord = new Map<number, Map<number, number>>(); // 场地 -> 主体 -> 电表数
+    const weightIncome = new Map<string, Map<number, number>>();   // "场地:品牌" -> 主体 -> 柜数
+    const weightLandlord = new Map<number, Map<number, number>>(); // 场地 -> 主体 -> 柜数
+    const cabsOf = cabinetCounter(cabinetList);
     for (const m of meterList) {
       if (!m.landlordId || m.entityId == null) continue;
       if (!(m.brandId != null || m.tag === "共享电表")) continue;
+      const cabs = cabsOf(m.id);
       const lk = weightLandlord.get(m.landlordId) ?? new Map<number, number>();
-      lk.set(m.entityId, (lk.get(m.entityId) || 0) + 1);
+      lk.set(m.entityId, (lk.get(m.entityId) || 0) + cabs);
       weightLandlord.set(m.landlordId, lk);
       const bkey = `${m.landlordId}:${m.brandId ?? "shared"}`;
       const bk = weightIncome.get(bkey) ?? new Map<number, number>();
-      bk.set(m.entityId, (bk.get(m.entityId) || 0) + 1);
+      bk.set(m.entityId, (bk.get(m.entityId) || 0) + cabs);
       weightIncome.set(bkey, bk);
     }
     for (const c of contractList) {
-      if (c.entityId != null) {
-        contractAllocs.set(c.id, [{ entityId: c.entityId, ratio: 1 }]);
-        continue;
-      }
       if (c.landlordId == null) { unattributedContracts.push(c); continue; }
       const wmap = c.contractType === "品牌方合同"
         ? weightIncome.get(`${c.landlordId}:${c.brandId ?? "shared"}`)
@@ -68,6 +67,18 @@ export default function Entities() {
       if (entries.length === 0) { unattributedContracts.push(c); continue; }
       const totalW = entries.reduce((s, [, w]) => s + w, 0);
       contractAllocs.set(c.id, entries.map(([eid, w]) => ({ entityId: eid, ratio: w / totalW })));
+    }
+
+    // 每份合同在各主体名下的分片金额（月租/年租，舍入到分，尾差归占比最大的主体）
+    const sliceMap = new Map<number, Map<number, { monthly: number; annual: number }>>();
+    for (const c of contractList) {
+      const allocs = contractAllocs.get(c.id);
+      if (!allocs) continue;
+      const monthly = splitByAllocs(Number(c.monthlyRent) || 0, allocs);
+      const annual = splitByAllocs(Number(c.rentAmount) || 0, allocs);
+      const m = new Map<number, { monthly: number; annual: number }>();
+      for (const [eid, v] of monthly) m.set(eid, { monthly: v, annual: annual.get(eid) || 0 });
+      sliceMap.set(c.id, m);
     }
 
     const mapped = entityList
@@ -79,17 +90,23 @@ export default function Entities() {
         // 该主体关联的场地ID集合（来自电表的landlord_id）
         // （entityLandlordIds 已由上方 weightLandlord/contractAllocs 的归属逻辑取代）
 
-        // 该主体的合同：entity_id 精确归属 + 未指定主体的合同按电表数分摊（_ratio 为分摊比例）
+        // 该主体的合同：按柜数分摊（_ratio 为分摊比例，_mSlice/_aSlice 为该主体名下分片金额，尾差已归最大主体）
         const entityContracts = contractList
           .filter((c: any) => (contractAllocs.get(c.id) ?? []).some((a: any) => a.entityId === entity.id))
           .map((c: any) => {
             const alloc = (contractAllocs.get(c.id) ?? []).find((a: any) => a.entityId === entity.id);
-            return { ...c, _ratio: alloc ? alloc.ratio : 1 };
+            const slice = sliceMap.get(c.id)?.get(entity.id);
+            return {
+              ...c,
+              _ratio: alloc ? alloc.ratio : 1,
+              _mSlice: slice ? slice.monthly : (Number(c.monthlyRent) || 0),
+              _aSlice: slice ? slice.annual : (Number(c.rentAmount) || 0),
+            };
           });
 
-        // 汇总数据
-        const totalMonthlyRent = entityContracts.reduce((sum: number, c: any) => sum + (Number(c.monthlyRent) || 0) * (c._ratio ?? 1), 0);
-        const totalAnnualRent = entityContracts.reduce((sum: number, c: any) => sum + (Number(c.rentAmount) || 0) * (c._ratio ?? 1), 0);
+        // 汇总数据（分片金额相加，跨主体合计闭合无尾差）
+        const totalMonthlyRent = entityContracts.reduce((sum: number, c: any) => sum + (c._mSlice ?? 0), 0);
+        const totalAnnualRent = entityContracts.reduce((sum: number, c: any) => sum + (c._aSlice ?? 0), 0);
         const costContracts = entityContracts.filter((c: any) => c.contractType === "场地合同");
         const incomeContracts = entityContracts.filter((c: any) => c.contractType === "品牌方合同");
 
@@ -199,7 +216,11 @@ export default function Entities() {
           });
         }
         const g = byLandlord.get(lid);
-        (c.contractType === "品牌方合同" ? g.incomeContracts : g.costContracts).push({ ...c, _ratio: 1 });
+        (c.contractType === "品牌方合同" ? g.incomeContracts : g.costContracts).push({
+          ...c, _ratio: 1,
+          _mSlice: Number(c.monthlyRent) || 0,
+          _aSlice: Number(c.rentAmount) || 0,
+        });
       }
       result = [...mapped, {
         id: -1,
@@ -262,14 +283,13 @@ export default function Entities() {
               ? Math.round((endDate.getTime() - startDate.getTime()) / (365.25 * 24 * 60 * 60 * 1000) * 10) / 10
               : "";
             const totalCabinets = station.totalCabinets || 1;
-            const unitCost = costContract?.monthlyRent
-              ? Math.round(Number(costContract.monthlyRent) / totalCabinets)
-              : "";
-            const monthlyRent = inc?.monthlyRent ? Number(inc.monthlyRent) : 0;
+            const costRent = costContract?._mSlice ?? (Number(costContract?.monthlyRent) || 0);
+            const unitCost = costRent ? Math.round(costRent / totalCabinets) : "";
+            const monthlyRent = inc?._mSlice ?? (Number(inc?.monthlyRent) || 0);
             const annualIncome = monthlyRent * 12;
             const taxRate = inc?.taxEnabled ? Number(inc.taxRate) || 0 : 0;
             const netIncome = taxRate > 0 ? Math.round(monthlyRent * (1 - taxRate) * 12 * 100) / 100 : annualIncome;
-            const rentProfit = netIncome - (Number(costContract?.monthlyRent) || 0);
+            const rentProfit = netIncome - costRent;
 
             allRows.push([
               seq,                          // A: 序号
@@ -283,7 +303,7 @@ export default function Entities() {
               "",                           // I: 负责人
               costContract ? `${fmtDate(costContract.startDate)} ~ ${fmtDate(costContract.endDate)}` : "", // J: 合同租期
               years ? years + "年" : "",    // K: 合作年限
-              costContract?.monthlyRent ?? "", // L: 租金成本
+              costContract?._mSlice ?? costContract?.monthlyRent ?? "", // L: 租金成本
               costContract?.payMethod ?? "",   // M: 付款方式
               "",                           // N: 25年~26年付款情况
               "",                           // O: 26年~27年付款情况
@@ -613,13 +633,14 @@ export default function Entities() {
                                     ? Math.round((endDate.getTime() - startDate.getTime()) / (365.25 * 24 * 60 * 60 * 1000) * 10) / 10
                                     : null;
                                   const totalCabinets = landlord.brands.reduce((s: number, st: any) => s + st.totalCabinets, 0) || 1;
-                                  const unitCost = c.monthlyRent ? Math.round(Number(c.monthlyRent) / totalCabinets) : null;
+                                  const costRent = c._mSlice ?? 0;
+                                  const unitCost = costRent ? Math.round(costRent / totalCabinets) : null;
 
                                   return (
                                     <tr key={c.id} className="border-b last:border-0">
                                       <td className="px-3 py-2 whitespace-nowrap">{fmtDate(c.startDate)} ~ {fmtDate(c.endDate)}</td>
                                       <td className="px-3 py-2 text-right tabular-nums">{years ? `${years}年` : "-"}</td>
-                                      <td className="px-3 py-2 text-right tabular-nums font-medium">{c.monthlyRent ? fmtMoney(Math.round(Number(c.monthlyRent) * (c._ratio ?? 1) * 100) / 100) : "-"}</td>
+                                      <td className="px-3 py-2 text-right tabular-nums font-medium">{costRent ? fmtMoney(costRent) : "-"}</td>
                                       <td className="px-3 py-2">{c.payMethod ?? "-"}</td>
                                       <td className="px-3 py-2">
                                         <StatusBadge status={c.payStatus || "未付款"} />
@@ -655,7 +676,7 @@ export default function Entities() {
                               </thead>
                               <tbody>
                                 {landlord.incomeContracts.map((c: any) => {
-                                  const monthlyRent = (Number(c.monthlyRent) || 0) * (c._ratio ?? 1);
+                                  const monthlyRent = c._mSlice ?? (Number(c.monthlyRent) || 0);
                                   const annualIncome = monthlyRent * 12;
                                   const taxRate = c.taxEnabled ? Number(c.taxRate) || 0 : 0;
                                   const netIncome = taxRate > 0
@@ -682,11 +703,11 @@ export default function Entities() {
                                     <td className="px-3 py-2">-</td>
                                     <td className="px-3 py-2">-</td>
                                     <td className="px-3 py-2">-</td>
-                                    <td className="px-3 py-2 text-right tabular-nums">{fmtMoney(landlord.incomeContracts.reduce((s: number, c: any) => s + (Number(c.monthlyRent) || 0) * (c._ratio ?? 1), 0))}</td>
+                                    <td className="px-3 py-2 text-right tabular-nums">{fmtMoney(landlord.incomeContracts.reduce((s: number, c: any) => s + (c._mSlice ?? 0), 0))}</td>
                                     <td className="px-3 py-2">-</td>
                                     <td className="px-3 py-2 text-right tabular-nums text-emerald-600">
                                       {fmtMoney(landlord.incomeContracts.reduce((s: number, c: any) => {
-                                        const mr = (Number(c.monthlyRent) || 0) * (c._ratio ?? 1);
+                                        const mr = c._mSlice ?? (Number(c.monthlyRent) || 0);
                                         const tr = c.taxEnabled ? Number(c.taxRate) || 0 : 0;
                                         return s + (tr > 0 ? mr * (1 - tr) * 12 : mr * 12);
                                       }, 0))}

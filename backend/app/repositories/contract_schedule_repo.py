@@ -67,20 +67,33 @@ def _split_periods(start: date, end: date, months_per_period: int):
     return periods
 
 
-def payment_due_months(start_date, end_date, pay_method, rent_advance_days=0):
+def payment_due_months(start_date, end_date, pay_method, rent_advance_days=0, contract_id=None):
     """按合同时间/付款方式/提前支付天数计算场地租金各期付款的到期月份（YYYY-MM 列表）。
 
     每期租金在期初前 rent_advance_days 天支付，到期月份取该付款日期所在月份。
     用于站点「提交审核」校验所选月份是否处于可提交场地费的月份。
+    自定义周期：分期完全由用户手动定义，到期月从 rent_payment_schedule 实际分期行推导
+    （需要传 contract_id；未录分期时返回空列表，即该合同暂无可提交月份）。
     """
+    if isinstance(start_date, str):
+        start_date = date.fromisoformat(str(start_date)[:10]) if start_date else None
+    if isinstance(end_date, str):
+        end_date = date.fromisoformat(str(end_date)[:10]) if end_date else None
     if not start_date or not end_date:
         return []
-    if isinstance(start_date, str):
-        start_date = date.fromisoformat(str(start_date)[:10])
-    if isinstance(end_date, str):
-        end_date = date.fromisoformat(str(end_date)[:10])
-    months = _PERIOD_MONTHS.get(pay_method, 1)
     days = int(rent_advance_days or 0)
+    if pay_method == "自定义周期" and contract_id:
+        months = set()
+        for r in list_payment_schedules(contract_id=contract_id):
+            ps = r.get("period_start")
+            if not ps:
+                continue
+            if isinstance(ps, str):
+                ps = date.fromisoformat(ps[:10])
+            due = ps - timedelta(days=days)
+            months.add(f"{due.year:04d}-{due.month:02d}")
+        return sorted(months)
+    months = _PERIOD_MONTHS.get(pay_method, 1)
     result = []
     for ps, _pe in _split_periods(start_date, end_date, months):
         due = ps - timedelta(days=days)

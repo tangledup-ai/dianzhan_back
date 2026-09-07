@@ -1,6 +1,6 @@
 import { useMemo, useState, useEffect, useRef, type ReactNode } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { listContracts, createContract, updateContract, deleteContract, importContractsExcel, getContractAudit } from "@/api/contracts";
+import { listContracts, createContract, updateContract, deleteContract, importContractsExcel, getContractAudit, createSchedule } from "@/api/contracts";
 import { createApproval } from "@/api/approvals";
 import { listBrands, listLandlords, listEntities } from "@/api/directory";
 import { listMeters } from "@/api/meters";
@@ -15,6 +15,7 @@ import * as XLSX from "xlsx";
 import { fmtMoney, fmtNum, fmtDate, numOrNull } from "@/lib/format";
 import { Download, Plus, Search, Pencil, Trash2, AlertTriangle, FileText, ArrowDownCircle, ArrowUpCircle, ExternalLink, ChevronDown, ChevronRight, Upload, Landmark } from "lucide-react";
 import { groupByEntity } from "@/lib/groupColors";
+import { cabinetCounter, splitByAllocs } from "@/lib/alloc";
 import { ContractSchedule } from "@/components/ContractSchedule";
 import { toast } from "sonner";
 
@@ -48,6 +49,71 @@ function splitPeriodsPreview(startDate: string, endDate: string, payMethod: stri
 }
 
 const ymd = (x: Date) => `${x.getFullYear()}-${String(x.getMonth() + 1).padStart(2, "0")}-${String(x.getDate()).padStart(2, "0")}`;
+
+// ── 分期自动拆期开关（场地合同/品牌方合同共用）──
+// 开（默认）：保存后后端按「收付款方式 × 起止日期」自动拆出每期与应收应付；
+// 关：不自动拆期，新建合同时可在表单下方「分期明细」手动录入，保存后也可在列表展开行「+ 添加一期」
+// 选择「自定义周期」付款方式时禁用（分期完全手动定义，不可开启）
+function AutoSplitToggle({ checked, onChange, disabled }: { checked: boolean; onChange: (v: boolean) => void; disabled?: boolean }) {
+  return (
+    <div className={`md:col-span-2 flex flex-wrap items-center gap-2 rounded-md border px-2.5 py-1.5 ${disabled ? "border-slate-100 bg-slate-50" : "border-slate-200 bg-slate-50/60"}`}>
+      <Switch checked={checked} onCheckedChange={onChange} disabled={disabled} />
+      <span className="text-xs font-medium text-slate-700">自动计算分期</span>
+      <span className="text-[10px] leading-4 text-slate-400">
+        {disabled
+          ? "已选「自定义周期」：分期完全手动定义，此处不可开启"
+          : checked
+            ? "按收付款方式 × 起止日期自动拆出每期起止与金额"
+            : "已关闭：在下方「分期明细」手动录入各期，保存后也可在列表展开行补录"}
+      </span>
+    </div>
+  );
+}
+
+// ── 手动分期明细编辑器（新建合同 + 关闭自动计算分期时显示；保存合同时一并写入分期表）──
+type ManualPeriod = { periodStart: string; periodEnd: string; amount: string; remark: string };
+
+function ManualPeriodsEditor({ periods, onChange }: { periods: ManualPeriod[]; onChange: (p: ManualPeriod[]) => void }) {
+  const update = (i: number, patch: Partial<ManualPeriod>) =>
+    onChange(periods.map((p, idx) => (idx === i ? { ...p, ...patch } : p)));
+  return (
+    <div className="rounded-lg border border-slate-200 bg-slate-50/60 p-2.5">
+      <div className="mb-2 flex items-center justify-between">
+        <span className="text-xs font-semibold text-slate-600">分期明细（手动定义）</span>
+        <button type="button"
+          className="rounded bg-emerald-600 px-2 py-1 text-[11px] text-white hover:bg-emerald-700"
+          onClick={() => onChange([...periods, { periodStart: "", periodEnd: "", amount: "", remark: "" }])}>
+          + 添加一期
+        </button>
+      </div>
+      {periods.length === 0 && (
+        <div className="py-1.5 text-center text-[11px] text-slate-400">
+          暂无分期，点「添加一期」逐期录入区间与金额；保存合同后也可在列表展开行继续补录
+        </div>
+      )}
+      <div className="space-y-1.5">
+        {periods.map((p, i) => (
+          <div key={i} className="flex flex-wrap items-center gap-2">
+            <span className="w-9 shrink-0 text-[11px] text-slate-400">第{i + 1}期</span>
+            <input type="date" className={inputCls + " w-32 text-xs"} value={p.periodStart}
+              onChange={(e) => update(i, { periodStart: e.target.value })} />
+            <span className="text-[11px] text-slate-400">~</span>
+            <input type="date" className={inputCls + " w-32 text-xs"} value={p.periodEnd}
+              onChange={(e) => update(i, { periodEnd: e.target.value })} />
+            <input type="number" placeholder="金额" className={inputCls + " w-24 text-xs"} value={p.amount}
+              onChange={(e) => update(i, { amount: e.target.value })} />
+            <input placeholder="备注" className={inputCls + " w-32 text-xs"} value={p.remark}
+              onChange={(e) => update(i, { remark: e.target.value })} />
+            <button type="button" className="rounded p-1 text-slate-400 hover:text-rose-500" title="删除该期"
+              onClick={() => onChange(periods.filter((_, idx) => idx !== i))}>
+              <Trash2 className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
 
 export default function Contracts() {
   const currentYear = new Date().getFullYear();
@@ -199,18 +265,15 @@ export default function Contracts() {
   const entityGroups = useMemo(() => {
     const entityNameById = new Map<number, string>((entitiesQ.data ?? []).map((e: any) => [e.id, e.name] as [number, string]));
 
-    // 电表主体权重（与主体损益表口径一致）：每块计费电表按 GREATEST(1, 柜数) 计
-    const cabCount = new Map<number, number>();
-    for (const cab of cabinetsQ.data ?? []) {
-      cabCount.set(cab.meterId, (cabCount.get(cab.meterId) || 0) + 1);
-    }
+    // 电表主体权重（与主体损益表口径一致）：每块计费电表按 max(1, 实际柜数) 计
+    const cabsOf = cabinetCounter(cabinetsQ.data ?? []);
     const weightIncome = new Map<string, Map<number, number>>();   // "场地:品牌" -> 主体 -> 柜数
     const weightLandlord = new Map<number, Map<number, number>>(); // 场地 -> 主体 -> 柜数
     for (const m of metersQ.data ?? []) {
       if (!m.landlordId || m.entityId == null) continue;
       if (!(m.brandId != null || m.tag === "共享电表")) continue;
       if (String(m.meterNo || "").startsWith("TEST")) continue;
-      const cabs = Math.max(1, cabCount.get(m.id) || 0);
+      const cabs = cabsOf(m.id);
       const lk = weightLandlord.get(m.landlordId) ?? new Map<number, number>();
       lk.set(m.entityId, (lk.get(m.entityId) || 0) + cabs);
       weightLandlord.set(m.landlordId, lk);
@@ -220,9 +283,9 @@ export default function Contracts() {
       weightIncome.set(bkey, bk);
     }
 
-    // 合同 → 主体分配：有 entity_id 精确归属；无 entity_id 按电表柜数比例分摊（收入按品牌电表，成本按场地电表）
+    // 合同 → 主体分配：一律按电表柜数比例分摊（收入按品牌电表，成本按场地电表含共享表）；
+    // contracts.entity_id 仅作电表默认报税主体（新表跟随值），不参与金额分摊
     const allocOf = (c: any): { entityId: number; ratio: number }[] => {
-      if (c.entityId != null) return [{ entityId: c.entityId, ratio: 1 }];
       if (!c.landlordId) return [];
       const wmap = c.contractType === "品牌方合同"
         ? weightIncome.get(`${c.landlordId}:${c.brandId ?? "shared"}`)
@@ -257,11 +320,16 @@ export default function Contracts() {
           bucket("未指定主体", { ...c, _ratio: 1 });
           return;
         }
+        // 跨主体切片：每片舍入到分，尾差归占比最大的主体（月租、年租同步拆分）
+        const mSlices = splitByAllocs(Number(c.monthlyRent || 0), allocs);
+        const aSlices = splitByAllocs(Number(c.rentAmount || 0), allocs);
         for (const a of allocs) {
           const name = entityNameById.get(a.entityId) || "未指定主体";
-          const row = a.ratio < 1
-            ? { ...c, monthlyRent: Math.round(Number(c.monthlyRent || 0) * a.ratio * 100) / 100, _ratio: a.ratio }
-            : { ...c, _ratio: 1 };
+          const row: any = { ...c, _ratio: a.ratio };
+          if (allocs.length > 1) {
+            row.monthlyRent = mSlices.get(a.entityId) ?? 0;
+            row.rentAmount = aSlices.get(a.entityId) ?? 0;
+          }
           bucket(name, row);
         }
       };
@@ -762,6 +830,7 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
     landlordId: "", brandId: "", contractType: defaultType || "场地合同",
     electricityPrice: "", rentAmount: "", cabinetsCount: "", unitMonthlyRent: "", monthlyRent: "",
     rentCalcMethod: defaultType === "品牌方合同" ? "按柜子数量" : "固定价格", payMethod: "", rentAdvanceDays: "0",
+    autoSplit: true,
     region: "", address: "", latitude: "", longitude: "", payEntity: "", entityId: "",
     startDate: "", endDate: "",
     taxEnabled: false, taxRate: "0.01", postTaxElectricityPrice: "",
@@ -770,6 +839,10 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
     remark: "",
   };
   const [f, setF] = useState(blank);
+  // 新建合同 + 关闭自动拆期时的手动分期明细（保存后逐期写入分期表）
+  const [manualPeriods, setManualPeriods] = useState<ManualPeriod[]>([]);
+  // 选择「自定义周期」时自动关闭且不可打开自动计算分期
+  const autoSplitLocked = f.payMethod === "自定义周期";
   const queryClient = useQueryClient();
   const brands = useQuery({ queryKey: ["brands"], queryFn: listBrands, enabled: open });
   const landlords = useQuery({ queryKey: ["landlords"], queryFn: listLandlords, enabled: open });
@@ -841,18 +914,22 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
       (m: any) => m.landlordId === landlordId && (m.brandId != null || m.tag === "共享电表") && !String(m.meterNo || "").startsWith("TEST")
     );
 
-    // 3) 本合同覆盖电表数 / 该场地总电表数（每表计 1 柜）
-    const liveCabs = isShared
-      ? siteMeters.filter((m: any) => !m.brandId).length
-      : siteMeters.filter((m: any) => m.brandId === brandId).length;
-    const totalCabs = siteMeters.length;
+    // 3) 本合同覆盖柜数 / 该场地总柜数（每块表按 max(1, 实际柜数) 计，与后端、合同页分组同口径）
+    const cabsOf = cabinetCounter(cabinets.data ?? []);
+    const liveCabs = (isShared
+      ? siteMeters.filter((m: any) => !m.brandId)
+      : siteMeters.filter((m: any) => m.brandId === brandId)
+    ).reduce((s: number, m: any) => s + cabsOf(m.id), 0);
+    const totalCabs = siteMeters.reduce((s: number, m: any) => s + cabsOf(m.id), 0);
 
     // 无场地合同（月租合计 0）与 无电表可分摊（总柜数 0）是两种不同情况，展示时区分提示
     const value = venueMonthlyRent > 0 && totalCabs > 0
       ? Math.round((venueMonthlyRent / totalCabs) * liveCabs * 100) / 100
       : null;
-    return { venueMonthlyRent, liveCabs, totalCabs, value };
-  }, [f.landlordId, f.brandId, f.contractType, contracts.data, meters.data]);
+    // 每柜成本（3 位小数，仅展示）：场地月租 ÷ 总柜数
+    const unitCost = venueMonthlyRent > 0 && totalCabs > 0 ? venueMonthlyRent / totalCabs : null;
+    return { venueMonthlyRent, liveCabs, totalCabs, value, unitCost };
+  }, [f.landlordId, f.brandId, f.contractType, contracts.data, meters.data, cabinets.data]);
   const venueCostLive = venueCostInfo?.value ?? null;
 
   // 当使用"按柜子数量"方式时，自动计算场地月租金，并同步年租金 = 月租金 × 12
@@ -902,6 +979,7 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
 
   useEffect(() => {
     if (!open) return;
+    setManualPeriods([]); // 手动分期明细只在新建时录入；已有合同在列表展开行管理
     if (record) {
       setF({
         landlordId: record.landlordId ? String(record.landlordId) : "",
@@ -912,6 +990,7 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
         cabinetsCount: record.cabinetsCount ? String(record.cabinetsCount) : "", unitMonthlyRent: record.unitMonthlyRent ? String(record.unitMonthlyRent) : "",
         rentCalcMethod: record.rent_calc_method || (record.contractType === "品牌方合同" ? "按柜子数量" : "固定价格"),
         monthlyRent: record.monthlyRent ? String(record.monthlyRent) : "", payMethod: record.payMethod ?? "",
+        autoSplit: record.autoSplit ?? true,
         rentAdvanceDays: record.rentAdvanceDays != null ? String(record.rentAdvanceDays) : "0",
         region: record.region ?? "", address: record.address ?? "",
         latitude: record.latitude != null ? String(record.latitude) : "",
@@ -938,7 +1017,29 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
   const set = (k: string) => (v: string) => setF((p) => ({ ...p, [k]: v }));
 
   const save = useMutation({
-    mutationFn: (data: any) => record ? updateContract(record.id, data) : createContract(data),
+    mutationFn: async (data: any) => {
+      const contract = record ? await updateContract(record.id, data) : await createContract(data);
+      // 新建 + 关闭自动拆期：把表单「分期明细」一并写入分期表（单期失败不中断，可回列表补录）
+      if (!record && !f.autoSplit) {
+        const side = f.contractType === "场地合同" ? "payment" : "income";
+        for (const p of manualPeriods) {
+          if (!p.periodStart && !p.periodEnd && !p.amount && !p.remark) continue; // 跳过空行
+          try {
+            await createSchedule({
+              contractId: contract.id,
+              side,
+              periodStart: p.periodStart || undefined,
+              periodEnd: p.periodEnd || undefined,
+              amount: p.amount ? Number(p.amount) : undefined,
+              remark: p.remark || undefined,
+            });
+          } catch (err) {
+            console.error("手动分期写入失败（可回列表补录）", p, err);
+          }
+        }
+      }
+      return contract;
+    },
     onSuccess: () => { toast.success("合同已保存"); queryClient.invalidateQueries(); onClose(); },
     onError: (e: any) => toast.error(e.message),
   });
@@ -978,9 +1079,9 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
       return;
     }
 
-    // 拆期预检：合同期限不足以凑成完整付款周期时提醒（尾期金额留空，由用户手动填写）
+    // 拆期预检（仅自动拆期时）：合同期限不足以凑成完整付款周期时提醒（尾期金额留空，由用户手动填写）
     const effEnd = f.earlyEndDate || f.endDate;
-    if (f.payMethod && f.startDate && effEnd) {
+    if (f.autoSplit && f.payMethod && f.startDate && effEnd) {
       const periods = splitPeriodsPreview(f.startDate, effEnd, f.payMethod);
       const shortOnes = periods.filter(p => p.pe < p.nominalEnd);
       if (shortOnes.length > 0) {
@@ -1006,13 +1107,14 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
       rentCalcMethod: f.rentCalcMethod,
       monthlyRent: f.monthlyRent ? Number(f.monthlyRent) : null,
       payMethod: f.payMethod || null,
+      autoSplit: f.autoSplit,
       rentAdvanceDays: f.rentAdvanceDays === "" ? 0 : Number(f.rentAdvanceDays),
       region: f.region || null,
       address: f.address || null,
       latitude: numOrNull(f.latitude),
       longitude: numOrNull(f.longitude),
       payEntity: f.payEntity || null,
-      // 主体归属：场地合同可选（默认继承来源）；品牌方合同以电表主体为准，不再携带
+      // 默认报税主体：仅作电表默认跟随值，不参与金额分摊；品牌方合同不携带
       entityId: f.contractType === "场地合同" ? (f.entityId ? Number(f.entityId) : null) : null,
       startDate: f.startDate || null,
       endDate: f.endDate || null,
@@ -1094,14 +1196,20 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
               </>
             )}
             {f.contractType === "场地合同" && (
-              <Field label="收付款主体">
-                <SearchSelect value={f.entityId} onChange={set("entityId")}
-                  placeholder="未指定（可搜索公司主体）"
-                  options={(entities.data ?? []).map((e: any) => ({ value: String(e.id), label: e.name }))} />
-                <div className="-mt-1.5 text-[11px] text-slate-400">
-                  场地成本默认全额归该主体；不指定时按柜数分摊到场地内各主体
+              <>
+                <Field label="默认报税主体">
+                  <SearchSelect value={f.entityId} onChange={set("entityId")}
+                    placeholder="未指定（可搜索公司主体）"
+                    options={[
+                      { value: "", label: "暂不选择（未指定主体）" },
+                      ...(entities.data ?? []).map((e: any) => ({ value: String(e.id), label: e.name })),
+                    ]} />
+                </Field>
+                {/* 提示放在独立单元格，避免把选择框顶高、与场地方/合同类型错位 */}
+                <div className="self-end pb-2 text-[11px] leading-4 text-slate-400">
+                  仅作为该场地下新电表/未设主体电表的默认报税主体，不影响金额分摊
                 </div>
-              </Field>
+              </>
             )}
             {f.contractType === "品牌方合同" && (
               <div className="rounded border border-slate-200 bg-slate-50/60 px-2.5 py-1.5 text-[11px] leading-5 text-slate-500 md:col-span-2">
@@ -1167,10 +1275,13 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
                 </Field>
                 <Field label="电费单价（元/度）"><NumInput value={f.electricityPrice} onChange={set("electricityPrice")} placeholder="0.65" /></Field>
                 <Field label="场地租金付款方式">
-                  <SelectInput value={f.payMethod} onChange={set("payMethod")}
-                    options={[{ value: "", label: "请选择" }, { value: "月付", label: "月付" }, { value: "季付", label: "季付" }, { value: "半年付", label: "半年付" }, { value: "年付", label: "年付" }]} />
+                  <SelectInput value={f.payMethod}
+                    onChange={(v) => setF((p) => ({ ...p, payMethod: v, autoSplit: v === "自定义周期" ? false : p.autoSplit }))}
+                    options={[{ value: "", label: "请选择" }, { value: "月付", label: "月付" }, { value: "季付", label: "季付" }, { value: "半年付", label: "半年付" }, { value: "年付", label: "年付" }, { value: "自定义周期", label: "自定义周期" }]} />
                 </Field>
-                {f.payMethod && f.startDate && (f.earlyEndDate || f.endDate) && (
+                <AutoSplitToggle checked={f.autoSplit} disabled={autoSplitLocked}
+                  onChange={(v) => setF((p) => ({ ...p, autoSplit: v }))} />
+                {f.autoSplit && f.payMethod && f.startDate && (f.earlyEndDate || f.endDate) && (
                   <div className="rounded border border-amber-200 bg-amber-50/60 px-2.5 py-1.5 text-[11px] leading-5 text-amber-800 md:col-span-2">
                     将拆成 {splitPeriodsPreview(f.startDate, f.earlyEndDate || f.endDate, f.payMethod).length} 期：
                     {splitPeriodsPreview(f.startDate, f.earlyEndDate || f.endDate, f.payMethod).map((p, i) => (
@@ -1238,7 +1349,11 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
               <div>
                 <span className="mb-1 block text-xs font-medium text-slate-500">
                   承担场地成本（元/月）
-                  <span className="block text-[10px] font-normal text-slate-400">根据场地合同月租金和所有品牌方计费柜数自动计算，不可编辑</span>
+                  <span className="block text-[10px] font-normal text-slate-400">
+                    {venueCostInfo?.unitCost != null
+                      ? `每柜成本 = 场地月租 ${fmtMoney(venueCostInfo.venueMonthlyRent)} ÷ 总柜数 ${venueCostInfo.totalCabs} = ${venueCostInfo.unitCost.toFixed(3)} 元/柜/月`
+                      : "根据场地合同月租金和所有品牌方计费柜数自动计算，不可编辑"}
+                  </span>
                 </span>
                 <div className="flex h-9 items-center rounded-md border border-slate-200 bg-slate-50 px-3 text-sm text-amber-600 font-semibold tabular-nums">
                   {venueCostLive != null ? fmtMoney(venueCostLive)
@@ -1249,10 +1364,13 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
               </div>
               <Field label="电费收款单价（税前·元/度）"><NumInput value={f.electricityPrice} onChange={set("electricityPrice")} placeholder="1.20" /></Field>
               <Field label="场地租金收款方式">
-                <SelectInput value={f.payMethod} onChange={set("payMethod")}
-                  options={[{ value: "", label: "请选择" }, { value: "月付", label: "月收" }, { value: "季付", label: "季收" }, { value: "半年付", label: "半年收" }, { value: "年付", label: "年收" }]} />
+                <SelectInput value={f.payMethod}
+                  onChange={(v) => setF((p) => ({ ...p, payMethod: v, autoSplit: v === "自定义周期" ? false : p.autoSplit }))}
+                  options={[{ value: "", label: "请选择" }, { value: "月付", label: "月收" }, { value: "季付", label: "季收" }, { value: "半年付", label: "半年收" }, { value: "年付", label: "年收" }, { value: "自定义周期", label: "自定义周期" }]} />
               </Field>
-              {f.payMethod && f.startDate && (f.earlyEndDate || f.endDate) && (
+              <AutoSplitToggle checked={f.autoSplit} disabled={autoSplitLocked}
+                onChange={(v) => setF((p) => ({ ...p, autoSplit: v }))} />
+              {f.autoSplit && f.payMethod && f.startDate && (f.earlyEndDate || f.endDate) && (
                 <div className="rounded border border-amber-200 bg-amber-50/60 px-2.5 py-1.5 text-[11px] leading-5 text-amber-800 md:col-span-2">
                   将拆成 {splitPeriodsPreview(f.startDate, f.earlyEndDate || f.endDate, f.payMethod).length} 期：
                   {splitPeriodsPreview(f.startDate, f.earlyEndDate || f.endDate, f.payMethod).map((p, i) => (
@@ -1286,6 +1404,13 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
                 </button>
               )}
             </>
+          )}
+
+          {/* 新建合同 + 关闭自动拆期：表单内直接录入分期，保存后一并写入 */}
+          {!record && !f.autoSplit && (
+            <div className="col-span-4">
+              <ManualPeriodsEditor periods={manualPeriods} onChange={setManualPeriods} />
+            </div>
           )}
           </FormSection>
 

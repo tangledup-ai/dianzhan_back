@@ -331,7 +331,8 @@ async def snapshot(user: dict = Depends(get_current_user)):
             rent_pending.append({
                 "station": r["station"],
                 "seq": int(r["seq"]),
-                "amount": float(r["amount"]),
+                # amount 可空（历史数据存在未填金额的排期），按 0 兜底，避免整页快照 500
+                "amount": float(r["amount"]) if r["amount"] is not None else 0.0,
                 "periodEnd": r["period_end"].isoformat() if r["period_end"] else "",
             })
 

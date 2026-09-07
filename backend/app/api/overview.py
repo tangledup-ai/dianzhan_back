@@ -582,33 +582,36 @@ async def monthly_detail(request: Request, period: str = None):
         entity_names = {r["id"]: r["name"] for r in cur.fetchall()}
 
         def _split_by_cabs(amount: float, wmap: dict) -> list:
-            """按柜数权重把金额拆到主体；无权重时整笔归未指定（None）"""
+            """按柜数权重把金额拆到主体；无权重时整笔归未指定（None）。
+            每片舍入到分，尾差归占比最大的主体，保证各片合计等于总额"""
             total_w = sum(w for w in wmap.values() if w > 0)
             if total_w <= 0:
-                return [(None, amount)]
+                return [(None, round(amount, 2))]
+            amount = round(amount, 2)
+            eids = [e for e in wmap if wmap[e] > 0]
+            if len(eids) == 1:
+                return [(eids[0], amount)]
+            biggest = max(eids, key=lambda e: wmap[e])
             out, rest = [], amount
-            eids = sorted([e for e in wmap if wmap[e] > 0], key=lambda x: (x is None, x))
-            for i, eid in enumerate(eids):
+            for eid in eids:
+                if eid == biggest:
+                    continue
                 share = round(amount * wmap[eid] / total_w, 2)
-                if i == len(eids) - 1:
-                    share = round(rest, 2)
-                rest = round(rest - share, 2)
                 out.append((eid, share))
+                rest = round(rest - share, 2)
+            out.append((biggest, rest))
             return out
 
         def _group_name(eid) -> str:
             return (entity_names.get(eid) if eid is not None else None) or "未指定主体"
 
         # 明细按公司主体汇总（收入含首月/退款当月口径，成本为月租金合计）。
-        # 品牌方合同不再携带收付款主体（主体以电表为准）：未指定主体的合同
-        # 按该场地该品牌电表柜数分摊到各主体；场地合同未指定主体按场地内柜数分摊。
+        # 所有合同一律按电表柜数分摊到各主体（收入按场地+品牌电表，场地成本按场地全部计费电表）；
+        # contracts.entity_id 仅作电表默认报税主体（新表跟随值），不参与分摊。
         income_groups: dict = {}
         for c in rent_income_contracts:
             amount = rent_income_for_period(c, month_compact) - rent_refund_for_period(c, month_compact)
-            if c.get("entity_id") is not None:
-                allocs = [(c["entity_id"], amount)]
-            else:
-                allocs = _split_by_cabs(amount, weights_brand.get((c.get("landlord_id"), c.get("brand_id")), {}))
+            allocs = _split_by_cabs(amount, weights_brand.get((c.get("landlord_id"), c.get("brand_id")), {}))
             for eid, share in allocs:
                 name = _group_name(eid)
                 g = income_groups.setdefault(name, {"entityName": name, "contractCount": 0, "amount": 0.0})
@@ -617,10 +620,7 @@ async def monthly_detail(request: Request, period: str = None):
         cost_groups: dict = {}
         for c in rent_cost_contracts:
             amount = float(c["monthly_rent"] or 0)
-            if c.get("entity_id") is not None:
-                allocs = [(c["entity_id"], amount)]
-            else:
-                allocs = _split_by_cabs(amount, weights_ll.get(c.get("landlord_id"), {}))
+            allocs = _split_by_cabs(amount, weights_ll.get(c.get("landlord_id"), {}))
             for eid, share in allocs:
                 name = _group_name(eid)
                 g = cost_groups.setdefault(name, {"entityName": name, "contractCount": 0, "amount": 0.0})
@@ -1364,19 +1364,24 @@ async def entity_monthly(request: Request, period: str = None):
         conn.close()
 
     def split_by_weights(amount: float, wmap: dict, force_entity=None) -> list:
-        """按权重把金额拆到主体；权重为空/为 0 时整笔归 force_entity（或未指定）"""
+        """按权重把金额拆到主体；权重为空/为 0 时整笔归 force_entity（或未指定）。
+        每片舍入到分，尾差归占比最大的主体，保证各片合计等于总额"""
         total_w = sum(w for w in wmap.values() if w > 0)
         if total_w <= 0:
-            return [(force_entity, amount)]
-        out = []
-        rest = amount
+            return [(force_entity, round(amount, 2))]
+        amount = round(amount, 2)
         eids = [e for e in wmap if wmap[e] > 0]
-        for i, eid in enumerate(sorted(eids, key=lambda x: (x is None, x))):
-            share = amount * wmap[eid] / total_w
-            if i == len(eids) - 1:
-                share = rest  # 尾差归最后一家，保证合计闭合
+        if len(eids) == 1:
+            return [(eids[0], amount)]
+        biggest = max(eids, key=lambda e: wmap[e])
+        out, rest = [], amount
+        for eid in eids:
+            if eid == biggest:
+                continue
+            share = round(amount * wmap[eid] / total_w, 2)
+            out.append((eid, share))
             rest = round(rest - share, 2)
-            out.append((eid, round(share, 2)))
+        out.append((biggest, rest))
         return out
 
     # ── 电费直接归集 ──
@@ -1388,15 +1393,13 @@ async def entity_monthly(request: Request, period: str = None):
         b["elecCollect"] += float(r["collect_amount"] or 0)
         b["elecNet"] += float(r["collect_net"] or 0)
 
-    # ── 合同租金（收入=品牌方合同 / 成本=场地合同），按主体归属或柜数拆分 ──
+    # ── 合同租金（收入=品牌方合同 / 成本=场地合同），一律按电表柜数拆分到主体
+    #    （contracts.entity_id 仅作电表默认报税主体，不参与分摊）──
     for c in contracts:
         lid = c["landlord_id"]
         if c["contract_type"] == "场地合同":
             amount = round(float(c.get("monthly_rent") or 0), 2)
-            if c.get("entity_id") is not None:
-                allocations = [(c["entity_id"], amount)]
-            else:
-                allocations = split_by_weights(amount, weights_ll.get(lid, {}))
+            allocations = split_by_weights(amount, weights_ll.get(lid, {}))
             for eid, share in allocations:
                 acc.setdefault(eid, bucket(eid))["venueCost"] += share
         elif c["contract_type"] == "品牌方合同":
@@ -1405,12 +1408,9 @@ async def entity_monthly(request: Request, period: str = None):
             if c.get("rent_tax_enabled") and c.get("post_tax_rent_price") is not None:
                 tax = round(float(c.get("monthly_rent") or 0) - float(c["post_tax_rent_price"]), 2)
             wmap = weights_brand.get((lid, c.get("brand_id")), {})
-            if c.get("entity_id") is not None:
-                allocs = [(c["entity_id"], amount, tax)]
-            else:
-                inc_allocs = split_by_weights(amount, wmap)
-                tax_map = dict(split_by_weights(tax, wmap)) if tax > 0 else {}
-                allocs = [(eid, share, tax_map.get(eid, 0.0)) for eid, share in inc_allocs]
+            inc_allocs = split_by_weights(amount, wmap)
+            tax_map = dict(split_by_weights(tax, wmap)) if tax > 0 else {}
+            allocs = [(eid, share, tax_map.get(eid, 0.0)) for eid, share in inc_allocs]
             for eid, share, tshare in allocs:
                 b = acc.setdefault(eid, bucket(eid))
                 b["rentIncome"] += share

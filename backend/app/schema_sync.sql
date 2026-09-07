@@ -248,3 +248,8 @@ ALTER TABLE meter_entity_changes ADD COLUMN IF NOT EXISTS effective_period VARCH
 ALTER TABLE landlord_shareholder_configs ADD COLUMN IF NOT EXISTS entity_id INTEGER;
 ALTER TABLE landlord_introducer_configs ADD COLUMN IF NOT EXISTS entity_id INTEGER;
 ALTER TABLE dividend_shares ADD COLUMN IF NOT EXISTS entity_id INTEGER;
+
+-- ── 16) 合同分期自动拆期开关 ─────────────────────────────────
+-- TRUE（默认）：保存合同时按「场地收付款方式 × 起止日期」自动拆出每期与应收应付；
+-- FALSE：不自动拆期，由用户在合同列表展开该合同后「+ 添加一期」手动录入
+ALTER TABLE contracts ADD COLUMN IF NOT EXISTS auto_split BOOLEAN NOT NULL DEFAULT TRUE;

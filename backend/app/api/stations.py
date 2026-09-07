@@ -204,6 +204,7 @@ async def get_landlord_meter_view(landlord_id: int, period: str = None, request:
                     c.get("early_end_date") or c.get("end_date"),
                     c.get("pay_method"),
                     c.get("rent_advance_days"),
+                    contract_id=c.get("id"),
                 ),
             })
         elif c.get("contract_type") == "品牌方合同":

@@ -172,6 +172,15 @@ def list_contracts(brand_id: int = None, landlord_id: int = None, station_id: in
         conn.close()
 
 
+def _to_bool(v, default: bool = True) -> bool:
+    """宽松布尔解析：前端传 true/false 布尔或字符串均可"""
+    if v is None:
+        return default
+    if isinstance(v, str):
+        return v.strip().lower() not in ("false", "0", "no", "off", "")
+    return bool(v)
+
+
 def _validate_early_end(data: dict):
     """填写了合同提前结束日期时，必须同时填写场地费退款金额（>0）"""
     early = data.get("earlyEndDate")
@@ -187,6 +196,11 @@ def _validate_early_end(data: dict):
 
 def create_contract(data: dict, operator: str = None):
     _validate_early_end(data)
+    # 分期自动拆期开关：TRUE（默认）按付款方式×起止日期自动拆期；FALSE 不拆，由用户手动添加
+    auto_split = _to_bool(data.get("autoSplit"), True)
+    # 自定义周期：分期完全由用户手动定义，强制不自动拆期
+    if data.get("payMethod") == "自定义周期":
+        auto_split = False
     conn = get_connection()
     cur = get_dict_cursor(conn)
     try:
@@ -207,8 +221,8 @@ def create_contract(data: dict, operator: str = None):
              electricity_price, rent_amount, unit_monthly_rent, monthly_rent,
              rent_calc_method, pay_method, rent_advance_days, region, address, latitude, longitude, pay_entity, start_date, end_date, pay_status,
              tax_enabled, tax_rate, post_tax_electricity_price, deposit, first_month_rent, rent_refund, early_end_date,
-             rent_tax_enabled, rent_tax_rate, post_tax_rent_price, remark)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+             rent_tax_enabled, rent_tax_rate, post_tax_rent_price, remark, auto_split)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING *
         """, (
             landlord_id, data.get("brandId"),
@@ -231,27 +245,29 @@ def create_contract(data: dict, operator: str = None):
             data.get("rentTaxEnabled", False),
             data.get("rentTaxRate", 0.01),
             data.get("postTaxRentPrice"),
-            data.get("remark")
+            data.get("remark"),
+            auto_split
         ))
         contract = cur.fetchone()
         # 变更审计：合同创建快照（与业务写入同事务）
         _log_contract_audit(cur, contract["id"], "create", {"snapshot": dict(contract)}, operator)
         conn.commit()
-        # 生成收付款分期（按 pay_method 拆期）；失败不再静默，打印日志便于排查
-        try:
-            from .contract_schedule_repo import generate_schedules
-            generate_schedules(
-                contract_id=contract["id"],
-                contract_type=contract_type,
-                pay_method=data.get("payMethod") or "月付",
-                start_date=data.get("startDate"),
-                end_date=data.get("earlyEndDate") or data.get("endDate"),
-                monthly_rent=data.get("monthlyRent"),
-                first_month_rent=data.get("firstMonthRent"),
-            )
-        except Exception as e:
-            import logging
-            logging.error(f"generate_schedules error for contract {contract['id']}: {e}, data={data}")
+        # 生成收付款分期（按 pay_method 拆期）；开关关闭时跳过，由用户手动添加；失败不再静默，打印日志便于排查
+        if auto_split:
+            try:
+                from .contract_schedule_repo import generate_schedules
+                generate_schedules(
+                    contract_id=contract["id"],
+                    contract_type=contract_type,
+                    pay_method=data.get("payMethod") or "月付",
+                    start_date=data.get("startDate"),
+                    end_date=data.get("earlyEndDate") or data.get("endDate"),
+                    monthly_rent=data.get("monthlyRent"),
+                    first_month_rent=data.get("firstMonthRent"),
+                )
+            except Exception as e:
+                import logging
+                logging.error(f"generate_schedules error for contract {contract['id']}: {e}, data={data}")
         return contract
     finally:
         cur.close()
@@ -300,6 +316,7 @@ def update_contract(contract_id: int, data: dict, operator: str = None):
             "rentTaxEnabled": "rent_tax_enabled",
             "rentTaxRate": "rent_tax_rate",
             "postTaxRentPrice": "post_tax_rent_price",
+            "autoSplit": "auto_split",
             "remark": "remark"
         }
         # 这三个字段允许显式清空：前端清空输入框提交 null/空串 表示"撤销该设置"
@@ -340,21 +357,24 @@ def update_contract(contract_id: int, data: dict, operator: str = None):
         if changes:
             _log_contract_audit(cur, contract_id, "update", changes, operator)
         conn.commit()
-        # 修复 #7：合同月租/付款方式/起止日期变更后，重建收付款分期（generate_schedules 会按 seq 保留已付状态）
-        try:
-            from .contract_schedule_repo import generate_schedules
-            generate_schedules(
-                contract_id=contract_id,
-                contract_type=updated.get("contract_type", "场地合同"),
-                pay_method=updated.get("pay_method") or "月付",
-                start_date=updated.get("start_date"),
-                end_date=updated.get("early_end_date") or updated.get("end_date"),
-                monthly_rent=updated.get("monthly_rent"),
-                first_month_rent=updated.get("first_month_rent"),
-            )
-        except Exception as e:
-            import logging
-            logging.error(f"generate_schedules error for contract {contract_id}: {e}")
+        # 修复 #7：合同月租/付款方式/起止日期变更后，重建收付款分期（generate_schedules 会按 seq 保留已付状态）；
+        # 自动拆期开关关闭时跳过重建，用户手动添加/调整的分期保持原样；
+        # 自定义周期的分期完全手动定义，永不自动重建
+        if updated.get("auto_split") and updated.get("pay_method") != "自定义周期":
+            try:
+                from .contract_schedule_repo import generate_schedules
+                generate_schedules(
+                    contract_id=contract_id,
+                    contract_type=updated.get("contract_type", "场地合同"),
+                    pay_method=updated.get("pay_method") or "月付",
+                    start_date=updated.get("start_date"),
+                    end_date=updated.get("early_end_date") or updated.get("end_date"),
+                    monthly_rent=updated.get("monthly_rent"),
+                    first_month_rent=updated.get("first_month_rent"),
+                )
+            except Exception as e:
+                import logging
+                logging.error(f"generate_schedules error for contract {contract_id}: {e}")
         return updated
     finally:
         cur.close()
