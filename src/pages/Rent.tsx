@@ -80,11 +80,24 @@ function rowCyclePrefixes(contracts: any[]): { income: string | null; pay: strin
   };
 }
 
-// ─── 整年场地收支表（框外展示）：按场地×品牌，付款信息=场地合同，收款信息=品牌方合同 ───
+// ─── 整年场地收支表（框外展示）：按 公司主体 → 场地×品牌 分组，付款信息=场地合同，收款信息=品牌方合同 ───
 function YearlyTable({ yearlyRows, yearLabels }: { yearlyRows: any[]; yearLabels: string[] }) {
+  // 按公司主体分组（与年度付款计划一致；entityName 由后端按 合同主体→电表主体 归属链给出）
+  const entityGroups = useMemo(() => groupByEntity(yearlyRows), [yearlyRows]);
   return (
-    <div className="space-y-3">
-      {yearlyRows.map((gy: any) => {
+    <div className="space-y-4">
+      {entityGroups.map((g) => {
+        const c = g.color;
+        return (
+          <div key={g.entityName} className={`space-y-3 rounded-xl border p-3 ${c.border} ${c.bg}`}>
+            <div className="flex items-center gap-2 px-1">
+              <div className={`flex h-6 w-6 items-center justify-center rounded-md ${c.icon}`}>
+                <Landmark className="h-3.5 w-3.5 text-white" />
+              </div>
+              <span className={`text-xs font-semibold ${c.text}`}>{g.entityName}</span>
+              <span className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${c.chip}`}>{g.rows.length} 个场地方</span>
+            </div>
+            {g.rows.map((gy: any) => {
         const vc: any = gy.venue || {};
         const brands = (gy.brands ?? []).filter((b: any) => b.contractType === "品牌方合同");
         if (brands.length === 0) return null;
@@ -204,6 +217,9 @@ function YearlyTable({ yearlyRows, yearLabels }: { yearlyRows: any[]; yearLabels
                 </tbody>
               </table>
             </div>
+          </div>
+        );
+      })}
           </div>
         );
       })}
