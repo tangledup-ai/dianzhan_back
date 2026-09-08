@@ -38,6 +38,10 @@ export const createSchedule = (data: { contractId: number; side: string; periodS
 export const updateSchedule = (id: number, data: any) =>
   client.put(`/contract-schedules/${id}`, data).then(r => r.data);
 
+// 删除单期分期（手动管理分期时使用）
+export const deleteSchedule = (id: number, side: "payment" | "income") =>
+  client.delete(`/contract-schedules/${id}`, { params: { side } }).then(r => r.data);
+
 export const markScheduleDone = (id: number, side: "payment" | "income") => {
   const status = side === "payment" ? "已付款" : "已到账";
   const today = new Date().toISOString().slice(0, 10);

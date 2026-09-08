@@ -253,7 +253,9 @@ def create_schedule(contract_id: int, side: str, data: dict):
 
 
 def update_schedule(schedule_id: int, side: str, data: dict):
-    """更新分期状态（标记已付款/已到账 + 日期 + 发票）。side 必传：payment/income，避免两张表 id 冲突。"""
+    """更新分期（状态/付款日期/发票/备注/金额，以及手动编辑的期起止）。
+    side 必传：payment/income，避免两张表 id 冲突。
+    amount/periodStart/periodEnd 允许显式置空（编辑表单清空 = NULL，待手填）。"""
     conn = get_connection()
     cur = get_dict_cursor(conn)
     try:
@@ -264,7 +266,10 @@ def update_schedule(schedule_id: int, side: str, data: dict):
             "status": "status", "payDate": "pay_date",
             "invoice": "invoice", "remark": "remark",
             "amount": "amount",
+            "periodStart": "period_start", "periodEnd": "period_end",
         }
+        # 这些字段编辑时允许显式清空（data 里有 key 就生效，值为 None 置 NULL）
+        EXPLICIT_NULL_FIELDS = {"amount", "periodStart", "periodEnd"}
         updates, values = [], []
         # 撤销标记：状态改回未付款/未到账时，清空实际付款/到账日期（忽略传入的 payDate）
         revert = data.get("status") in ("未付款", "未到账")
@@ -273,7 +278,7 @@ def update_schedule(schedule_id: int, side: str, data: dict):
                 continue
             if key == "payDate" and revert:
                 continue
-            if data[key] is not None:
+            if data[key] is not None or key in EXPLICIT_NULL_FIELDS:
                 updates.append(f"{db_field} = %s"); values.append(data[key])
         if revert:
             updates.append("pay_date = NULL")
@@ -286,6 +291,23 @@ def update_schedule(schedule_id: int, side: str, data: dict):
         if row:
             row["side"] = "payment" if table == "rent_payment_schedule" else "income"
         return row
+    finally:
+        cur.close()
+        conn.close()
+
+
+def delete_schedule(schedule_id: int, side: str):
+    """删除单期分期（手动管理分期时使用）。side: payment/income"""
+    table = "rent_payment_schedule" if side == "payment" else "rent_income_schedule"
+    if not table:
+        return None
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(f"DELETE FROM {table} WHERE id = %s RETURNING id", (schedule_id,))
+        row = cur.fetchone()
+        conn.commit()
+        return row[0] if row else None
     finally:
         cur.close()
         conn.close()

@@ -555,7 +555,7 @@ export default function Contracts() {
                             {isExpanded && (
                               <tr key={`${c.id}-exp`} className="bg-slate-50/50">
                                 <td colSpan={13} className="px-4 py-3">
-                                  <ContractSchedule contractId={c.id} side="payment" title={`${c.landlordName || ""} 场地费 付款情况`} editable />
+                                  <ContractSchedule contractId={c.id} side="payment" title={`${c.landlordName || ""} 场地费 付款情况`} editable autoSplit={c.autoSplit ?? true} />
                                 </td>
                               </tr>
                             )}
@@ -662,7 +662,7 @@ export default function Contracts() {
                             {isExpanded && (
                               <tr key={`${c.id}-exp`} className="bg-slate-50/50">
                                 <td colSpan={17} className="px-4 py-3">
-                                  <ContractSchedule contractId={c.id} side="income" title={`${c.brandName || "全部品牌共享"} 场地费 收款情况`} editable />
+                                  <ContractSchedule contractId={c.id} side="income" title={`${c.brandName || "全部品牌共享"} 场地费 收款情况`} editable autoSplit={c.autoSplit ?? true} />
                                 </td>
                               </tr>
                             )}

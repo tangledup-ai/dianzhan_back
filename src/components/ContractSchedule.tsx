@@ -1,25 +1,30 @@
 import { useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { listPaymentSchedules, listIncomeSchedules, updateSchedule, createSchedule } from "@/api/contracts";
+import { listPaymentSchedules, listIncomeSchedules, updateSchedule, createSchedule, deleteSchedule } from "@/api/contracts";
 import { Button } from "@/components/ui/button";
 import { inputCls } from "@/components/fields";
 import { fmtMoney } from "@/lib/format";
+import { Pencil, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 
 /**
  * 合同收付款分期列表（按 pay_method 拆期）
- * editable=true：可手动标记每期状态 + 手动添加一期
+ * editable=true：可标记每期状态 + 添加/编辑/删除每一期
  * editable=false：只读展示
+ * autoSplit：该合同是否开启了自动计算分期（开启时提示手动改动会被重建覆盖）
  */
-export function ContractSchedule({ contractId, side, title, editable = true }: {
+export function ContractSchedule({ contractId, side, title, editable = true, autoSplit = false }: {
   contractId: number;
   side: "payment" | "income";
   title: string;
   editable?: boolean;
+  autoSplit?: boolean;
 }) {
   const queryClient = useQueryClient();
   const [adding, setAdding] = useState(false);
   const [addForm, setAddForm] = useState({ periodStart: "", periodEnd: "", amount: "", remark: "" });
+  const [editingId, setEditingId] = useState<number | null>(null);
+  const [editForm, setEditForm] = useState({ periodStart: "", periodEnd: "", amount: "", remark: "" });
   const [markingId, setMarkingId] = useState<number | null>(null);
   const [markDate, setMarkDate] = useState("");
   const [amountEditId, setAmountEditId] = useState<number | null>(null);
@@ -63,6 +68,27 @@ export function ContractSchedule({ contractId, side, title, editable = true }: {
     onError: (e: any) => toast.error(e.message || "添加失败"),
   });
 
+  // 编辑某期（起止/金额/备注；金额清空 = 置 NULL 待手填）
+  const editRow = useMutation({
+    mutationFn: (p: { id: number; data: any }) => updateSchedule(p.id, { ...p.data, side }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: [queryKey] });
+      toast.success("分期已保存");
+      setEditingId(null);
+    },
+    onError: (e: any) => toast.error(e.message || "保存失败"),
+  });
+
+  // 删除某期
+  const delRow = useMutation({
+    mutationFn: (id: number) => deleteSchedule(id, side),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: [queryKey] });
+      toast.success("已删除该期");
+    },
+    onError: (e: any) => toast.error(e.message || "删除失败"),
+  });
+
   // 补填/修改某期金额（尾期金额留空后由用户手动录入）
   const saveAmount = useMutation({
     mutationFn: ({ id, amount }: { id: number; amount: string }) =>
@@ -76,16 +102,42 @@ export function ContractSchedule({ contractId, side, title, editable = true }: {
     onError: (e: any) => toast.error(e.message || "保存失败"),
   });
 
+  const startEdit = (r: any) => {
+    setEditingId(r.id);
+    setEditForm({
+      periodStart: r.periodStart ? String(r.periodStart).slice(0, 10) : "",
+      periodEnd: r.periodEnd ? String(r.periodEnd).slice(0, 10) : "",
+      amount: r.amount == null ? "" : String(r.amount),
+      remark: r.remark || "",
+    });
+  };
+
+  const saveEdit = () => {
+    if (!editingId) return;
+    editRow.mutate({
+      id: editingId,
+      data: {
+        periodStart: editForm.periodStart || null,
+        periodEnd: editForm.periodEnd || null,
+        amount: editForm.amount === "" ? null : Number(editForm.amount),
+        remark: editForm.remark || "",
+      },
+    });
+  };
+
   const rows = schedules ?? [];
   const paidCount = rows.filter((r: any) => r.status === doneStatus).length;
 
   return (
     <div className="rounded-lg border overflow-hidden">
-      <div className="flex items-center justify-between bg-slate-50 px-3 py-1.5 border-b">
+      <div className="flex flex-wrap items-center justify-between gap-1 bg-slate-50 px-3 py-1.5 border-b">
         <span className="text-[11px] font-semibold text-slate-600">{title}</span>
         <div className="flex items-center gap-2">
           {rows.length > 0 && (
             <span className="text-[10px] text-slate-500">{paidCount}/{rows.length} 期已{side === "payment" ? "付" : "收"}</span>
+          )}
+          {editable && autoSplit && (
+            <span className="text-[10px] text-amber-600">已开启自动拆期：保存合同时分期会重建（已付状态保留）</span>
           )}
           {editable && (
             <button
@@ -140,6 +192,30 @@ export function ContractSchedule({ contractId, side, title, editable = true }: {
           <tbody>
             {rows.map((r: any) => {
               const done = r.status === doneStatus;
+              if (editable && editingId === r.id) {
+                return (
+                  <tr key={r.id} className="border-b last:border-0 bg-amber-50/40">
+                    <td className="px-2.5 py-1.5 text-slate-500">{r.seq}</td>
+                    <td className="px-2.5 py-1.5" colSpan={4}>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <input type="date" className={inputCls + " w-32 text-xs"} value={editForm.periodStart}
+                          onChange={(e) => setEditForm((p) => ({ ...p, periodStart: e.target.value }))} />
+                        <span className="text-[11px] text-slate-400">~</span>
+                        <input type="date" className={inputCls + " w-32 text-xs"} value={editForm.periodEnd}
+                          onChange={(e) => setEditForm((p) => ({ ...p, periodEnd: e.target.value }))} />
+                        <input type="number" placeholder="金额" className={inputCls + " w-24 text-xs"} value={editForm.amount}
+                          onChange={(e) => setEditForm((p) => ({ ...p, amount: e.target.value }))} />
+                        <input placeholder="备注" className={inputCls + " w-32 text-xs"} value={editForm.remark}
+                          onChange={(e) => setEditForm((p) => ({ ...p, remark: e.target.value }))} />
+                        <Button size="sm" className="bg-emerald-600 hover:bg-emerald-700 text-[11px] h-7 px-3"
+                          disabled={editRow.isPending} onClick={saveEdit}>保存</Button>
+                        <button onClick={() => setEditingId(null)}
+                          className="rounded bg-slate-200 px-1.5 py-0.5 text-[10px] text-slate-600 hover:bg-slate-300">取消</button>
+                      </div>
+                    </td>
+                  </tr>
+                );
+              }
               return (
                 <tr key={r.id} className="border-b last:border-0">
                   <td className="px-2.5 py-1.5 text-slate-500">{r.seq}</td>
@@ -227,14 +303,26 @@ export function ContractSchedule({ contractId, side, title, editable = true }: {
                             onClick={() => { setMarkingId(r.id); setMarkDate(r.payDate || new Date().toISOString().slice(0, 10)); }}
                             className="rounded px-1 text-[10px] text-rose-600 hover:text-rose-700"
                           >修改</button>
+                          <button title="编辑该期" onClick={() => startEdit(r)}
+                            className="rounded p-0.5 text-slate-400 hover:text-emerald-600"><Pencil className="h-3 w-3" /></button>
+                          <button title="删除该期" onClick={() => window.confirm(`确定删除第${r.seq}期？`) && delRow.mutate(r.id)}
+                            disabled={delRow.isPending}
+                            className="rounded p-0.5 text-slate-400 hover:text-rose-500 disabled:opacity-50"><Trash2 className="h-3 w-3" /></button>
                         </div>
                       ) : (
-                        <button
-                          onClick={() => { setMarkingId(r.id); setMarkDate(new Date().toISOString().slice(0, 10)); }}
-                          className="rounded bg-blue-600 px-1.5 py-0.5 text-[10px] text-white hover:bg-blue-700"
-                        >
-                          {side === "payment" ? "标记付款" : "标记到账"}
-                        </button>
+                        <div className="flex items-center justify-center gap-1">
+                          <button
+                            onClick={() => { setMarkingId(r.id); setMarkDate(new Date().toISOString().slice(0, 10)); }}
+                            className="rounded bg-blue-600 px-1.5 py-0.5 text-[10px] text-white hover:bg-blue-700"
+                          >
+                            {side === "payment" ? "标记付款" : "标记到账"}
+                          </button>
+                          <button title="编辑该期" onClick={() => startEdit(r)}
+                            className="rounded p-0.5 text-slate-400 hover:text-emerald-600"><Pencil className="h-3 w-3" /></button>
+                          <button title="删除该期" onClick={() => window.confirm(`确定删除第${r.seq}期？`) && delRow.mutate(r.id)}
+                            disabled={delRow.isPending}
+                            className="rounded p-0.5 text-slate-400 hover:text-rose-500 disabled:opacity-50"><Trash2 className="h-3 w-3" /></button>
+                        </div>
                       )}
                     </td>
                   )}

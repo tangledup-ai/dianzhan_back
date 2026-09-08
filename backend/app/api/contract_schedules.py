@@ -35,3 +35,14 @@ async def update_schedule(schedule_id: int, data: dict):
     if not result:
         raise HTTPException(404, "分期记录不存在")
     return result
+
+
+@router.delete("/{schedule_id}")
+async def delete_schedule(schedule_id: int, side: str):
+    """删除单期分期（手动管理分期时使用）"""
+    if side not in ("payment", "income"):
+        raise HTTPException(400, "side 必须是 payment 或 income")
+    ok = contract_schedule_repo.delete_schedule(schedule_id, side)
+    if not ok:
+        raise HTTPException(404, "分期记录不存在")
+    return {"deleted": schedule_id, "side": side}
