@@ -39,3 +39,8 @@ build/
 # Test coverage
 coverage/
 .nyc_output/
+# Python
+__pycache__/
+*.py[cod]
+# Agent workspace memory (local only)
+.workbuddy/
