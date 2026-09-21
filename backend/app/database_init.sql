@@ -260,6 +260,30 @@ COMMENT ON COLUMN meter_monthly.curr_actual_reading IS '本月实际电表读数
 COMMENT ON COLUMN meter_monthly.prev_reading IS '上月起始度数（第三方原始值，同步覆盖）';
 COMMENT ON COLUMN meter_monthly.curr_reading IS '本月抄表度数（第三方原始值，同步覆盖）';
 
+CREATE TABLE IF NOT EXISTS meter_shared_allocations (
+    id SERIAL PRIMARY KEY,
+    meter_id INTEGER NOT NULL REFERENCES meters(id),
+    address VARCHAR(100) NOT NULL,
+    month_period VARCHAR(6) NOT NULL,
+    brand_id INTEGER NOT NULL REFERENCES brands(id),
+    entity_id INTEGER REFERENCES entities(id),
+    collect_amount NUMERIC(14,2) NOT NULL,
+    unit_price NUMERIC(8,4),
+    cabinet_count INTEGER,
+    remark TEXT,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW(),
+    UNIQUE(address, month_period, brand_id)
+);
+CREATE INDEX IF NOT EXISTS idx_shared_alloc_period ON meter_shared_allocations(month_period);
+CREATE INDEX IF NOT EXISTS idx_shared_alloc_meter ON meter_shared_allocations(meter_id);
+CREATE INDEX IF NOT EXISTS idx_shared_alloc_brand ON meter_shared_allocations(brand_id);
+COMMENT ON TABLE meter_shared_allocations IS '共享电表品牌分摊：按 电表×月份×品牌 人工录入应付电费（收款），用电量=金额÷单价倒推';
+COMMENT ON COLUMN meter_shared_allocations.collect_amount IS '品牌方付给我方的电费（收款/收入，含税）';
+COMMENT ON COLUMN meter_shared_allocations.unit_price IS '倒推用电量用的单价（元/度）；为空=取该品牌方合同单价';
+COMMENT ON COLUMN meter_shared_allocations.cabinet_count IS '该品牌当月在此共享电表下投放的电柜数量（逐月可变，可为空）';
+COMMENT ON COLUMN meter_shared_allocations.month_period IS '月份，统一 6 位 YYYYMM';
+
 CREATE TABLE IF NOT EXISTS meter_daily (
     id SERIAL PRIMARY KEY,
     device_id VARCHAR(50),

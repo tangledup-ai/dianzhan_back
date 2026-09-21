@@ -424,14 +424,14 @@ export default function Contracts() {
           <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-slate-400" />
           <input className={`${inputCls} w-48 pl-8`} placeholder="搜索场地方 / 品牌方…" value={keyword} onChange={(e) => setKeyword(e.target.value)} />
         </div>
-        <select className={`${inputCls} w-40`} value={landlordId} onChange={(e) => setLandlordId(e.target.value)}>
-          <option value="">全部场地方</option>
-          {(landlords.data ?? []).map((l: any) => <option key={l.id} value={String(l.id)}>{l.name}</option>)}
-        </select>
-        <select className={`${inputCls} w-40`} value={brandId} onChange={(e) => setBrandId(e.target.value)}>
-          <option value="">全部品牌方</option>
-          {(brands.data ?? []).map((b: any) => <option key={b.id} value={String(b.id)}>{b.name}</option>)}
-        </select>
+        <div className="w-40">
+          <SearchSelect value={landlordId} onChange={setLandlordId} placeholder="全部场地方"
+            options={(landlords.data ?? []).map((l: any) => ({ value: String(l.id), label: l.name }))} />
+        </div>
+        <div className="w-40">
+          <SearchSelect value={brandId} onChange={setBrandId} placeholder="全部品牌方"
+            options={(brands.data ?? []).map((b: any) => ({ value: String(b.id), label: b.name }))} />
+        </div>
         <div className="ml-auto flex gap-2">
           <Button className="bg-blue-600 hover:bg-blue-700" onClick={doExport}><Download className="mr-1.5 h-4 w-4" />导出表格</Button>
           <Button variant="outline" className="text-blue-600" disabled={importing} onClick={() => fileRef.current?.click()}>
@@ -1182,12 +1182,9 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
                     options={[{ value: "", label: "请选择场地方" }, ...(landlords.data ?? []).map((l: any) => ({ value: String(l.id), label: l.name }))]} />
                 </Field>
                 <Field label="品牌方">
-                  <SelectInput value={f.brandId} onChange={set("brandId")}
-                    options={[
-                      // 首项即默认：不指定品牌 = 全品牌合同，计费柜数/电费收款按场地内共享电表计算
-                      { value: "", label: "全部品牌（共享电表）" },
-                      ...(brands.data ?? []).map((b: any) => ({ value: String(b.id), label: b.name })),
-                    ]} />
+                  {/* 首项即默认：不指定品牌 = 全品牌合同，计费柜数/电费收款按场地内共享电表计算 */}
+                  <SearchSelect value={f.brandId} onChange={set("brandId")} placeholder="全部品牌（共享电表）"
+                    options={(brands.data ?? []).map((b: any) => ({ value: String(b.id), label: b.name }))} />
                 </Field>
                 <Field label="计费方式">
                   <SelectInput value={f.rentCalcMethod} onChange={set("rentCalcMethod")}

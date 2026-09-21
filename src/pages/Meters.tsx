@@ -5,7 +5,7 @@ import { listContracts } from "@/api/contracts";
 import { listCabinets, createCabinet, updateCabinet, deleteCabinet } from "@/api/cabinets";
 import { listBrands, listLandlords, listEntities } from "@/api/directory";
 import { generateElectricity } from "@/api/electricity";
-import { triggerSync, saveMeterReading, getMeterReadings } from "@/api/meterEnergy";
+import { triggerSync, saveMeterReading, getMeterReadings, getSharedAllocationForm, saveSharedAllocations } from "@/api/meterEnergy";
 import { StatusBadge } from "@/components/Stat";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -285,15 +285,17 @@ export default function Meters() {
           <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-slate-400" />
           <input className={`${inputCls} w-56 pl-8`} placeholder="搜索电表编号 / 场地方…" value={keyword} onChange={(e) => setKeyword(e.target.value)} />
         </div>
-        <select className={`${inputCls} w-40`} value={landlordId} onChange={(e) => setLandlordId(e.target.value)}>
-          <option value="">全部场地方</option>
-          {(landlords.data ?? []).map((l: any) => <option key={l.id} value={String(l.id)}>{l.name}</option>)}
-        </select>
-        <select className={`${inputCls} w-40`} value={brandId} onChange={(e) => setBrandId(e.target.value)}>
-          <option value="">全部品牌方</option>
-          <option value="shared">共享电表（全品牌）</option>
-          {(brands.data ?? []).map((b: any) => <option key={b.id} value={String(b.id)}>{b.name}</option>)}
-        </select>
+        <div className="w-40">
+          <SearchSelect value={landlordId} onChange={setLandlordId} placeholder="全部场地方"
+            options={(landlords.data ?? []).map((l: any) => ({ value: String(l.id), label: l.name }))} />
+        </div>
+        <div className="w-40">
+          <SearchSelect value={brandId} onChange={setBrandId} placeholder="全部品牌方"
+            options={[
+              { value: "shared", label: "共享电表（全品牌）" },
+              ...(brands.data ?? []).map((b: any) => ({ value: String(b.id), label: b.name })),
+            ]} />
+        </div>
         {tagScope ? (
           <select className={`${inputCls} w-36`} value={tagScope} disabled title="当前账号的数据范围">
             <option value={tagScope}>{tagScope}</option>
@@ -777,6 +779,9 @@ function MeterForm({ open, onClose, record }: { open: boolean; onClose: () => vo
 }
 
 // ─── 录入读数表单 ───
+// 共享电表（「所有品牌共用此电表」）额外支持按品牌录入「应付电费」：
+//   录入值 = 品牌方付给我方的电费（收款/收入，含税）；用电量 = 金额 ÷ 单价 倒推。
+//   该表某月录了品牌分摊后，台账不再按「整表读数 × 合同单价」出一行，而是按品牌拆行。
 function ReadingForm({ open, onClose, meter }: { open: boolean; onClose: () => void; meter: any }) {
   const now = new Date();
   const defaultPeriod = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, "0")}`;
@@ -792,12 +797,61 @@ function ReadingForm({ open, onClose, meter }: { open: boolean; onClose: () => v
   const [calcKwh, setCalcKwh] = useState(true); // 是否自动计算区间度数
   const queryClient = useQueryClient();
 
+  // 共享电表：标签为「共享电表」且未指定品牌方（=「所有品牌共用此电表」开关打开的状态）
+  const isShared = !!meter && meter.tag === "共享电表" && !meter.brandId;
+  // 品牌分摊行（unitPrice 留空 = 用该品牌方合同单价；cabinetCount 留空 = 本月未填柜数）
+  const [allocRows, setAllocRows] = useState<
+    { brandId: string; collectAmount: string; unitPrice: string; cabinetCount: string }[]
+  >([]);
+  // 整表度数手动补录（共享电表：第三方未同步，或需人工修正物理读数时用）
+  const [editingTableKwh, setEditingTableKwh] = useState(false);
+  const [manualKwh, setManualKwh] = useState("");
+
   // 加载该电表已有的读数
   const readings = useQuery({
     queryKey: ["meterReadings", meter?.meterNo],
     queryFn: () => getMeterReadings(meter.meterNo),
+    // 共享电表也加载读数：输入区已隐藏，读数仅用于核对「整表度数 vs 分摊倒推合计」
     enabled: open && !!meter?.meterNo,
   });
+
+  // 共享电表：加载品牌分摊表单数据（候选品牌 + 合同单价 + 已录入分摊）
+  const allocForm = useQuery({
+    queryKey: ["shared-allocations", meter?.meterNo, monthPeriod],
+    queryFn: () => getSharedAllocationForm({ meterNo: meter.meterNo, monthPeriod }),
+    enabled: open && isShared && !!meter?.meterNo && !!monthPeriod,
+  });
+
+  // 电柜数量默认值：该品牌最近一次填写值（柜数逐月可动态调整）
+  // 仅在某月「尚无分摊记录」时用于预填；已录入月份严格回填已存值（清空就是清空）
+  const cabinetDefaultOf = (brandId: string): { count: number; monthPeriod: string } | null => {
+    const d = allocForm.data?.cabinetDefaults?.[String(brandId)];
+    return d && d.count != null ? { count: Number(d.count), monthPeriod: d.monthPeriod } : null;
+  };
+
+  // 分摊数据回填：切换到已有分摊的月份 → 填已录入值；没有则预填该场地已签合同的品牌（金额留空）
+  // 电柜数量：没有分摊记录的月份，用该品牌最近一次填写值预填（本月改了 → 下月默认就是新值）
+  useEffect(() => {
+    const d = allocForm.data;
+    if (!open || !isShared || !d || d.monthPeriod !== monthPeriod) return;
+    if ((d.allocations ?? []).length > 0) {
+      setAllocRows(d.allocations.map((a: any) => ({
+        brandId: String(a.brandId),
+        collectAmount: a.collectAmount != null ? String(a.collectAmount) : "",
+        // 只有「人工覆盖价」才回填输入框；合同价留在 placeholder 里动态取
+        unitPrice: a.unitPrice != null ? String(a.unitPrice) : "",
+        cabinetCount: a.cabinetCount != null ? String(a.cabinetCount) : "",
+      })));
+    } else {
+      setAllocRows(((d.brands ?? []) as any[]).map((b) => {
+        const def = cabinetDefaultOf(String(b.brandId));
+        return {
+          brandId: String(b.brandId), collectAmount: "", unitPrice: "",
+          cabinetCount: def ? String(def.count) : "",
+        };
+      }));
+    }
+  }, [allocForm.data, monthPeriod, open, isShared]);
 
   // 切换月份时自动填充已有数据
   useEffect(() => {
@@ -836,7 +890,11 @@ function ReadingForm({ open, onClose, meter }: { open: boolean; onClose: () => v
   }, [readings.data, monthPeriod]);
 
   useEffect(() => {
-    if (open) setMonthPeriod(defaultPeriod);
+    if (open) {
+      setMonthPeriod(defaultPeriod);
+      setEditingTableKwh(false);
+      setManualKwh("");
+    }
   }, [open]);
 
   // 自动计算区间度数
@@ -849,67 +907,474 @@ function ReadingForm({ open, onClose, meter }: { open: boolean; onClose: () => v
     }
   }, [prevReading, currReading, calcKwh]);
 
-  // 已有读数的月份列表（用于高亮显示）
+  // ── 品牌分摊辅助计算 ──
+  const contractPriceOf = (brandId: string): number | null => {
+    const b = (allocForm.data?.brands ?? []).find((x: any) => String(x.brandId) === String(brandId));
+    return b?.unitPrice != null ? Number(b.unitPrice) : null;
+  };
+  const effectivePriceOf = (row: { brandId: string; unitPrice: string }): number | null => {
+    if (row.unitPrice.trim() !== "") {
+      const p = parseFloat(row.unitPrice);
+      return !isNaN(p) && p > 0 ? p : null;
+    }
+    return contractPriceOf(row.brandId);
+  };
+  const kwhOfRow = (row: { brandId: string; collectAmount: string; unitPrice: string }): number | null => {
+    const amount = parseFloat(row.collectAmount);
+    const price = effectivePriceOf(row);
+    if (isNaN(amount) || !price) return null;
+    return Math.round((amount / price) * 100) / 100;
+  };
+  // 候选品牌：该场地已签品牌方合同的品牌在前，其余品牌可手动添加
+  const brandOptions = useMemo(() => {
+    const withContract = (allocForm.data?.brands ?? []).map((b: any) => ({
+      value: String(b.brandId), label: b.unitPrice != null ? `${b.brandName}（合同价 ${b.unitPrice}）` : b.brandName,
+    }));
+    const used = new Set(withContract.map((o: { value: string }) => o.value));
+    const rest = (allocForm.data?.allBrands ?? [])
+      .filter((b: any) => !used.has(String(b.brandId)))
+      .map((b: any) => ({ value: String(b.brandId), label: b.brandName }));
+    return [...withContract, ...rest];
+  }, [allocForm.data]);
+  // 合计（行数很少，直接算，不走 memo）
+  const allocTotals = (() => {
+    let amount = 0, kwhSum = 0, missingPrice = 0, cabinets = 0, cabinetsFilled = 0;
+    for (const r of allocRows) {
+      const a = parseFloat(r.collectAmount);
+      if (isNaN(a) || String(r.collectAmount).trim() === "") continue;
+      amount += a;
+      const k = kwhOfRow(r);
+      if (k == null) missingPrice += 1;
+      else kwhSum += k;
+      const cc = parseInt(r.cabinetCount, 10);
+      if (!isNaN(cc) && cc > 0) { cabinets += cc; cabinetsFilled += 1; }
+    }
+    return {
+      amount: Math.round(amount * 100) / 100,
+      kwh: Math.round(kwhSum * 100) / 100,
+      missingPrice,
+      cabinets,
+      cabinetsFilled,
+    };
+  })();
+
+  // ── 共享电表核对：第三方同步的整表月度实际度数 vs 品牌分摊倒推合计 ──
+  // 台账按「倒推电量 × 场地单价」付场地方，若与物理整表读数不一致，
+  // 差额（线损 / 公摊 / 漏报品牌）在账上无人承担，这里把它显性化。
+  const tableRow = (isShared && monthPeriod)
+    ? (readings.data ?? []).find((r: any) => r.monthPeriod === monthPeriod)
+    : undefined;
+  const tableKwhValue = tableRow?.kwh != null ? Number(tableRow.kwh) : null;
+  const tableKwh = tableKwhValue != null && !isNaN(tableKwhValue) && tableKwhValue > 0 ? tableKwhValue : null;
+  // actual_kwh 非空 = 人工补录/修正（该字段不随第三方同步覆盖）
+  const tableKwhIsManual = tableRow?.actualKwh != null;
+  // >0：整表多于分摊倒推（有电量没人认领）；<0：分摊倒推超出物理读数
+  const kwhGap = tableKwh != null && allocTotals.amount > 0
+    ? Math.round((tableKwh - allocTotals.kwh) * 100) / 100
+    : null;
+
+  // 切换月份：同时退出「整表读数补录」编辑态，避免残留上个月的输入
+  const changeMonth = (p: string) => {
+    setMonthPeriod(p);
+    setEditingTableKwh(false);
+    setManualKwh("");
+  };
+
+  const setAllocRow = (
+    i: number,
+    patch: Partial<{ brandId: string; collectAmount: string; unitPrice: string; cabinetCount: string }>,
+  ) => setAllocRows((prev) => prev.map((r, idx) => (idx === i ? { ...r, ...patch } : r)));
+  const addAllocRow = () => setAllocRows((prev) => [
+    ...prev, { brandId: "", collectAmount: "", unitPrice: "", cabinetCount: "" },
+  ]);
+  const removeAllocRow = (i: number) => setAllocRows((prev) => prev.filter((_, idx) => idx !== i));
+
+  // 是否有填了金额的分摊行（用于决定保存按钮可用性 / 是否需要调分摊接口）
+  const allocAmountRows = allocRows.filter((r) => r.brandId && String(r.collectAmount).trim() !== "");
+  const hasReadingInput = !!(kwh || actualKwh || prevReading || currReading || prevActualReading || currActualReading);
+  // 共享电表读数区已隐藏，保存可用性只看分摊是否改动（含「清空全部金额」这种取消分摊的改动）
+  const savedAllocKey = ((allocForm.data?.allocations ?? []) as any[])
+    .map((a) => `${a.brandId}:${Number(a.collectAmount ?? 0).toFixed(2)}:`
+      + `${a.cabinetCount != null ? Number(a.cabinetCount) : ""}`)
+    .sort().join("|");
+  const currentAllocKey = allocAmountRows
+    .map((r) => `${r.brandId}:${parseFloat(r.collectAmount).toFixed(2)}:`
+      + `${r.cabinetCount.trim() === "" ? "" : parseInt(r.cabinetCount, 10)}`)
+    .sort().join("|");
+  const allocDirty = currentAllocKey !== savedAllocKey;
+  const canSave = isShared ? allocDirty : hasReadingInput;
 
   const save = useMutation({
-    mutationFn: () => saveMeterReading({
-      address: meter.meterNo,
-      monthPeriod,
-      kwh: kwh ? parseFloat(kwh) : undefined,
-      actualKwh: actualKwh ? parseFloat(actualKwh) : undefined,
-      prevActualReading: prevActualReading ? parseFloat(prevActualReading) : undefined,
-      currActualReading: currActualReading ? parseFloat(currActualReading) : undefined,
-      prevReadingDate: prevReadingDate || undefined,
-      prevReading: prevReading ? parseFloat(prevReading) : undefined,
-      currReadingDate: currReadingDate || undefined,
-      currReading: currReading ? parseFloat(currReading) : undefined,
-    }),
+    mutationFn: async () => {
+      if (isShared) {
+        // 单价校验：填了金额但取不到单价 → 无法倒推用电量
+        const bad = allocAmountRows.find((r) => effectivePriceOf(r) == null);
+        if (bad) {
+          const name = brandOptions.find((o) => o.value === bad.brandId)?.label || "某品牌";
+          throw new Error(`${name} 缺少单价，无法倒推用电量：请填写单价或先维护该品牌方合同的电费单价`);
+        }
+        // 电柜数量校验：留空 = 本月未填；填了必须是正整数
+        const badCabinet = allocAmountRows.find((r) => {
+          const t = r.cabinetCount.trim();
+          if (t === "") return false;
+          const n = Number(t);
+          return !Number.isInteger(n) || n <= 0;
+        });
+        if (badCabinet) {
+          const name = brandOptions.find((o) => o.value === badCabinet.brandId)?.label || "某品牌";
+          throw new Error(`${name} 的电柜数量需为大于 0 的整数（留空表示本月未填）`);
+        }
+      }
+      // 1) 有读数输入才写读数（共享电表不录读数；只录分摊时不产生 0 度读数）
+      if (hasReadingInput && !isShared) {
+        await saveMeterReading({
+          address: meter.meterNo,
+          monthPeriod,
+          kwh: kwh ? parseFloat(kwh) : undefined,
+          actualKwh: actualKwh ? parseFloat(actualKwh) : undefined,
+          prevActualReading: prevActualReading ? parseFloat(prevActualReading) : undefined,
+          currActualReading: currActualReading ? parseFloat(currActualReading) : undefined,
+          prevReadingDate: prevReadingDate || undefined,
+          prevReading: prevReading ? parseFloat(prevReading) : undefined,
+          currReadingDate: currReadingDate || undefined,
+          currReading: currReading ? parseFloat(currReading) : undefined,
+        });
+      }
+      // 2) 共享电表：整体替换该月品牌分摊（含空 = 清空），后端保存后自动重算该月台账
+      if (isShared) {
+        await saveSharedAllocations({
+          address: meter.meterNo,
+          monthPeriod,
+          rows: allocAmountRows.map((r) => ({
+            brandId: Number(r.brandId),
+            collectAmount: parseFloat(r.collectAmount),
+            unitPrice: r.unitPrice.trim() === "" ? null : parseFloat(r.unitPrice),
+            cabinetCount: r.cabinetCount.trim() === "" ? null : parseInt(r.cabinetCount, 10),
+          })),
+        });
+      }
+    },
     onSuccess: async () => {
-      toast.success("读数已保存");
+      toast.success(isShared ? "品牌分摊已保存，台账已按分摊重算" : "读数已保存");
       try {
-        // v3：台账按场地×品牌全量重算该月
-        await generateElectricity({ period: monthPeriod, landlordId: meter.landlordId || undefined });
+        if (!isShared && hasReadingInput) {
+          // v3：台账按场地×品牌全量重算该月
+          await generateElectricity({ period: monthPeriod, landlordId: meter.landlordId || undefined });
+        }
         queryClient.invalidateQueries({ queryKey: ["electricity"] });
+        queryClient.invalidateQueries({ queryKey: ["electricity-monthly-ledger-range"] });
+        queryClient.invalidateQueries({ queryKey: ["shared-allocations"] });
+        queryClient.invalidateQueries({ queryKey: ["meterReadings"] });
       } catch {}
       onClose();
     },
-    onError: (e: any) => toast.error(e.message || "保存失败"),
+    onError: (e: any) => toast.error(e?.response?.data?.detail || e.message || "保存失败"),
+  });
+
+  // 整表度数手动补录：写 meter_monthly.actual_kwh（该字段不随第三方同步覆盖）
+  // 共享电表未录分摊的月份，台账会用这个度数；录了分摊的月份它只作核对基准
+  const saveTableKwh = useMutation({
+    mutationFn: async () => {
+      const v = parseFloat(manualKwh);
+      if (isNaN(v) || v <= 0) throw new Error("请填写大于 0 的整表实际度数");
+      // 回传现有原始表码：后端 kwh 必填且 ON CONFLICT 覆盖，不传会把第三方原始读数冲成 0
+      const rawKwh = tableRow?.rawKwh != null ? Number(tableRow.rawKwh) : undefined;
+      await saveMeterReading({ address: meter.meterNo, monthPeriod, kwh: rawKwh, actualKwh: v });
+    },
+    onSuccess: async () => {
+      setEditingTableKwh(false);
+      setManualKwh("");
+      queryClient.invalidateQueries({ queryKey: ["meterReadings"] });
+      // 读数变了 → 重算该月台账（未录分摊的月份完全依赖它）
+      try {
+        await generateElectricity({ period: monthPeriod, landlordId: meter.landlordId || undefined });
+      } catch {
+        // 重算失败不影响读数已保存，用户可稍后在电费台账页手动重跑
+      }
+      queryClient.invalidateQueries({ queryKey: ["electricity"] });
+      queryClient.invalidateQueries({ queryKey: ["electricity-monthly-ledger-range"] });
+      toast.success("整表读数已保存");
+    },
+    onError: (e: any) => toast.error(e?.response?.data?.detail || e.message || "保存失败"),
   });
 
   return (
     <Dialog open={open} onOpenChange={(o) => !o && onClose()}>
-      <DialogContent className="max-w-md">
+      <DialogContent className={`${isShared ? "!max-w-3xl" : "max-w-md"} max-h-[90vh] overflow-y-auto`}>
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <BookOpen className="h-5 w-5 text-blue-600" />
-            录入电表读数
+            {isShared ? "共享电表 · 品牌分摊（按应付电费倒推）" : "录入电表读数"}
           </DialogTitle>
         </DialogHeader>
         <div className="space-y-3">
           <div className="rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-600">
             <div>表号：<span className="font-mono font-medium">{meter?.meterNo}</span></div>
             <div>名称：{meter?.meterName ?? "-"}</div>
+            {isShared && (
+              <div className="mt-1 text-purple-600">所有品牌共用此电表（场地总表）</div>
+            )}
           </div>
 
           <Field label="月份">
             <input type="month" className="w-full rounded-md border border-slate-200 px-2.5 py-1.5 text-sm"
               value={monthPeriod ? toDisplay(monthPeriod) : ""}
-              onChange={(e) => setMonthPeriod(e.target.value ? toCompact(e.target.value) : "")} />
+              onChange={(e) => changeMonth(e.target.value ? toCompact(e.target.value) : "")} />
           </Field>
 
-          {/* 已有读数的月份提示 */}
-          {readings.data && readings.data.length > 0 && (
+          {/* 月份快捷切换：共享电表看「已录分摊的月份」，普通电表看「已有读数的月份」 */}
+          {isShared ? (
+            (allocForm.data?.periods?.length ?? 0) > 0 && (
+              <div className="flex flex-wrap items-center gap-1">
+                <span className="text-[11px] text-purple-600">已录分摊月份</span>
+                {allocForm.data.periods.map((p: string) => (
+                  <button key={p}
+                    className={`rounded-full px-2 py-0.5 text-[10px] ${p === monthPeriod ? "bg-purple-100 font-medium text-purple-700" : "bg-slate-100 text-slate-500 hover:bg-slate-200"}`}
+                    onClick={() => changeMonth(p)}>
+                    {toDisplay(p)}
+                  </button>
+                ))}
+              </div>
+            )
+          ) : readings.data && readings.data.length > 0 && (
             <div className="flex flex-wrap gap-1">
               {readings.data.map((r: any) => (
                 <button key={r.monthPeriod}
                   className={`rounded-full px-2 py-0.5 text-[10px] ${r.monthPeriod === monthPeriod ? "bg-blue-100 text-blue-700 font-medium" : "bg-slate-100 text-slate-500 hover:bg-slate-200"}`}
-                  onClick={() => setMonthPeriod(r.monthPeriod)}>
+                  onClick={() => changeMonth(r.monthPeriod)}>
                   {toDisplay(r.monthPeriod)} ({r.kwh}){r.actualKwh != null ? " ★" : ""}
                 </button>
               ))}
             </div>
           )}
 
+          {/* ── 共享电表：品牌分摊录入（应付电费 → 倒推用电量）── */}
+          {isShared && (
+            <div className="rounded-lg border border-purple-200 bg-purple-50/40 p-3">
+              <div className="mb-1 flex items-center justify-between">
+                <div>
+                  <div className="text-sm font-semibold text-purple-800">品牌分摊（各品牌应付电费）</div>
+                  <div className="text-[11px] text-purple-600">
+                    录入各品牌该月应付电费 + 电柜数量 → 用电量 = 金额 ÷ 单价 自动倒推；付款给场地方 = 倒推电量 × 场地单价
+                  </div>
+                </div>
+                <Button size="sm" variant="outline" className="shrink-0 border-purple-300 text-purple-700 hover:bg-purple-50"
+                  onClick={addAllocRow} disabled={allocForm.isLoading}>
+                  <Plus className="mr-1 h-3 w-3" />添加品牌
+                </Button>
+              </div>
+
+              {allocForm.isLoading ? (
+                <div className="py-3 text-center text-xs text-slate-400">加载品牌单价…</div>
+              ) : (
+                <>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-xs">
+                      <thead>
+                        <tr className="text-left text-[10px] text-purple-700">
+                          <th className="py-1 pr-2 font-medium">品牌方</th>
+                          <th className="py-1 pr-2 font-medium">电柜数量</th>
+                          <th className="py-1 pr-2 font-medium">应付电费（元）</th>
+                          <th className="py-1 pr-2 font-medium">单价（元/度）</th>
+                          <th className="py-1 pr-2 font-medium">用电量（度）</th>
+                          <th className="py-1 font-medium"></th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {allocRows.map((row, i) => {
+                          const contractPrice = contractPriceOf(row.brandId);
+                          const k = kwhOfRow(row);
+                          const hasAmount = String(row.collectAmount).trim() !== "";
+                          const defCabinet = cabinetDefaultOf(row.brandId);
+                          // 该行柜数 = 该品牌最近一次填写值，且来源不是本月 → 说明是「沿用」来的
+                          const cabinetInherited = defCabinet != null
+                            && String(defCabinet.count) === row.cabinetCount.trim()
+                            && defCabinet.monthPeriod !== monthPeriod;
+                          return (
+                            <tr key={`${row.brandId}-${i}`} className="border-t border-purple-100">
+                              <td className="py-1 pr-2">
+                                <select className={`${inputCls} h-8 w-36 text-xs`} value={row.brandId}
+                                  onChange={(e) => {
+                                    const bid = e.target.value;
+                                    const def = cabinetDefaultOf(bid);
+                                    // 换品牌时带出该品牌最近一次的电柜数量（无记录则清空）
+                                    setAllocRow(i, {
+                                      brandId: bid, unitPrice: "",
+                                      cabinetCount: def ? String(def.count) : "",
+                                    });
+                                  }}>
+                                  <option value="">请选择品牌</option>
+                                  {/* 已被其他行选中的品牌不再列出，避免同表同月重复（后端也会拦） */}
+                                  {brandOptions
+                                    .filter((o) => o.value === row.brandId
+                                      || !allocRows.some((r2, j) => j !== i && r2.brandId === o.value))
+                                    .map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+                                </select>
+                              </td>
+                              <td className="py-1 pr-2">
+                                <div className="flex items-center gap-1">
+                                  <input type="number" step="1" min="1"
+                                    className={`${inputCls} h-8 w-16 text-xs`}
+                                    placeholder="台"
+                                    title={defCabinet
+                                      ? `该品牌最近一次填写：${defCabinet.count} 台（${toDisplay(defCabinet.monthPeriod)}）`
+                                      : "该品牌尚未填写过电柜数量"}
+                                    value={row.cabinetCount}
+                                    onChange={(e) => setAllocRow(i, { cabinetCount: e.target.value })} />
+                                  <span className="text-[10px] text-purple-500">台</span>
+                                  {cabinetInherited && defCabinet && (
+                                    <span className="cursor-help text-[10px] text-purple-400"
+                                      title={`沿用 ${toDisplay(defCabinet.monthPeriod)} 的填写值；本月调整后，下月默认即为新值`}>
+                                      沿用
+                                    </span>
+                                  )}
+                                </div>
+                              </td>
+                              <td className="py-1 pr-2">
+                                <input type="number" step="0.01" min="0"
+                                  className={`${inputCls} h-8 w-24 text-xs`} placeholder="0.00"
+                                  value={row.collectAmount}
+                                  onChange={(e) => setAllocRow(i, { collectAmount: e.target.value })} />
+                              </td>
+                              <td className="py-1 pr-2">
+                                <input type="number" step="0.0001" min="0"
+                                  className={`${inputCls} h-8 w-24 text-xs`}
+                                  placeholder={contractPrice != null ? String(contractPrice) : "无合同价"}
+                                  value={row.unitPrice}
+                                  onChange={(e) => setAllocRow(i, { unitPrice: e.target.value })} />
+                              </td>
+                              <td className="py-1 pr-2 tabular-nums text-slate-600">
+                                {k != null ? k : (hasAmount ? <span className="text-rose-500">缺单价</span> : "—")}
+                              </td>
+                              <td className="py-1 text-right">
+                                <button className="rounded p-1 text-slate-400 hover:text-rose-500" onClick={() => removeAllocRow(i)} title="删除该品牌分摊">
+                                  <Trash2 className="h-3 w-3" />
+                                </button>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                        {allocRows.length === 0 && (
+                          <tr><td colSpan={6} className="py-3 text-center text-slate-400">
+                            暂无品牌分摊，点击「添加品牌」录入
+                          </td></tr>
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+
+                  <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 border-t border-purple-100 pt-2 text-[11px] text-purple-700">
+                    <span>合计应付电费：<b className="tabular-nums">{fmtNum(allocTotals.amount)}</b> 元</span>
+                    <span>合计用电量：<b className="tabular-nums">{fmtNum(allocTotals.kwh)}</b> 度</span>
+                    {allocTotals.cabinetsFilled > 0 && (
+                      <span>合计电柜：<b className="tabular-nums">{allocTotals.cabinets}</b> 台</span>
+                    )}
+                    {allocTotals.missingPrice > 0 && (
+                      <span className="text-rose-600">{allocTotals.missingPrice} 行缺单价，无法倒推用电量</span>
+                    )}
+                  </div>
+
+                  {/* 整表读数：第三方同步值；未同步时可手动补录（写 actual_kwh，不随同步覆盖） */}
+                  <div className="mt-2 space-y-1 border-t border-purple-100 pt-2">
+                    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px]">
+                      <span className="font-medium text-purple-800">整表读数</span>
+                      {editingTableKwh ? (
+                        <>
+                          <input type="number" step="0.01" min="0" autoFocus
+                            className={`${inputCls} h-8 w-32 text-xs`}
+                            placeholder="含互感器倍数"
+                            value={manualKwh}
+                            onChange={(e) => setManualKwh(e.target.value)} />
+                          <span className="text-purple-700">度</span>
+                          <Button size="sm" variant="outline"
+                            className="h-8 border-purple-300 text-purple-700 hover:bg-purple-50"
+                            disabled={!manualKwh.trim() || saveTableKwh.isPending}
+                            onClick={() => saveTableKwh.mutate()}>
+                            {saveTableKwh.isPending ? "保存中…" : "保存"}
+                          </Button>
+                          <button className="text-slate-400 hover:text-slate-600"
+                            onClick={() => { setEditingTableKwh(false); setManualKwh(""); }}>
+                            取消
+                          </button>
+                        </>
+                      ) : (
+                        <>
+                          <span className="text-purple-700">
+                            {tableKwh != null
+                              ? <><b className="tabular-nums">{fmtNum(tableKwh)}</b> 度（{tableKwhIsManual ? "人工补录" : "第三方同步"}）</>
+                              : <span className="text-slate-400">未同步</span>}
+                          </span>
+                          <button className="text-purple-500 underline decoration-dotted hover:text-purple-700"
+                            onClick={() => { setEditingTableKwh(true); setManualKwh(tableKwh != null ? String(tableKwh) : ""); }}>
+                            {tableKwh != null ? "修改" : "手动补录"}
+                          </button>
+                        </>
+                      )}
+                    </div>
+
+                    {editingTableKwh && (
+                      <p className="text-[11px] text-slate-400">
+                        填整表实际用电量（已含互感器倍数）。该值不随第三方同步覆盖；未录分摊的月份，台账按此度数 × 合同单价计算。
+                      </p>
+                    )}
+
+                    {/* 核对条：整表物理读数 vs 分摊倒推合计 */}
+                    {!editingTableKwh && allocTotals.amount > 0 && tableKwh != null && kwhGap != null && (() => {
+                      const payPrice = allocForm.data?.payPrice != null ? Number(allocForm.data.payPrice) : null;
+                      if (Math.abs(kwhGap) <= Math.max(1, tableKwh * 0.01)) {
+                        return (
+                          <p className="text-[11px] text-emerald-600">
+                            整表 {fmtNum(tableKwh)} 度 ≈ 分摊倒推 {fmtNum(allocTotals.kwh)} 度，已对齐。
+                          </p>
+                        );
+                      }
+                      if (kwhGap > 0) {
+                        return (
+                          <p className="text-[11px] text-amber-600">
+                            整表 {fmtNum(tableKwh)} 度 － 分摊倒推 {fmtNum(allocTotals.kwh)} 度 ={" "}
+                            <b className="tabular-nums">{fmtNum(kwhGap)}</b> 度无人认领
+                            {payPrice ? <>（按场地单价 {payPrice} 元/度约 <b className="tabular-nums">¥{(kwhGap * payPrice).toFixed(2)}</b> 需自负）</> : null}
+                            ，请检查是否有漏报品牌或公摊电量。
+                          </p>
+                        );
+                      }
+                      return (
+                        <p className="text-[11px] text-rose-600">
+                          分摊倒推 {fmtNum(allocTotals.kwh)} 度 ＞ 整表 {fmtNum(tableKwh)} 度{" "}
+                          <b className="tabular-nums">{fmtNum(Math.abs(kwhGap))}</b> 度，请检查品牌单价或应付电费金额是否偏高。
+                        </p>
+                      );
+                    })()}
+
+                    {!editingTableKwh && allocTotals.amount > 0 && tableKwh == null && (
+                      <p className="text-[11px] text-slate-400">
+                        该月暂无整表读数，无法与分摊倒推量核对；可点「手动补录」填入物理读数。
+                      </p>
+                    )}
+                  </div>
+                  {allocAmountRows.length === 0 && savedAllocKey !== "" && (
+                    <p className="mt-1 text-[11px] text-rose-600">
+                      当前未填任何金额 → 保存后将清空该月品牌分摊，台账退回「整表读数 × 合同单价」。
+                    </p>
+                  )}
+                  <p className="mt-1 text-[11px] text-purple-600">
+                    单价留空 = 自动取该品牌方合同单价；填了则以填写值为准（用于倒推用电量）。
+                    电柜数量逐月可调，首次录入后下月自动沿用该品牌最近一次填写值（本月改了，下月默认即为新值）；
+                    柜数留空表示本月未填。
+                  </p>
+                  <p className="mt-1 text-[11px] text-purple-600">
+                    金额留空的行不会保存。清空全部金额 = 取消分摊，台账退回「整表读数 × 合同单价」。
+                  </p>
+                  <p className="mt-1 text-[11px] text-purple-500">
+                    共享电表不按整表读数计费，此表单只录分摊；未录分摊的月份，台账按「第三方同步读数 × 合同单价」生成。
+                  </p>
+                </>
+              )}
+            </div>
+          )}
+
+          {/* 读数区：共享电表（所有品牌共用）不按读数计费，整块隐藏 */}
+          {!isShared && (<>
           {/* 上月抄表信息 */}
           <div className="grid grid-cols-2 gap-3">
             <Field label="上月抄表时间">
@@ -984,9 +1449,13 @@ function ReadingForm({ open, onClose, meter }: { open: boolean; onClose: () => v
             </div>
           )}
 
+          </>)}
+
           <div className="flex justify-end gap-2 pt-1">
             <Button variant="outline" onClick={onClose}>取消</Button>
-            <Button className="bg-blue-600 hover:bg-blue-700" disabled={save.isPending || (!kwh && !prevReading && !currReading)} onClick={() => save.mutate()}>
+            <Button className="bg-blue-600 hover:bg-blue-700"
+              disabled={save.isPending || !canSave || (isShared && allocForm.isLoading)}
+              onClick={() => save.mutate()}>
               {save.isPending ? "保存中…" : "保存"}
             </Button>
           </div>

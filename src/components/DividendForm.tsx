@@ -4,7 +4,7 @@ import { createDividend } from "@/api/dividends";
 import { listLandlords } from "@/api/directory";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
-import { Field, TextInput, SelectInput } from "./fields";
+import { Field, TextInput, SelectInput, SearchSelect } from "./fields";
 import { strOrNull } from "@/lib/format";
 import { toast } from "sonner";
 
@@ -56,8 +56,8 @@ export function DividendForm(props: { open: boolean; onClose: () => void; record
         <div className="space-y-4">
           <div className="grid grid-cols-3 gap-3">
             <Field label="场地方 *">
-              <SelectInput value={f.landlordId} onChange={set("landlordId")}
-                options={[{ value: "", label: "请选择场地方" }, ...(landlords.data ?? []).map((st: any) => ({ value: String(st.id), label: st.name }))]} />
+              <SearchSelect value={f.landlordId} onChange={set("landlordId")} placeholder="请选择场地方（可搜索）" clearable={false}
+                options={(landlords.data ?? []).map((st: any) => ({ value: String(st.id), label: st.name }))} />
             </Field>
             <Field label="分红月份">
               <input type="month" className="w-full rounded-md border border-slate-200 px-2.5 py-1.5 text-sm" value={f.period} onChange={(e) => set("period")(e.target.value)} />

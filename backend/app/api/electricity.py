@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException, Request
-from ..repositories import electricity_repo
+from ..repositories import electricity_repo, shared_allocation_repo
 from ..domain.electricity_calc import calc_electricity
 from ..domain.electricity_pricing import split_tax
 from ..infra.auth_scope import scope_landlord_ids, ensure_meter_in_scope
@@ -181,21 +181,39 @@ async def reading_detail(request: Request, meterNo: str, period: str):
         prev_row = cur.fetchone()
 
         # 该表当期台账费用（场地×品牌×月的记录中本表明细）
+        # 共享电表按品牌分摊后，同一块表在同一月会有多条明细（每个品牌一条），全部返回。
         cur.execute("""
             SELECT e.pay_unit_price, e.pay_amount, e.pay_status,
                    e.collect_unit_price, e.collect_amount, e.collect_net, e.collect_status,
-                   d.kwh AS ledger_kwh, e.data_source
+                   d.kwh AS ledger_kwh, e.data_source,
+                   COALESCE(e.brand_id, m.brand_id) AS brand_id, b.name AS brand_name
             FROM electricity_meter_details d
             JOIN electricity_records e ON e.id = d.electricity_id
+            JOIN meters m ON d.meter_id = m.id
+            LEFT JOIN brands b ON COALESCE(e.brand_id, m.brand_id) = b.id
             WHERE d.meter_id = %s AND e.period = %s
+            ORDER BY b.name
         """, (meter["id"], period))
-        ledger = cur.fetchone()
+        ledger_rows = cur.fetchall()
+        ledger = ledger_rows[0] if ledger_rows else None
+
+        # 品牌分摊录入（共享电表）：核对时可直接看到各品牌录入的应收电费与倒推电量
+        cur.execute("""
+            SELECT a.brand_id, b.name AS brand_name, a.collect_amount, a.unit_price, a.remark
+            FROM meter_shared_allocations a
+            LEFT JOIN brands b ON a.brand_id = b.id
+            WHERE a.address = %s AND a.month_period = %s
+            ORDER BY b.name
+        """, (meterNo, period))
+        allocations = cur.fetchall()
 
         return {
             "meter": meter,
             "reading": reading,
             "prevMonth": prev_row,
             "ledger": ledger,
+            "ledgerRows": ledger_rows,
+            "allocations": allocations,
         }
     finally:
         cur.close()
@@ -495,9 +513,19 @@ async def generate_electricity(data: dict):
                 landlord_contracts_map[c["landlord_id"]].append(c)
 
         # 4. 按 (场地, 品牌, 主体) 分组电表（v3.1：一表一主体，组内天然同主体）
+        #
+        # 共享电表（「所有品牌共用此电表」）特例：该表某月已人工录入品牌分摊时，
+        # 按分摊品牌拆成多条明细（金额人工给、用电量=金额÷单价倒推），该表自身不再单独成组，
+        # 避免「总表整场地一行」与「品牌明细」双算；未录分摊的月份维持原口径（读数 × 合同单价）。
+        alloc_map = shared_allocation_repo.list_allocations_by_period(period)
         groups = defaultdict(list)
         for m in meters:
-            groups[(m["landlord_id"], m["brand_id"], m["entity_id"])].append(m)
+            allocs = alloc_map.get(m["meter_no"])
+            if allocs:
+                for a in allocs:
+                    groups[(m["landlord_id"], a["brand_id"], m["entity_id"])].append({"meter": m, "alloc": a})
+            else:
+                groups[(m["landlord_id"], m["brand_id"], m["entity_id"])].append({"meter": m, "alloc": None})
 
         # 预加载已有台账（按 landlord+brand+entity）
         cur.execute("SELECT id, landlord_id, brand_id, entity_id FROM electricity_records WHERE period = %s", (period,))
@@ -505,6 +533,7 @@ async def generate_electricity(data: dict):
 
         created = []
         updated = []
+        warnings = []
 
         for (lid, bid, eid), meter_list in groups.items():
             existing = existing_map.get((lid, bid, eid))
@@ -515,10 +544,13 @@ async def generate_electricity(data: dict):
             pricing = resolve_prices(contracts)
             landlord_price = pricing["pay_price"]
 
+            # 有品牌分摊录入的组：金额是人工确认的应付款，无对应品牌合同也照常生成
+            has_alloc = any(e["alloc"] for e in meter_list)
+
             # 只生成有合同的场地×品牌：无场地合同 且（该品牌无品牌方合同 且 无全品牌合同）→ 不生成；有旧记录则删除
             has_site_contract = any(c.get("contract_type") == "场地合同" for c in contracts)
             has_brand_contract = (bid in pricing["brand_prices"]) if bid is not None else pricing.get("shared_price") is not None
-            if not has_site_contract and not has_brand_contract:
+            if not has_site_contract and not has_brand_contract and not has_alloc:
                 if existing:
                     cur.execute("DELETE FROM electricity_meter_details WHERE electricity_id = %s", (existing["id"],))
                     cur.execute("DELETE FROM electricity_records WHERE id = %s", (existing["id"],))
@@ -536,7 +568,44 @@ async def generate_electricity(data: dict):
             total_pay_kwh = 0
             total_collect_kwh = 0
             meter_details = []
-            for m in meter_list:
+            for item in meter_list:
+                m = item["meter"]
+                alloc = item["alloc"]
+
+                if alloc is not None:
+                    # ── 共享电表品牌分摊：金额人工录入，用电量 = 金额 ÷ 单价 倒推 ──
+                    brand_info = brand_price_for(pricing, alloc["brand_id"], m.get("entity_id"))
+                    unit_price = alloc.get("unit_price")
+                    if unit_price is None:
+                        unit_price = brand_info["price"] if brand_info else None
+                    collect_amount = round(float(alloc["collect_amount"] or 0), 2)
+                    if not unit_price:
+                        warnings.append(
+                            f"{m['meter_no']}（{alloc.get('brand_name') or alloc['brand_id']}）"
+                            f"{period} 缺单价，无法倒推用电量，已跳过该品牌分摊"
+                        )
+                        continue
+                    actual_kwh = round(collect_amount / float(unit_price), 2)
+                    detail_rate = brand_info["tax_rate"] if (brand_info and brand_info.get("tax_enabled")) else None
+                    pay_amount = round(actual_kwh * float(landlord_price or 0), 2) if landlord_price else 0
+                    _, collect_net = split_tax(collect_amount, detail_rate)
+                    total_pay_kwh += actual_kwh
+                    total_collect_kwh += actual_kwh
+                    meter_details.append({
+                        "meterId": m["id"],
+                        "meterNo": m["meter_no"],
+                        "brandId": alloc["brand_id"],
+                        "brandName": alloc.get("brand_name"),
+                        "kwh": actual_kwh,
+                        "payUnitPrice": float(landlord_price or 0),
+                        "payAmount": pay_amount,
+                        "collectUnitPrice": float(unit_price),
+                        "collectAmount": collect_amount,
+                        "collectNet": collect_net,
+                        "source": "shared_alloc",
+                    })
+                    continue
+
                 row = readings.get(m["meter_no"]) or {}
                 kwh = float(row.get("kwh") or 0)
                 if row.get("actual") is not None:
@@ -576,6 +645,10 @@ async def generate_electricity(data: dict):
             total_pay_amount = sum(d["payAmount"] for d in meter_details)
             total_collect_amount = sum(d["collectAmount"] for d in meter_details)
             total_collect_net = sum(d["collectNet"] for d in meter_details)
+
+            # 分摊组的表头收款单价取明细实际单价（可能是人工覆盖的单价，合同里查不到）
+            if has_alloc and meter_details:
+                record_collect_price = meter_details[0]["collectUnitPrice"]
 
             # 电费台账只记纯电费，不混租金（租金在 rent_* 体系单独体现）
             profit = round(total_collect_net - total_pay_amount, 2)
@@ -665,6 +738,7 @@ async def generate_electricity(data: dict):
             "updated": len(updated),
             "deleted": len(deleted),
             "period": period,
+            "warnings": warnings,
             "detail": f"新增 {len(created)} 条，更新 {len(updated)} 条" + (f"，清理残留 {len(deleted)} 条" if deleted else "")
         }
     finally:
@@ -695,7 +769,12 @@ async def auto_generate_for_meter(meter_no: str, from_period: str = None) -> int
         row = cur.fetchone()
         if not row:
             return 0
-        cur.execute("SELECT DISTINCT month_period AS p FROM meter_monthly WHERE address = %s", (meter_no,))
+        # 有读数的月份 ∪ 有品牌分摊录入的月份（共享电表可能只录了分摊、没录读数）
+        cur.execute("""
+            SELECT DISTINCT month_period AS p FROM meter_monthly WHERE address = %s
+            UNION
+            SELECT DISTINCT month_period AS p FROM meter_shared_allocations WHERE address = %s
+        """, (meter_no, meter_no))
         periods = [r["p"] for r in cur.fetchall()]
     finally:
         cur.close()
@@ -720,7 +799,11 @@ async def auto_generate_for_landlord(landlord_id) -> int:
             JOIN meters m ON m.meter_no = mm.address
             WHERE m.landlord_id = %s AND (m.brand_id IS NOT NULL OR m.tag = '共享电表')
               AND m.meter_no NOT LIKE 'TEST%%'
-        """, (landlord_id,))
+            UNION
+            SELECT DISTINCT a.month_period AS p FROM meter_shared_allocations a
+            JOIN meters m ON m.meter_no = a.address
+            WHERE m.landlord_id = %s AND m.meter_no NOT LIKE 'TEST%%'
+        """, (landlord_id, landlord_id))
         periods = [r["p"] for r in cur.fetchall()]
     finally:
         cur.close()
@@ -747,6 +830,10 @@ async def generate_all_ledger() -> int:
             WHERE m.landlord_id IS NOT NULL
               AND (m.brand_id IS NOT NULL OR m.tag = '共享电表')
               AND m.meter_no NOT LIKE 'TEST%%'
+            UNION
+            SELECT DISTINCT a.month_period AS p FROM meter_shared_allocations a
+            JOIN meters m ON m.meter_no = a.address
+            WHERE m.landlord_id IS NOT NULL AND m.meter_no NOT LIKE 'TEST%%'
         """)
         periods = [r["p"] for r in cur.fetchall()]
     finally:
@@ -785,7 +872,7 @@ async def monthly_ledger(period: str, dim: str = "landlord", request: Request = 
                 brand_scope_sql += " AND m.tag = %s"
                 brand_scope_vals.append(tag_scope)
             cur.execute(f"""
-                SELECT m.brand_id AS key, COALESCE(b.name, '全品牌共享') AS name,
+                SELECT COALESCE(e.brand_id, m.brand_id) AS key, COALESCE(b.name, '全品牌共享') AS name,
                        COALESCE(SUM(d.kwh), 0) AS kwh,
                        COALESCE(SUM(d.pay_amount), 0) AS pay_amount,
                        COALESCE(SUM(d.collect_amount), 0) AS collect_amount,
@@ -793,28 +880,29 @@ async def monthly_ledger(period: str, dim: str = "landlord", request: Request = 
                 FROM electricity_meter_details d
                 JOIN electricity_records e ON e.id = d.electricity_id
                 JOIN meters m ON d.meter_id = m.id
-                LEFT JOIN brands b ON m.brand_id = b.id
+                LEFT JOIN brands b ON COALESCE(e.brand_id, m.brand_id) = b.id
                 WHERE e.period = %s{brand_scope_sql}
-                GROUP BY m.brand_id, b.name
+                GROUP BY COALESCE(e.brand_id, m.brand_id), b.name
                 ORDER BY name
             """, (period, *brand_scope_vals))
             rows = cur.fetchall()
             # 品牌明细：该品牌该月的 电表行（含 互感器倍数/单价/金额/状态）
             for r in rows:
-                # 共享电表 brand_id 为 NULL，需用 IS NULL 匹配
-                brand_cond = "m.brand_id IS NULL" if r["key"] is None else "m.brand_id = %s"
+                # 品牌口径：优先台账行品牌（共享电表按品牌分摊后每行一个品牌），
+                # 其次电表品牌；两者都空 = 未做分摊的共享电表（全品牌共享）
+                brand_cond = "COALESCE(e.brand_id, m.brand_id) IS NULL" if r["key"] is None else "COALESCE(e.brand_id, m.brand_id) = %s"
                 brand_vals = (period,) if r["key"] is None else (period, r["key"])
                 cur.execute(f"""
                     SELECT m.meter_name AS station_name, m.meter_no, m.meter_name,
                            m.transformer_ratio,
-                           m.brand_id, b.name AS brand_name,
+                           COALESCE(e.brand_id, m.brand_id) AS brand_id, b.name AS brand_name,
                            d.kwh, d.pay_unit_price, d.pay_amount, d.collect_unit_price,
                            d.collect_amount, d.collect_net,
                            e.pay_status, e.collect_status, e.data_source, e.id AS record_id
                     FROM electricity_meter_details d
                     JOIN electricity_records e ON e.id = d.electricity_id
                     JOIN meters m ON d.meter_id = m.id
-                    LEFT JOIN brands b ON m.brand_id = b.id
+                    LEFT JOIN brands b ON COALESCE(e.brand_id, m.brand_id) = b.id
                     WHERE e.period = %s AND {brand_cond}{brand_scope_sql}
                     ORDER BY m.meter_name, m.meter_no
                 """, (*brand_vals, *brand_scope_vals))
@@ -852,7 +940,7 @@ async def monthly_ledger(period: str, dim: str = "landlord", request: Request = 
                 cur.execute(f"""
                     SELECT m.meter_name, m.meter_no, m.meter_name AS station_name,
                            m.transformer_ratio,
-                           m.brand_id, b.name AS brand_name,
+                           COALESCE(e.brand_id, m.brand_id) AS brand_id, b.name AS brand_name,
                            l.name AS landlord_name,
                            d.kwh, d.pay_unit_price, d.pay_amount, d.collect_unit_price,
                            d.collect_amount, d.collect_net,
@@ -860,7 +948,7 @@ async def monthly_ledger(period: str, dim: str = "landlord", request: Request = 
                     FROM electricity_meter_details d
                     JOIN electricity_records e ON e.id = d.electricity_id
                     JOIN meters m ON d.meter_id = m.id
-                    LEFT JOIN brands b ON m.brand_id = b.id
+                    LEFT JOIN brands b ON COALESCE(e.brand_id, m.brand_id) = b.id
                     LEFT JOIN landlords l ON m.landlord_id = l.id
                     WHERE e.period = %s AND m.entity_id IS NOT DISTINCT FROM %s{detail_scope_sql}
                     ORDER BY l.name, m.meter_name, m.meter_no
@@ -901,14 +989,14 @@ async def monthly_ledger(period: str, dim: str = "landlord", request: Request = 
                 cur.execute(f"""
                     SELECT m.meter_name, m.meter_no, m.meter_name AS station_name,
                            m.transformer_ratio,
-                           m.brand_id, b.name AS brand_name,
+                           COALESCE(e.brand_id, m.brand_id) AS brand_id, b.name AS brand_name,
                            d.kwh, d.pay_unit_price, d.pay_amount, d.collect_unit_price,
                            d.collect_amount, d.collect_net,
                            e.pay_status, e.collect_status, e.data_source, e.id AS record_id
                     FROM electricity_meter_details d
                     JOIN electricity_records e ON e.id = d.electricity_id
                     JOIN meters m ON d.meter_id = m.id
-                    LEFT JOIN brands b ON m.brand_id = b.id
+                    LEFT JOIN brands b ON COALESCE(e.brand_id, m.brand_id) = b.id
                     WHERE e.period = %s AND m.landlord_id = %s
                       AND m.entity_id IS NOT DISTINCT FROM %s{detail_scope_sql}
                     ORDER BY m.meter_name, m.meter_no
@@ -981,7 +1069,7 @@ async def export_ledger(request: Request, period: str, dim: str = "landlord"):
                 d.id AS detail_id,
                 m.id AS meter_id, m.meter_no, m.meter_name, m.transformer_ratio, m.tag,
                 l.id AS landlord_id, l.name AS landlord_name, l.company_share,
-                b.id AS brand_id, b.name AS brand_name,
+                COALESCE(e.brand_id, m.brand_id) AS brand_id, b.name AS brand_name,
                 m.entity_id AS entity_id, ent.name AS entity_name,
                 d.kwh, d.pay_unit_price, d.pay_amount,
                 d.collect_unit_price, d.collect_amount, d.collect_net,
@@ -993,7 +1081,7 @@ async def export_ledger(request: Request, period: str, dim: str = "landlord"):
             JOIN electricity_records e ON e.id = d.electricity_id
             JOIN meters m ON d.meter_id = m.id
             LEFT JOIN landlords l ON m.landlord_id = l.id
-            LEFT JOIN brands b ON m.brand_id = b.id
+            LEFT JOIN brands b ON COALESCE(e.brand_id, m.brand_id) = b.id
             LEFT JOIN entities ent ON m.entity_id = ent.id
             LEFT JOIN meter_monthly mm
                    ON mm.address = m.meter_no AND mm.month_period = %s

@@ -13,7 +13,7 @@ import {
 } from "@/api/directory";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { inputCls } from "@/components/fields";
+import { inputCls, SearchSelect } from "@/components/fields";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { exportXlsx } from "@/lib/export";
 import { getAlertConfig, saveAlertConfig } from "@/api/alerts";
@@ -265,11 +265,11 @@ function PlatformUsersTable({ shareholders, landlords }: { shareholders: any[] |
       </td>
       <td className="px-3 py-2">
         {d.role === "shareholder" ? (
-          <select className={`${inputCls} w-28`} value={d.shareholderId}
-            onChange={(e) => setD((p: any) => ({ ...p, shareholderId: e.target.value }))}>
-            <option value="">选择股东…</option>
-            {(shareholders ?? []).map((s: any) => <option key={s.id} value={s.id}>{s.name}</option>)}
-          </select>
+          <div className="w-28">
+            <SearchSelect value={d.shareholderId} onChange={(v) => setD((p: any) => ({ ...p, shareholderId: v }))}
+              placeholder="选择股东…" clearable={false}
+              options={(shareholders ?? []).map((s: any) => ({ value: String(s.id), label: s.name }))} />
+          </div>
         ) : (
           <span className="text-xs text-slate-400">-</span>
         )}

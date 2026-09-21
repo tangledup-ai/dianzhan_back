@@ -253,3 +253,31 @@ ALTER TABLE dividend_shares ADD COLUMN IF NOT EXISTS entity_id INTEGER;
 -- TRUE（默认）：保存合同时按「场地收付款方式 × 起止日期」自动拆出每期与应收应付；
 -- FALSE：不自动拆期，由用户在合同列表展开该合同后「+ 添加一期」手动录入
 ALTER TABLE contracts ADD COLUMN IF NOT EXISTS auto_split BOOLEAN NOT NULL DEFAULT TRUE;
+
+-- ── 17) 共享电表品牌分摊（「所有品牌共用此电表」时按品牌录入应付电费）──
+-- 电表 tag='共享电表' 且 brand_id 为空 = 场地总表，无法用「某品牌用电量 × 单价」算电费；
+-- 改为按 电表×月份×品牌 人工录入收款金额，用电量 = 金额 ÷ 单价 倒推。
+-- 某表某月无分摊行时，台账仍按原口径（读数 × 合同单价）整场地出一行。
+CREATE TABLE IF NOT EXISTS meter_shared_allocations (
+    id SERIAL PRIMARY KEY,
+    meter_id INTEGER NOT NULL REFERENCES meters(id),
+    address VARCHAR(100) NOT NULL,
+    month_period VARCHAR(6) NOT NULL,
+    brand_id INTEGER NOT NULL REFERENCES brands(id),
+    entity_id INTEGER REFERENCES entities(id),
+    collect_amount NUMERIC(14,2) NOT NULL,
+    unit_price NUMERIC(8,4),
+    remark TEXT,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW(),
+    UNIQUE(address, month_period, brand_id)
+);
+CREATE INDEX IF NOT EXISTS idx_shared_alloc_period ON meter_shared_allocations(month_period);
+CREATE INDEX IF NOT EXISTS idx_shared_alloc_meter ON meter_shared_allocations(meter_id);
+CREATE INDEX IF NOT EXISTS idx_shared_alloc_brand ON meter_shared_allocations(brand_id);
+
+-- 电柜数量：某品牌当月在该共享电表（场地总表）下投放的柜数。
+-- 逐月可动态调整（柜子会增减），所以落「电表×月份×品牌」维度，不做全局唯一值。
+-- 录入时留空 = 自动沿用该品牌最近一次填写值（前端预填，不落库）。
+ALTER TABLE meter_shared_allocations ADD COLUMN IF NOT EXISTS cabinet_count INTEGER;
+COMMENT ON COLUMN meter_shared_allocations.cabinet_count IS '该品牌当月在此共享电表下投放的电柜数量（逐月可变，可为空）';

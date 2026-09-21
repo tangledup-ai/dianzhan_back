@@ -1,0 +1,294 @@
+"""共享电表品牌分摊仓储（「所有品牌共用此电表」按品牌录入应付电费）
+
+表：meter_shared_allocations（电表 × 月份 × 品牌 一行）
+- collect_amount = 品牌方付给我方的电费（收款/收入，含税）
+- unit_price     = 倒推用电量用的单价；NULL = 生成台账时取该品牌方合同单价
+- 用电量 kwh     = collect_amount ÷ unit_price（不落库，生成台账/分红时实时算）
+"""
+from ..infra.database import get_connection, get_dict_cursor
+
+
+def list_allocations(address: str = None, month_period: str = None, brand_id: int = None):
+    """按条件查分摊行（带品牌名），供录入表单回填与核对展示"""
+    conn = get_connection()
+    cur = get_dict_cursor(conn)
+    try:
+        conditions, values = [], []
+        if address:
+            conditions.append("a.address = %s"); values.append(address)
+        if month_period:
+            conditions.append("a.month_period = %s"); values.append(month_period)
+        if brand_id:
+            conditions.append("a.brand_id = %s"); values.append(brand_id)
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        cur.execute(f"""
+            SELECT a.*, b.name AS brand_name, ent.name AS entity_name
+            FROM meter_shared_allocations a
+            LEFT JOIN brands b ON a.brand_id = b.id
+            LEFT JOIN entities ent ON a.entity_id = ent.id
+            {where}
+            ORDER BY b.name, a.brand_id
+        """, values)
+        return cur.fetchall()
+    finally:
+        cur.close()
+        conn.close()
+
+
+def list_allocations_by_period(month_period: str) -> dict:
+    """取某月全部分摊行，按电表号分组：{address: [row, ...]}
+
+    供台账生成一次查询使用（避免逐表查询）。
+    """
+    conn = get_connection()
+    cur = get_dict_cursor(conn)
+    try:
+        cur.execute("""
+            SELECT a.address, a.brand_id, a.entity_id, a.collect_amount, a.unit_price, a.remark,
+                   b.name AS brand_name
+            FROM meter_shared_allocations a
+            LEFT JOIN brands b ON a.brand_id = b.id
+            WHERE a.month_period = %s
+            ORDER BY a.address, a.brand_id
+        """, (month_period,))
+        out = {}
+        for r in cur.fetchall():
+            out.setdefault(r["address"], []).append(r)
+        return out
+    finally:
+        cur.close()
+        conn.close()
+
+
+def replace_allocations(address: str, month_period: str, rows: list) -> int:
+    """整体替换某电表某月的品牌分摊行（删除后重建，空列表 = 清空该月分摊）。
+
+    rows: [{brandId, entityId, collectAmount, unitPrice, cabinetCount, remark}]
+    返回写入行数。
+    """
+    conn = get_connection()
+    cur = get_dict_cursor(conn)
+    try:
+        cur.execute(
+            "DELETE FROM meter_shared_allocations WHERE address = %s AND month_period = %s",
+            (address, month_period),
+        )
+        cur.execute("SELECT id FROM meters WHERE meter_no = %s", (address,))
+        meter = cur.fetchone()
+        meter_id = meter["id"] if meter else None
+        if meter_id is None and rows:
+            raise ValueError(f"电表 {address} 不存在，无法保存品牌分摊")
+
+        for r in rows:
+            cur.execute("""
+                INSERT INTO meter_shared_allocations
+                (meter_id, address, month_period, brand_id, entity_id, collect_amount, unit_price, cabinet_count, remark)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (
+                meter_id, address, month_period, r["brandId"], r.get("entityId"),
+                r["collectAmount"], r.get("unitPrice"), r.get("cabinetCount"), r.get("remark"),
+            ))
+        conn.commit()
+        return len(rows)
+    finally:
+        cur.close()
+        conn.close()
+
+
+def delete_allocations(address: str, month_period: str = None) -> int:
+    """删除某电表（可选限定月份）的全部分摊行"""
+    conn = get_connection()
+    cur = get_dict_cursor(conn)
+    try:
+        if month_period:
+            cur.execute(
+                "DELETE FROM meter_shared_allocations WHERE address = %s AND month_period = %s",
+                (address, month_period),
+            )
+        else:
+            cur.execute("DELETE FROM meter_shared_allocations WHERE address = %s", (address,))
+        conn.commit()
+        return cur.rowcount
+    finally:
+        cur.close()
+        conn.close()
+
+
+def latest_cabinet_counts(address: str, before_period: str = None) -> dict:
+    """该电表各品牌「最近一次填过的电柜数量」：{brand_id: {count, monthPeriod}}
+
+    用于录入表单预填：柜数逐月可动态调整，某月留空时默认沿用最近一次填写值；
+    某月调整后，其后月份的默认值随之变为新值。
+    - 优先取 `before_period`（不含）之前最近一条 —— 「历史沿用」语义；
+    - 该品牌在目标月份之前从未填过时，回退到全表最近一条（向后兜底），避免留空。
+    """
+    conn = get_connection()
+    cur = get_dict_cursor(conn)
+    try:
+        out = {}
+        cur.execute("""
+            SELECT DISTINCT ON (brand_id) brand_id, cabinet_count, month_period
+            FROM meter_shared_allocations
+            WHERE address = %s AND cabinet_count IS NOT NULL
+            ORDER BY brand_id, month_period DESC
+        """, (address,))
+        for r in cur.fetchall():
+            out[int(r["brand_id"])] = {"count": r["cabinet_count"], "monthPeriod": r["month_period"]}
+
+        if before_period:
+            cur.execute("""
+                SELECT DISTINCT ON (brand_id) brand_id, cabinet_count, month_period
+                FROM meter_shared_allocations
+                WHERE address = %s AND cabinet_count IS NOT NULL AND month_period < %s
+                ORDER BY brand_id, month_period DESC
+            """, (address, before_period))
+            for r in cur.fetchall():
+                out[int(r["brand_id"])] = {"count": r["cabinet_count"], "monthPeriod": r["month_period"]}
+        return out
+    finally:
+        cur.close()
+        conn.close()
+
+
+def list_periods_for_meter(address: str) -> list:
+    """该电表已录入分摊的月份列表（供录入表单高亮）"""
+    conn = get_connection()
+    cur = get_dict_cursor(conn)
+    try:
+        cur.execute(
+            "SELECT DISTINCT month_period FROM meter_shared_allocations WHERE address = %s ORDER BY month_period DESC",
+            (address,),
+        )
+        return [r["month_period"] for r in cur.fetchall()]
+    finally:
+        cur.close()
+        conn.close()
+
+
+def _pick_cabinet(hist: list, period: str = None):
+    """从 [(month_period, cabs), ...] 里按「当月 → 该月之前最近 → 全表最近」取值
+
+    hist 需按 month_period 升序。period 为空时直接取最近一次。
+    """
+    if not hist:
+        return None
+    if not period:
+        return hist[-1][1]
+    exact = [c for mp, c in hist if mp == period]
+    if exact:
+        return exact[-1]
+    before = [c for mp, c in hist if mp < period]
+    return before[-1] if before else hist[-1][1]
+
+
+def cabinet_records(landlord_id: int = None, address: str = None) -> dict:
+    """共享电表柜数录入原始记录（未按月份取值）
+
+    Returns:
+        {address: {"landlordId": int|None, "entityId": int|None,
+                   "brands": {brand_id: [(month_period, cabs), ...] 升序}}}
+    """
+    conn = get_connection()
+    cur = get_dict_cursor(conn)
+    try:
+        conditions, values = [], []
+        if landlord_id:
+            conditions.append("m.landlord_id = %s"); values.append(landlord_id)
+        if address:
+            conditions.append("a.address = %s"); values.append(address)
+        where = f"AND {' AND '.join(conditions)}" if conditions else ""
+        cur.execute(f"""
+            SELECT a.address, a.brand_id, a.month_period, a.cabinet_count,
+                   m.landlord_id, m.entity_id
+            FROM meter_shared_allocations a
+            JOIN meters m ON m.meter_no = a.address
+            WHERE a.cabinet_count IS NOT NULL
+              AND m.tag = '共享电表' AND m.brand_id IS NULL
+              AND m.meter_no NOT LIKE 'TEST%%'
+              {where}
+            ORDER BY a.address, a.brand_id, a.month_period
+        """, values)
+        rows = cur.fetchall()
+    finally:
+        cur.close()
+        conn.close()
+
+    out = {}
+    for r in rows:
+        addr = r["address"]
+        entry = out.setdefault(addr, {
+            "landlordId": r.get("landlord_id"),
+            "entityId": r.get("entity_id"),
+            "brands": {},
+        })
+        entry["brands"].setdefault(int(r["brand_id"]), []).append(
+            (str(r["month_period"]), int(r["cabinet_count"]))
+        )
+    return out
+
+
+def cabinet_usage_by_month(landlord_id: int = None, periods=None) -> dict:
+    """共享电表按品牌的柜数，**逐月**取值：{landlord_id: {period: {brand_id: cabs}}}
+
+    用于 Rent 页「承担场地成本」这类需要按月分摊的场景（柜数逐月可调）。
+    periods 为 None 时取各表已录入月份的并集（即只有真正有柜数的月份会出现）。
+    """
+    records = cabinet_records(landlord_id=landlord_id)
+    if not records:
+        return {}
+    wanted = None
+    if periods is not None:
+        wanted = [str(p).replace("-", "")[:6] for p in periods]
+
+    out = {}
+    for addr, entry in records.items():
+        lid = entry.get("landlordId")
+        months = sorted({mp for hist in entry["brands"].values() for mp, _ in hist})
+        targets = wanted if wanted is not None else months
+        for period in targets:
+            for bid, hist in entry["brands"].items():
+                cabs = _pick_cabinet(hist, period)
+                if cabs is None:
+                    continue
+                out.setdefault(lid, {}).setdefault(period, {})
+                out[lid][period][bid] = out[lid][period].get(bid, 0) + cabs
+    return out
+
+
+def cabinet_usage_by_meter(landlord_id: int = None, address: str = None, period: str = None) -> dict:
+    """共享电表按品牌录入的**有效**电柜数量（按月取值）。
+
+    场地总表（tag='共享电表' 且 brand_id 为空）下各品牌没有自己的电表，
+    「数电表」那套柜数统计根本数不到它们；柜数只能靠分摊行人工录入。
+    本函数把这批录入值取出来，供场地成本（场地月租 / 运营费）按柜数分摊使用。
+
+    取值优先级（逐「电表 × 品牌」判定，与录入界面的默认值语义一致）：
+      1) period 当月的填写值
+      2) period 之前最近一次的填写值（历史沿用）
+      3) 全表最近一次的填写值（向后兜底：先把后面的月份补了也能用）
+    period 为 None 时直接用 3)。
+
+    Returns:
+        {address: {"entityId": int|None, "brands": {brand_id: cabs}}}
+        只包含真正取到柜数的「表 × 品牌」。整块表不在返回值里 = 该表没录过柜数（调用方需兜底）；
+        entityId 是共享表自身的主体，供品牌无法从合同判定主体时兜底。
+    """
+    records = cabinet_records(landlord_id=landlord_id, address=address)
+    out = {}
+    for addr, rec in records.items():
+        for bid, hist in rec["brands"].items():
+            chosen = _pick_cabinet(hist, period)
+            if chosen is None:
+                continue
+            entry = out.setdefault(addr, {"entityId": rec.get("entityId"), "brands": {}})
+            entry["brands"][bid] = int(chosen)
+    return out
+
+
+def cabinet_totals_by_brand(landlord_id: int = None, period: str = None) -> dict:
+    """场地内共享电表按品牌汇总的电柜数量：{brand_id: cabs}（按月取值，见上面口径）"""
+    out = {}
+    for _addr, entry in cabinet_usage_by_meter(landlord_id=landlord_id, period=period).items():
+        for bid, cabs in (entry.get("brands") or {}).items():
+            out[bid] = out.get(bid, 0) + cabs
+    return out

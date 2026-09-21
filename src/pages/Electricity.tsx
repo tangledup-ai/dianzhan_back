@@ -37,6 +37,9 @@ function ReadingDetailDialog({ target, onClose }: { target: { meterNo: string; p
   const mtr = (q.data?.meter ?? {}) as any;
   const rd = (q.data?.reading ?? {}) as any;
   const lg = (q.data?.ledger ?? null) as any;
+  // 共享电表按品牌分摊后，同一块表同一月有多条台账明细（每个品牌一条）
+  const ledgerRows = ((q.data?.ledgerRows ?? (lg ? [lg] : [])) as any[]);
+  const allocations = ((q.data?.allocations ?? []) as any[]);
   const prev = q.data?.prevMonth ?? null;
   const ratio = Number(mtr.transformerRatio ?? 1);
 
@@ -48,8 +51,19 @@ function ReadingDetailDialog({ target, onClose }: { target: { meterNo: string; p
       `上月抄表：${rd.prevReadingDate ?? "—"}　表盘读数 ${rd.prevReading ?? "—"}`,
       `本月抄表：${rd.currReadingDate ?? "—"}　表盘读数 ${rd.currReading ?? "—"}`,
       `区间度数：${rd.kwh ?? "—"} × 倍数 ${ratio} = 计费用量 ${usage.toFixed(2)} 度`,
-      `应付电费（付场地方）：${fmtMoney(Number(lg?.payAmount ?? 0))} 元（单价 ${fmtMoney(Number(lg?.payUnitPrice ?? 0))} 元/度）`,
-      `应收电费（品牌方支付）：${fmtMoney(Number(lg?.collectAmount ?? 0))} 元（单价 ${fmtMoney(Number(lg?.collectUnitPrice ?? 0))} 元/度，不含税 ${fmtMoney(Number(lg?.collectNet ?? 0))}）`,
+      ...(ledgerRows.length > 1
+        ? [
+            "【品牌分摊明细】",
+            ...ledgerRows.map((r: any) =>
+              `${r.brandName || "全品牌共享"}：用量 ${fmtNum(Number(r.ledgerKwh ?? 0))} 度，` +
+              `应付（付场地方）${fmtMoney(Number(r.payAmount ?? 0))} 元，` +
+              `应收（品牌方支付）${fmtMoney(Number(r.collectAmount ?? 0))} 元（不含税 ${fmtMoney(Number(r.collectNet ?? 0))}）`
+            ),
+          ]
+        : [
+            `应付电费（付场地方）：${fmtMoney(Number(lg?.payAmount ?? 0))} 元（单价 ${fmtMoney(Number(lg?.payUnitPrice ?? 0))} 元/度）`,
+            `应收电费（品牌方支付）：${fmtMoney(Number(lg?.collectAmount ?? 0))} 元（单价 ${fmtMoney(Number(lg?.collectUnitPrice ?? 0))} 元/度，不含税 ${fmtMoney(Number(lg?.collectNet ?? 0))}）`,
+          ]),
     ].filter(Boolean).join("\n");
     try {
       await navigator.clipboard.writeText(lines);
@@ -108,13 +122,49 @@ function ReadingDetailDialog({ target, onClose }: { target: { meterNo: string; p
                 <div className="text-sm font-semibold tabular-nums text-slate-700">{fmtNum(rd.kwh)} 度</div>
               </div>
               <div className="rounded-md border border-slate-200 px-3 py-2">
-                <div className="text-[10px] text-slate-400">计费用量（×倍数）</div>
+                <div className="text-[10px] text-slate-400">计费用量（×倍数{ledgerRows.length > 1 ? " · 品牌分摊倒推合计" : ""}）</div>
                 <div className="text-sm font-semibold tabular-nums text-slate-700">
-                  {fmtNum(lg?.ledgerKwh ?? (Number(rd.kwh ?? 0) * ratio))} 度
+                  {ledgerRows.length > 1
+                    ? fmtNum(ledgerRows.reduce((s: number, r: any) => s + Number(r.ledgerKwh ?? 0), 0))
+                    : fmtNum(lg?.ledgerKwh ?? (Number(rd.kwh ?? 0) * ratio))} 度
                 </div>
               </div>
             </div>
-            {lg && (
+            {ledgerRows.length > 1 ? (
+              <div>
+                <div className="mb-1 text-[10px] font-semibold text-purple-600">
+                  品牌分摊明细（{ledgerRows.length} 个品牌 · 应付电费按品牌录入，用量 = 金额 ÷ 单价 倒推）
+                </div>
+                <div className="overflow-x-auto rounded-md border">
+                  <table className="w-full text-[11px]">
+                    <thead>
+                      <tr className="bg-slate-50 text-left text-slate-500">
+                        <th className="px-2 py-1.5 font-medium">品牌方</th>
+                        <th className="px-2 py-1.5 text-right font-medium">用量(度)</th>
+                        <th className="px-2 py-1.5 text-right font-medium">付款单价</th>
+                        <th className="px-2 py-1.5 text-right font-medium">应付(元)</th>
+                        <th className="px-2 py-1.5 text-right font-medium">收款单价</th>
+                        <th className="px-2 py-1.5 text-right font-medium">应收(元)</th>
+                        <th className="px-2 py-1.5 text-right font-medium">不含税</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {ledgerRows.map((r: any, i: number) => (
+                        <tr key={i} className="border-t">
+                          <td className="px-2 py-1.5 font-medium text-slate-700">{r.brandName || "全品牌共享"}</td>
+                          <td className="px-2 py-1.5 text-right tabular-nums">{fmtNum(Number(r.ledgerKwh ?? 0))}</td>
+                          <td className="px-2 py-1.5 text-right tabular-nums">{fmtMoney(Number(r.payUnitPrice ?? 0))}</td>
+                          <td className="px-2 py-1.5 text-right tabular-nums text-rose-600">{fmtMoney(Number(r.payAmount ?? 0))}</td>
+                          <td className="px-2 py-1.5 text-right tabular-nums">{fmtMoney(Number(r.collectUnitPrice ?? 0))}</td>
+                          <td className="px-2 py-1.5 text-right tabular-nums text-emerald-600">{fmtMoney(Number(r.collectAmount ?? 0))}</td>
+                          <td className="px-2 py-1.5 text-right tabular-nums">{fmtMoney(Number(r.collectNet ?? 0))}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            ) : lg ? (
               <div className="grid grid-cols-2 gap-2 text-slate-600">
                 <div className="rounded-md border border-rose-100 bg-rose-50/50 px-3 py-2">
                   <div className="text-[10px] text-rose-500">应付电费（付场地方）· {lg.payStatus}</div>
@@ -126,6 +176,20 @@ function ReadingDetailDialog({ target, onClose }: { target: { meterNo: string; p
                   <div className="font-semibold tabular-nums text-emerald-600">{fmtMoney(Number(lg.collectAmount ?? 0))} 元</div>
                   <div className="text-[10px] text-slate-400">单价 {fmtMoney(Number(lg.collectUnitPrice ?? 0))} 元/度 · 不含税 {fmtMoney(Number(lg.collectNet ?? 0))}</div>
                 </div>
+              </div>
+            ) : null}
+            {allocations.length > 0 && ledgerRows.length === 0 && (
+              <div className="rounded-md border border-purple-100 bg-purple-50/50 px-3 py-2 text-[11px] text-purple-700">
+                <div className="font-semibold">已录入品牌分摊（该月台账未生成）</div>
+                {allocations.map((a: any, i: number) => (
+                  <div key={i} className="mt-0.5 flex items-center justify-between">
+                    <span>{a.brandName ?? `品牌${a.brandId}`}</span>
+                    <span className="tabular-nums">
+                      应付 {fmtMoney(Number(a.collectAmount ?? 0))} 元
+                      {a.unitPrice != null ? ` · 单价 ${fmtMoney(Number(a.unitPrice))}` : ""}
+                    </span>
+                  </div>
+                ))}
               </div>
             )}
             {prev && Number(prev.kwh ?? 0) > 0 && (

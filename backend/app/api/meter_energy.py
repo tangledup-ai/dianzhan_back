@@ -2,9 +2,23 @@
 from fastapi import APIRouter, HTTPException, Query, Request
 from ..infra.database import get_connection, get_dict_cursor
 from ..infra.auth_scope import scope_landlord_ids, scope_meter_tag, ensure_meter_in_scope
+from ..infra.period import to_compact, to_display
+from ..domain.electricity_pricing import resolve_prices, split_tax
+from ..repositories import shared_allocation_repo
 from .base import CamelJSONResponse
 
 router = APIRouter(prefix="/api/meter-energy", tags=["电表能耗"], default_response_class=CamelJSONResponse)
+
+
+def _shared_kwh(collect_amount, unit_price):
+    """用电量 = 应付电费 ÷ 单价（单价为空/0 → None，无法倒推）"""
+    try:
+        price = float(unit_price or 0)
+        if price <= 0:
+            return None
+        return round(float(collect_amount or 0) / price, 2)
+    except (TypeError, ValueError):
+        return None
 
 
 def _scope_conditions(conditions: list, values: list, request, column: str):
@@ -241,6 +255,225 @@ async def save_meter_reading(data: dict, request: Request = None):
     finally:
         cur.close()
         conn.close()
+
+
+# ─── 共享电表品牌分摊（「所有品牌共用此电表」按品牌录入应付电费）────────────
+#
+# 口径（用户 2026-09 确认）：
+#   录入值 = 品牌方付给我方的电费（收款/收入，含税）
+#   用电量 = 录入金额 ÷ 单价；单价默认取该品牌方合同单价，可在表单里人工覆盖
+#   付款给场地方 = 倒推出的用电量 × 场地合同单价（口径不变）
+# 某表某月没有任何分摊行时，台账仍按原口径（读数 × 合同单价）整场地出一行。
+
+def _price_info(unit_price, fallback_info):
+    """单价与税信息：表单覆盖单价优先，其次合同单价"""
+    price = unit_price if unit_price is not None else (fallback_info or {}).get("price")
+    tax_rate = (fallback_info or {}).get("tax_rate", 0.01)
+    tax_enabled = bool((fallback_info or {}).get("tax_enabled"))
+    return price, tax_rate, tax_enabled
+
+
+@router.get("/shared-allocations")
+async def get_shared_allocations(request: Request = None, meterNo: str = None, monthPeriod: str = None):
+    """共享电表品牌分摊录入表单数据：电表信息 + 候选品牌（带合同单价）+ 已录入分摊
+
+    非共享电表也会返回（isShared=false），前端据此决定是否展示分摊录入区。
+    """
+    if not meterNo:
+        raise HTTPException(400, "meterNo 必填")
+    month_period = to_compact(monthPeriod) or ""
+
+    conn = get_connection()
+    cur = get_dict_cursor(conn)
+    try:
+        cur.execute("""
+            SELECT m.id, m.meter_no, m.meter_name, m.brand_id, m.landlord_id, m.entity_id,
+                   m.tag, m.transformer_ratio, l.name AS landlord_name, b.name AS brand_name
+            FROM meters m
+            LEFT JOIN landlords l ON m.landlord_id = l.id
+            LEFT JOIN brands b ON m.brand_id = b.id
+            WHERE m.meter_no = %s
+        """, (meterNo,))
+        meter = cur.fetchone()
+        if not meter:
+            raise HTTPException(404, "电表不存在")
+        if request is not None:
+            ensure_meter_in_scope(request, meter.get("tag"), meter.get("landlord_id"), hide=True)
+
+        contracts = []
+        if meter.get("landlord_id"):
+            cur.execute("SELECT * FROM contracts WHERE landlord_id = %s", (meter["landlord_id"],))
+            contracts = cur.fetchall()
+
+        cur.execute("SELECT id, name FROM brands ORDER BY name")
+        all_brands = [{"brandId": r["id"], "brandName": r["name"]} for r in cur.fetchall()]
+        brand_names = {b["brandId"]: b["brandName"] for b in all_brands}
+    finally:
+        cur.close()
+        conn.close()
+
+    pricing = resolve_prices(contracts)
+    # 候选品牌：该场地方已签品牌方合同的品牌（默认单价 = 合同单价）
+    candidates = []
+    for bid, info in sorted(pricing["brand_prices"].items(), key=lambda kv: brand_names.get(kv[0], "")):
+        candidates.append({
+            "brandId": bid,
+            "brandName": brand_names.get(bid, f"品牌{bid}"),
+            "unitPrice": info.get("price"),
+            "taxRate": info.get("tax_rate", 0.01),
+            "taxEnabled": bool(info.get("tax_enabled")),
+            "hasContract": True,
+        })
+
+    saved = shared_allocation_repo.list_allocations(address=meterNo, month_period=month_period) if month_period else []
+    allocations = []
+    for r in saved:
+        fallback = pricing["brand_price_options"].get(int(r["brand_id"]), [])
+        fallback = fallback[0] if fallback else None
+        price, tax_rate, tax_enabled = _price_info(r.get("unit_price"), fallback)
+        amount = float(r["collect_amount"] or 0)
+        _, net = split_tax(amount, tax_rate) if tax_enabled else (0, amount)
+        allocations.append({
+            "brandId": r["brand_id"],
+            "brandName": r.get("brand_name") or brand_names.get(r["brand_id"], ""),
+            "collectAmount": round(amount, 2),
+            "unitPrice": float(r["unit_price"]) if r.get("unit_price") is not None else None,
+            "effectiveUnitPrice": float(price) if price is not None else None,
+            "taxRate": tax_rate,
+            "taxEnabled": tax_enabled,
+            "kwh": _shared_kwh(amount, price),
+            "collectNet": round(net, 2),
+            "cabinetCount": int(r["cabinet_count"]) if r.get("cabinet_count") is not None else None,
+            "remark": r.get("remark"),
+        })
+
+    # 电柜数量默认值：该品牌最近一次填写值（逐月可调整；本月留空则沿用）
+    cabinet_defaults = shared_allocation_repo.latest_cabinet_counts(meterNo, before_period=month_period or None)
+
+    return {
+        "monthPeriod": month_period,
+        "displayPeriod": to_display(month_period) if month_period else "",
+        "meter": meter,
+        "isShared": (meter.get("tag") == "共享电表") and (meter.get("brand_id") is None),
+        "payPrice": pricing.get("pay_price"),
+        "sharedPrice": (pricing.get("shared_price") or {}).get("price"),
+        "brands": candidates,
+        "allBrands": all_brands,
+        "allocations": allocations,
+        "periods": shared_allocation_repo.list_periods_for_meter(meterNo),
+        # {"<brandId>": {"count": 12, "monthPeriod": "202608"}}
+        "cabinetDefaults": {str(bid): info for bid, info in cabinet_defaults.items()},
+    }
+
+
+@router.post("/shared-allocations")
+async def save_shared_allocations(data: dict, request: Request = None):
+    """整体保存某共享电表某月的品牌分摊（应收电费），并按新分摊重算该月台账。
+
+    入参：{ address, monthPeriod, rows: [{ brandId, collectAmount, unitPrice?, cabinetCount?, remark? }] }
+    rows 为空数组 = 清空该月分摊（台账退回「读数 × 合同单价」口径）。
+    cabinetCount = 该品牌当月在该表下投放的电柜数量（逐月可调，可空）。
+    """
+    address = data.get("address")
+    month_period = to_compact(data.get("monthPeriod"))
+    if not address or not month_period:
+        raise HTTPException(400, "address 和 monthPeriod 必填")
+    if len(str(month_period)) != 6 or not str(month_period).isdigit():
+        raise HTTPException(400, f"月份格式应为 YYYYMM，收到：{month_period}")
+
+    raw_rows = data.get("rows") or []
+    seen, rows = set(), []
+    for r in raw_rows:
+        brand_id = r.get("brandId")
+        if not brand_id:
+            raise HTTPException(400, "每一行都必须选择品牌方")
+        brand_id = int(brand_id)
+        if brand_id in seen:
+            raise HTTPException(400, f"品牌方重复：{brand_id}（同一电表同一月一个品牌只能一行）")
+        seen.add(brand_id)
+
+        amount_raw = r.get("collectAmount")
+        if amount_raw is None or str(amount_raw).strip() == "":
+            continue  # 金额留空 = 该行不保存
+        try:
+            amount = round(float(amount_raw), 2)
+        except (TypeError, ValueError):
+            raise HTTPException(400, f"应付电费格式无效：{amount_raw}")
+        if amount < 0:
+            raise HTTPException(400, "应付电费不能为负数")
+
+        unit_price = r.get("unitPrice")
+        if unit_price is not None and str(unit_price).strip() != "":
+            try:
+                unit_price = float(unit_price)
+            except (TypeError, ValueError):
+                raise HTTPException(400, f"单价格式无效：{unit_price}")
+            if unit_price <= 0:
+                raise HTTPException(400, "单价必须大于 0（否则无法倒推用电量）")
+        else:
+            unit_price = None
+
+        # 电柜数量：逐月可动态调整；留空 = 未填（NULL），前端会默认沿用最近一次填写值
+        cabinet_count = r.get("cabinetCount")
+        if cabinet_count is not None and str(cabinet_count).strip() != "":
+            try:
+                cabinet_count = int(float(str(cabinet_count).strip()))
+            except (TypeError, ValueError):
+                raise HTTPException(400, f"电柜数量格式无效：{cabinet_count}")
+            if cabinet_count <= 0:
+                raise HTTPException(400, "电柜数量必须大于 0（留空表示本月未填）")
+        else:
+            cabinet_count = None
+
+        rows.append({
+            "brandId": brand_id,
+            "collectAmount": amount,
+            "unitPrice": unit_price,
+            "cabinetCount": cabinet_count,
+            "remark": r.get("remark"),
+        })
+
+    # 权限校验：只允许写范围内电表的分摊
+    conn = get_connection()
+    cur = get_dict_cursor(conn)
+    try:
+        cur.execute("SELECT id, tag, landlord_id, brand_id FROM meters WHERE meter_no = %s", (address,))
+        meter = cur.fetchone()
+    finally:
+        cur.close()
+        conn.close()
+    if not meter:
+        raise HTTPException(404, "电表不存在")
+    if request is not None:
+        ensure_meter_in_scope(request, meter.get("tag"), meter.get("landlord_id"))
+    # 台账按「场地 × 品牌 × 主体」生成，电表没有场地方则分摊无法落到台账上
+    if not meter.get("landlord_id"):
+        raise HTTPException(400, "该电表未关联场地方，无法生成电费台账；请先在电表档案里设置场地方")
+    # 只有「所有品牌共用此电表」（标签=共享电表 且 未指定品牌方）才谈得上按品牌分摊
+    if (meter.get("tag") or "") != "共享电表" or meter.get("brand_id") is not None:
+        raise HTTPException(400, "只有「所有品牌共用此电表」的电表才能按品牌录入分摊（请在电表档案里打开该开关）")
+
+    try:
+        saved = shared_allocation_repo.replace_allocations(address, month_period, rows)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    # 台账联动：分摊变了 → 该月台账需按新分摊重算（失败不影响保存结果）
+    regenerated = None
+    try:
+        from .electricity import generate_electricity
+        regenerated = await generate_electricity({"period": month_period})
+    except Exception as e:
+        regenerated = {"error": str(e)}
+
+    return {
+        "ok": True,
+        "address": address,
+        "monthPeriod": month_period,
+        "saved": saved,
+        "totalAmount": round(sum(r["collectAmount"] for r in rows), 2),
+        "regenerated": regenerated,
+    }
 
 
 @router.get("/sync-logs")

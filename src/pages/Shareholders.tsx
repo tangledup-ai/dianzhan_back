@@ -8,7 +8,7 @@ import { exportXlsxWithTitle, exportXlsxWithTitles } from "@/lib/export";
 import { MonthPicker } from "@/components/MonthPicker";
 import { fmtMoney } from "@/lib/format";
 import { toCompact, toDisplay } from "@/lib/period";
-import { inputCls } from "@/components/fields";
+import { inputCls, SearchSelect } from "@/components/fields";
 import { groupByEntity } from "@/lib/groupColors";
 import { Users, MapPin, X, Trash2, UserPlus, Wallet, Settings, Pencil, Search, Landmark, ChevronDown, ChevronRight } from "lucide-react";
 import { toast } from "sonner";
@@ -150,26 +150,33 @@ function ConfigDividendDialog({ open, onClose, type, landlordId, brands, entitie
         </div>
         <div className="space-y-3">
           <div>
-            <label className="mb-1 block text-xs text-slate-500">{type === "shareholder" ? "选择股东" : "选择介绍人"} <span className="text-rose-500">*</span></label>
-            <select className={inputCls} value={targetId || ""} onChange={e => setTargetId(Number(e.target.value) || null)}>
-              <option value="">{type === "shareholder" ? "请选择股东" : "请选择介绍人"}</option>
-              {targets?.map((t: any) => <option key={t.id} value={t.id}>{t.name}</option>)}
-            </select>
+            <div className="mb-1 block text-xs text-slate-500">{type === "shareholder" ? "选择股东" : "选择介绍人"} <span className="text-rose-500">*</span></div>
+            <SearchSelect
+              value={targetId ? String(targetId) : ""}
+              onChange={(v) => setTargetId(v ? Number(v) : null)}
+              placeholder={type === "shareholder" ? "请选择股东（可搜索）" : "请选择介绍人（可搜索）"}
+              clearable={false}
+              options={(targets ?? []).map((t: any) => ({ value: String(t.id), label: t.name }))}
+            />
           </div>
           <div>
-            <label className="mb-1 block text-xs text-slate-500">品牌范围</label>
-            <select className={inputCls} value={brandId} onChange={e => setBrandId(e.target.value ? Number(e.target.value) : "")}>
-              <option value="">整个场地（全部品牌）</option>
-              {brands?.map((b: any) => <option key={b.id} value={b.id}>{b.name}</option>)}
-            </select>
+            <div className="mb-1 block text-xs text-slate-500">品牌范围</div>
+            <SearchSelect
+              value={brandId === "" ? "" : String(brandId)}
+              onChange={(v) => setBrandId(v ? Number(v) : "")}
+              placeholder="整个场地（全部品牌）"
+              options={(brands ?? []).map((b: any) => ({ value: String(b.id), label: b.name }))}
+            />
             <div className="mt-1 text-[10px] text-slate-400">选择品牌则只参与该品牌的分红；留空参与场地全部分红</div>
           </div>
           <div>
-            <label className="mb-1 block text-xs text-slate-500">主体范围</label>
-            <select className={inputCls} value={entityId} onChange={e => setEntityId(e.target.value ? Number(e.target.value) : "")}>
-              <option value="">不按主体（默认）</option>
-              {(entities ?? []).map((en: any) => <option key={en.id} value={en.id}>{en.name}</option>)}
-            </select>
+            <div className="mb-1 block text-xs text-slate-500">主体范围</div>
+            <SearchSelect
+              value={entityId === "" ? "" : String(entityId)}
+              onChange={(v) => setEntityId(v ? Number(v) : "")}
+              placeholder="不按主体（默认）"
+              options={(entities ?? []).map((en: any) => ({ value: String(en.id), label: en.name }))}
+            />
             <div className="mt-1 text-[10px] text-slate-400">
               选择主体则分红基数 = 该主体在本场地的收入/利润（跨品牌归集）；与品牌同时选择时按品牌优先
             </div>
@@ -1403,17 +1410,14 @@ export default function Shareholders() {
                   )}
                 </div>
                 <div className="flex flex-wrap gap-2">
-                  <select
-                    className={`${inputCls} w-44`}
-                    value={expenseEntityId}
-                    onChange={(e) => setExpenseEntityId(e.target.value)}
-                    title="该笔费用归属：整场地公共（按柜数分摊到主体）或某主体专属"
-                  >
-                    <option value="">整场地公共（分摊）</option>
-                    {(entitiesQ.data ?? []).map((en: any) => (
-                      <option key={en.id} value={String(en.id)}>{en.name}（专属）</option>
-                    ))}
-                  </select>
+                  <div className="w-44" title="该笔费用归属：整场地公共（按柜数分摊到主体）或某主体专属">
+                    <SearchSelect
+                      value={expenseEntityId}
+                      onChange={setExpenseEntityId}
+                      placeholder="整场地公共（分摊）"
+                      options={(entitiesQ.data ?? []).map((en: any) => ({ value: String(en.id), label: `${en.name}（专属）` }))}
+                    />
+                  </div>
                   <input
                     className={`${inputCls} w-36`}
                     type="number"

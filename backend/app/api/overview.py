@@ -482,7 +482,7 @@ async def monthly_detail(request: Request, period: str = None):
                     FROM electricity_meter_details d
                     LEFT JOIN electricity_records er ON d.electricity_id = er.id
                     LEFT JOIN meters m ON d.meter_id = m.id
-                    LEFT JOIN brands b ON m.brand_id = b.id
+                    LEFT JOIN brands b ON COALESCE(er.brand_id, m.brand_id) = b.id
                     WHERE er.period = %s AND er.landlord_id = ANY(%s::int[])
                 """, (month_compact, allowed))
             else:
@@ -492,7 +492,7 @@ async def monthly_detail(request: Request, period: str = None):
                     FROM electricity_meter_details d
                     LEFT JOIN electricity_records er ON d.electricity_id = er.id
                     LEFT JOIN meters m ON d.meter_id = m.id
-                    LEFT JOIN brands b ON m.brand_id = b.id
+                    LEFT JOIN brands b ON COALESCE(er.brand_id, m.brand_id) = b.id
                     WHERE er.period = %s
                 """, (month_compact,))
             detail_rows = cur.fetchall()
@@ -902,6 +902,14 @@ async def station_board(request: Request, landlordId: int = None, keyword: str =
                     bid = m.get("brand_id")
                     if bid:
                         brand_cabinet_count[bid] = brand_cabinet_count.get(bid, 0) + cab_by_meter.get(m["id"], 1)
+
+            # 共享电表（各品牌共用一块总表）：品牌名下没有电表，「数电表」数不到它们，
+            # 柜数取分摊行人工录入值（按月，逐月可调）
+            from ..repositories import shared_allocation_repo as _shared_repo
+            for _bid, _cabs in _shared_repo.cabinet_totals_by_brand(
+                    landlord_id=lid,
+                    period=(period.replace("-", "") if period else None)).items():
+                brand_cabinet_count[_bid] = brand_cabinet_count.get(_bid, 0) + _cabs
 
             # 合同拆分数据
             contract_breakdown = []

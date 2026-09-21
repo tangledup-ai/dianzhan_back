@@ -5,7 +5,7 @@ import { calculateDividend } from "@/api/dividends";
 import { StatCard, Money, StatusBadge } from "@/components/Stat";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { Field, NumInput, TextInput, SelectInput, inputCls } from "@/components/fields";
+import { Field, NumInput, TextInput, SearchSelect, inputCls } from "@/components/fields";
 import { exportXlsx } from "@/lib/export";
 import { fmtMoney, fmtDateTime, numOrNull, strOrNull } from "@/lib/format";
 import {
@@ -662,7 +662,8 @@ export default function Approvals() {
         <div className="max-w-3xl rounded-xl border bg-white p-6 shadow-sm">
           <div className="grid grid-cols-2 gap-4">
             <Field label="业务类型 *">
-              <SelectInput value={form.bizType} onChange={(v) => setForm((p) => ({ ...p, bizType: v }))}
+              <SearchSelect value={form.bizType} onChange={(v) => setForm((p) => ({ ...p, bizType: v }))}
+                placeholder="请选择业务类型（可搜索）" clearable={false}
                 options={bizTypes.map((b: string) => ({ value: b, label: b }))} />
             </Field>
             <Field label="申请人 *"><TextInput value={form.applicant} onChange={(v) => setForm((p) => ({ ...p, applicant: v }))} placeholder="经办人姓名" /></Field>

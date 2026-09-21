@@ -112,12 +112,17 @@ def get_meter_details(electricity_id: int):
     conn = get_connection()
     cur = get_dict_cursor(conn)
     try:
+        # 品牌口径：优先取台账行的品牌（共享电表按品牌分摊后，一行台账对应一个品牌，
+        # 而电表自身 brand_id 为空），其次回退到电表品牌。
         cur.execute("""
-            SELECT d.*, m.meter_no, m.meter_name, m.brand_id, m.landlord_id, m.entity_id,
+            SELECT d.*, m.meter_no, m.meter_name, m.landlord_id,
+                   COALESCE(e.brand_id, m.brand_id) AS brand_id,
+                   m.entity_id,
                    b.name as brand_name, ent.name as entity_name
             FROM electricity_meter_details d
+            LEFT JOIN electricity_records e ON e.id = d.electricity_id
             LEFT JOIN meters m ON d.meter_id = m.id
-            LEFT JOIN brands b ON m.brand_id = b.id
+            LEFT JOIN brands b ON COALESCE(e.brand_id, m.brand_id) = b.id
             LEFT JOIN entities ent ON m.entity_id = ent.id
             WHERE d.electricity_id = %s
         """, (electricity_id,))

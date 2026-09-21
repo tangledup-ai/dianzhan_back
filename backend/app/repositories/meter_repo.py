@@ -234,6 +234,7 @@ def delete_meter(meter_id: int):
         meter_no = row[0] if row else None
 
         cur.execute("DELETE FROM electricity_meter_details WHERE meter_id = %s", (meter_id,))
+        cur.execute("DELETE FROM meter_shared_allocations WHERE meter_id = %s", (meter_id,))  # 共享电表品牌分摊
         cur.execute("DELETE FROM cabinets WHERE meter_id = %s", (meter_id,))          # 柜子挂在电表下
         cur.execute("UPDATE meter_devices SET meter_id = NULL WHERE meter_id = %s", (meter_id,))  # 第三方设备解除关联
         if meter_no:
