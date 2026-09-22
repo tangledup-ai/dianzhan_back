@@ -11,7 +11,7 @@ router = APIRouter(prefix="/api/meter-energy", tags=["电表能耗"], default_re
 
 
 def _shared_kwh(collect_amount, unit_price):
-    """用电量 = 应付电费 ÷ 单价（单价为空/0 → None，无法倒推）"""
+    """用电量 = 应收电费 ÷ 单价（单价为空/0 → None，无法倒推）"""
     try:
         price = float(unit_price or 0)
         if price <= 0:
@@ -257,7 +257,7 @@ async def save_meter_reading(data: dict, request: Request = None):
         conn.close()
 
 
-# ─── 共享电表品牌分摊（「所有品牌共用此电表」按品牌录入应付电费）────────────
+# ─── 共享电表品牌分摊（「所有品牌共用此电表」按品牌录入应收电费）────────────
 #
 # 口径（用户 2026-09 确认）：
 #   录入值 = 品牌方付给我方的电费（收款/收入，含税）
@@ -424,9 +424,9 @@ async def save_shared_allocations(data: dict, request: Request = None):
         try:
             amount = round(float(amount_raw), 2)
         except (TypeError, ValueError):
-            raise HTTPException(400, f"应付电费格式无效：{amount_raw}")
+            raise HTTPException(400, f"应收电费格式无效：{amount_raw}")
         if amount < 0:
-            raise HTTPException(400, "应付电费不能为负数")
+            raise HTTPException(400, "应收电费不能为负数")
 
         unit_price = r.get("unitPrice")
         if unit_price is not None and str(unit_price).strip() != "":

@@ -41,7 +41,7 @@ export interface MeterReadingData {
 export const saveMeterReading = (data: MeterReadingData) =>
   client.post("/meter-energy/readings", data).then(r => r.data);
 
-// ─── 共享电表品牌分摊（「所有品牌共用此电表」按品牌录入应付电费）───
+// ─── 共享电表品牌分摊（「所有品牌共用此电表」按品牌录入应收电费）───
 // 录入值 = 品牌方付给我方的电费（收款/收入，含税）；用电量 = 金额 ÷ 单价 倒推。
 
 export interface SharedAllocationBrandOption {

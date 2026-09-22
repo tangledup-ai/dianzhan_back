@@ -470,7 +470,7 @@ function MeterCard({ meter, isExpanded, onToggle, onEdit, onDelete, onReading, h
   });
 
   // ── 共享电表柜数：brand_id 为空，各品牌在该表下没有自己的电表，「数 cabinets」永远数不到 ──
-  // 柜数只能取「品牌分摊（各品牌应付电费）」按品牌逐月录入的 cabinet_count。
+  // 柜数只能取「品牌分摊（各品牌应收电费）」按品牌逐月录入的 cabinet_count。
   // 与后端 shared_allocation_repo.shared_meter_cabinets / 合同页 / 看板同一口径：
   //   managedByAlloc=true  → 合计各品牌录入柜数（此时后端会排除该表的整表计数，避免双算）
   //   managedByAlloc=false → 完全没录过，退回整表口径 max(1, cabinets 记录数)
@@ -550,7 +550,7 @@ function MeterCard({ meter, isExpanded, onToggle, onEdit, onDelete, onReading, h
           <span className="text-xs text-slate-400">互感器倍数：{fmtNum(meter.transformerRatio)}</span>
           <span className="text-xs text-slate-400"
             title={allocCabCount != null
-              ? `共享电表：合计「品牌分摊（各品牌应付电费）」里各品牌录入的柜数（${allocCabDetail}）`
+              ? `共享电表：合计「品牌分摊（各品牌应收电费）」里各品牌录入的柜数（${allocCabDetail}）`
               : undefined}>
             柜数：{cabinetCount}
           </span>
@@ -582,7 +582,7 @@ function MeterCard({ meter, isExpanded, onToggle, onEdit, onDelete, onReading, h
             <div className="space-y-2">
               <p className="text-xs leading-relaxed text-slate-500">
                 共享电表（全品牌共用）下各品牌<b>没有自己的电表</b>，柜数只能在
-                <b>「品牌分摊（各品牌应付电费）」</b>模块按品牌逐月录入，计费以品牌录入值为准；
+                <b>「品牌分摊（各品牌应收电费）」</b>模块按品牌逐月录入，计费以品牌录入值为准；
                 因此本表下不再单独维护柜子记录（此处记录不计入柜数）。
               </p>
               <div className="flex flex-wrap items-center gap-1.5">
@@ -848,7 +848,7 @@ function MeterForm({ open, onClose, record }: { open: boolean; onClose: () => vo
 }
 
 // ─── 录入读数表单 ───
-// 共享电表（「所有品牌共用此电表」）额外支持按品牌录入「应付电费」：
+// 共享电表（「所有品牌共用此电表」）额外支持按品牌录入「应收电费」：
 //   录入值 = 品牌方付给我方的电费（收款/收入，含税）；用电量 = 金额 ÷ 单价 倒推。
 //   该表某月录了品牌分摊后，台账不再按「整表读数 × 合同单价」出一行，而是按品牌拆行。
 function ReadingForm({ open, onClose, meter }: { open: boolean; onClose: () => void; meter: any }) {
@@ -1255,7 +1255,7 @@ function ReadingForm({ open, onClose, meter }: { open: boolean; onClose: () => v
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <BookOpen className="h-5 w-5 text-blue-600" />
-            {isShared ? "共享电表 · 品牌分摊（按应付电费倒推）" : "录入电表读数"}
+            {isShared ? "共享电表 · 品牌分摊（按应收电费倒推）" : "录入电表读数"}
           </DialogTitle>
         </DialogHeader>
         <div className="space-y-3">
@@ -1299,14 +1299,14 @@ function ReadingForm({ open, onClose, meter }: { open: boolean; onClose: () => v
             </div>
           )}
 
-          {/* ── 共享电表：品牌分摊录入（应付电费 → 倒推用电量）── */}
+          {/* ── 共享电表：品牌分摊录入（应收电费 → 倒推用电量）── */}
           {isShared && (
             <div className="rounded-lg border border-purple-200 bg-purple-50/40 p-3">
               <div className="mb-1 flex items-center justify-between">
                 <div>
-                  <div className="text-sm font-semibold text-purple-800">品牌分摊（各品牌应付电费）</div>
+                  <div className="text-sm font-semibold text-purple-800">品牌分摊（各品牌应收电费）</div>
                   <div className="text-[11px] text-purple-600">
-                    录入各品牌该月应付电费 + 电柜数量 → 用电量 = 金额 ÷ 单价 自动倒推；付款给场地方 = 倒推电量 × 场地单价
+                    录入各品牌该月应收电费 + 电柜数量 → 用电量 = 金额 ÷ 单价 自动倒推；付款给场地方 = 倒推电量 × 场地单价
                   </div>
                 </div>
                 <Button size="sm" variant="outline" className="shrink-0 border-purple-300 text-purple-700 hover:bg-purple-50"
@@ -1326,7 +1326,7 @@ function ReadingForm({ open, onClose, meter }: { open: boolean; onClose: () => v
                           <th className="py-1 pr-2 font-medium">品牌方</th>
                           <th className="py-1 pr-2 font-medium">电柜数量</th>
                           <th className="py-1 pr-2 font-medium">报税主体</th>
-                          <th className="py-1 pr-2 font-medium">应付电费（元）</th>
+                          <th className="py-1 pr-2 font-medium">应收电费（元）</th>
                           <th className="py-1 pr-2 font-medium">单价（元/度）</th>
                           <th className="py-1 pr-2 font-medium">用电量（度）</th>
                           <th className="py-1 font-medium"></th>
@@ -1431,7 +1431,7 @@ function ReadingForm({ open, onClose, meter }: { open: boolean; onClose: () => v
                   </div>
 
                   <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 border-t border-purple-100 pt-2 text-[11px] text-purple-700">
-                    <span>合计应付电费：<b className="tabular-nums">{fmtNum(allocTotals.amount)}</b> 元</span>
+                    <span>合计应收电费：<b className="tabular-nums">{fmtNum(allocTotals.amount)}</b> 元</span>
                     <span>合计用电量：<b className="tabular-nums">{fmtNum(allocTotals.kwh)}</b> 度</span>
                     {allocTotals.cabinetsFilled > 0 && (
                       <span>合计电柜：<b className="tabular-nums">{allocTotals.cabinets}</b> 台</span>
@@ -1575,7 +1575,7 @@ function ReadingForm({ open, onClose, meter }: { open: boolean; onClose: () => v
                       <span className="font-semibold tabular-nums text-rose-600">
                         品牌合计超出整表 {fmtNum(Math.abs(venueBill.lossKwh))} 度
                       </span>
-                      <span className="text-slate-500">请核对品牌单价或应付电费金额是否偏高</span>
+                      <span className="text-slate-500">请核对品牌单价或应收电费金额是否偏高</span>
                     </>
                   ) : (
                     <span className="text-emerald-600">0 度，品牌合计与整表读数已对齐</span>

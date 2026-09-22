@@ -27,6 +27,36 @@ function StatCard({ label, value, suffix = "", tone = "slate" }: { label: string
   );
 }
 
+// ─── 台账明细按「电表」分组 ───
+// 共享电表（「所有品牌共用此电表」）下一块表有多条品牌明细，但**付给场地方只有一整笔**
+// （= 整表读数 × 场地合同单价，亏空按电量比例摊在各品牌上）。
+// 因此付款信息只在电表分组的第一行展示（rowSpan 跨该表全部品牌行），品牌行只保留各自的收款。
+// 普通电表一块表对应一条明细，分组后行数不变，展示与改造前一致。
+function groupDetailsByMeter(details: any[]) {
+  const groups: any[][] = [];
+  const index = new Map<string, number>();
+  details.forEach((d, i) => {
+    // 无电表编号时各自成组，避免被误并成「一整笔」
+    const k = d.meterNo ? `no:${d.meterNo}` : `idx:${i}`;
+    if (!index.has(k)) { index.set(k, groups.length); groups.push([]); }
+    groups[index.get(k)!].push(d);
+  });
+  return groups.map((rows) => {
+    const sum = (f: (r: any) => number) => Math.round(rows.reduce((s, r) => s + f(r), 0) * 100) / 100;
+    const priceRow = rows.find((r) => r.payUnitPrice != null && Number(r.payUnitPrice) > 0);
+    const paidCount = rows.filter((r) => r.payStatus === "已付款").length;
+    return {
+      rows,
+      kwh: sum((r) => Number(r.kwh ?? r.payKwh ?? 0)),
+      payAmount: sum((r) => Number(r.payAmount ?? 0)),
+      payUnitPrice: priceRow ? Number(priceRow.payUnitPrice) : (rows[0]?.payUnitPrice ?? null),
+      recordIds: rows.map((r) => r.recordId).filter((x) => x != null) as number[],
+      payStatus: paidCount === 0 ? "未付款" : paidCount === rows.length ? "已付款" : "部分已付款",
+      shared: rows.length > 1,
+    };
+  });
+}
+
 // ─── 抄表核对详情弹窗（发给场地方/品牌方老板核对）───
 function ReadingDetailDialog({ target, onClose }: { target: { meterNo: string; period: string } | null; onClose: () => void }) {
   const q = useQuery({
@@ -43,8 +73,16 @@ function ReadingDetailDialog({ target, onClose }: { target: { meterNo: string; p
   const prev = q.data?.prevMonth ?? null;
   const ratio = Number(mtr.transformerRatio ?? 1);
 
+  // 共享电表：付给场地方只有**一整笔**（整表读数 × 场地合同单价），品牌分摊只是把收款拆成几行
+  const sharedKwh = Math.round(ledgerRows.reduce((s: number, r: any) => s + Number(r.ledgerKwh ?? 0), 0) * 100) / 100;
+  const sharedPayAmount = Math.round(ledgerRows.reduce((s: number, r: any) => s + Number(r.payAmount ?? 0), 0) * 100) / 100;
+  const sharedPayPrice = Number((ledgerRows.find((r: any) => Number(r.payUnitPrice ?? 0) > 0) ?? {}).payUnitPrice ?? 0);
+  const sharedPaidCount = ledgerRows.filter((r: any) => r.payStatus === "已付款").length;
+  const sharedPayStatus = sharedPaidCount === 0 ? "未付款"
+    : sharedPaidCount === ledgerRows.length ? "已付款" : "部分已付款";
+
   const copyText = async () => {
-    const usage = Number(lg?.ledgerKwh ?? (Number(rd.kwh ?? 0) * ratio));
+    const usage = ledgerRows.length > 1 ? sharedKwh : Number(lg?.ledgerKwh ?? (Number(rd.kwh ?? 0) * ratio));
     const lines = [
       `【电费抄表核对】${mtr.landlordName ?? ""}（${mtr.brandName || "全品牌共享"}）`,
       `电表：${mtr.meterNo ?? target?.meterNo}${mtr.meterName ? `（${mtr.meterName}）` : ""}`,
@@ -53,11 +91,12 @@ function ReadingDetailDialog({ target, onClose }: { target: { meterNo: string; p
       `区间度数：${rd.kwh ?? "—"} × 倍数 ${ratio} = 计费用量 ${usage.toFixed(2)} 度`,
       ...(ledgerRows.length > 1
         ? [
+            `【付场地方（整表一笔）】${fmtNum(sharedKwh)} 度 × ${fmtMoney(sharedPayPrice)} 元/度 = ` +
+            `${fmtMoney(sharedPayAmount)} 元（${sharedPayStatus}）`,
             "【品牌分摊明细】",
             ...ledgerRows.map((r: any) =>
-              `${r.brandName || "全品牌共享"}：用量 ${fmtNum(Number(r.ledgerKwh ?? 0))} 度，` +
-              `应付（付场地方）${fmtMoney(Number(r.payAmount ?? 0))} 元，` +
-              `应收（品牌方支付）${fmtMoney(Number(r.collectAmount ?? 0))} 元（不含税 ${fmtMoney(Number(r.collectNet ?? 0))}）`
+              `${r.brandName || "全品牌共享"}：应收（品牌方支付）${fmtMoney(Number(r.collectAmount ?? 0))} 元` +
+              `（不含税 ${fmtMoney(Number(r.collectNet ?? 0))}）`
             ),
           ]
         : [
@@ -131,37 +170,48 @@ function ReadingDetailDialog({ target, onClose }: { target: { meterNo: string; p
               </div>
             </div>
             {ledgerRows.length > 1 ? (
-              <div>
-                <div className="mb-1 text-[10px] font-semibold text-purple-600">
-                  品牌分摊明细（{ledgerRows.length} 个品牌 · 应付电费按品牌录入，用量 = 金额 ÷ 单价 倒推）
+              <div className="space-y-2">
+                {/* 共享电表：付给场地方是一整笔（整表读数 × 场地单价），不按品牌拆 */}
+                <div className="rounded-md border border-rose-100 bg-rose-50/50 px-3 py-2">
+                  <div className="text-[10px] text-rose-500">应付电费（付场地方 · 整表一笔）· {sharedPayStatus}</div>
+                  <div className="font-semibold tabular-nums text-rose-600">{fmtMoney(sharedPayAmount)} 元</div>
+                  <div className="text-[10px] text-slate-400">
+                    = 整表 {fmtNum(sharedKwh)} 度 × {fmtMoney(sharedPayPrice)} 元/度
+                    （亏空按电量摊入各品牌，合计就是这一笔）
+                  </div>
                 </div>
-                <div className="overflow-x-auto rounded-md border">
-                  <table className="w-full text-[11px]">
-                    <thead>
-                      <tr className="bg-slate-50 text-left text-slate-500">
-                        <th className="px-2 py-1.5 font-medium">品牌方</th>
-                        <th className="px-2 py-1.5 text-right font-medium">用量(度)</th>
-                        <th className="px-2 py-1.5 text-right font-medium">付款单价</th>
-                        <th className="px-2 py-1.5 text-right font-medium">应付(元)</th>
-                        <th className="px-2 py-1.5 text-right font-medium">收款单价</th>
-                        <th className="px-2 py-1.5 text-right font-medium">应收(元)</th>
-                        <th className="px-2 py-1.5 text-right font-medium">不含税</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {ledgerRows.map((r: any, i: number) => (
-                        <tr key={i} className="border-t">
-                          <td className="px-2 py-1.5 font-medium text-slate-700">{r.brandName || "全品牌共享"}</td>
-                          <td className="px-2 py-1.5 text-right tabular-nums">{fmtNum(Number(r.ledgerKwh ?? 0))}</td>
-                          <td className="px-2 py-1.5 text-right tabular-nums">{fmtMoney(Number(r.payUnitPrice ?? 0))}</td>
-                          <td className="px-2 py-1.5 text-right tabular-nums text-rose-600">{fmtMoney(Number(r.payAmount ?? 0))}</td>
-                          <td className="px-2 py-1.5 text-right tabular-nums">{fmtMoney(Number(r.collectUnitPrice ?? 0))}</td>
-                          <td className="px-2 py-1.5 text-right tabular-nums text-emerald-600">{fmtMoney(Number(r.collectAmount ?? 0))}</td>
-                          <td className="px-2 py-1.5 text-right tabular-nums">{fmtMoney(Number(r.collectNet ?? 0))}</td>
+                <div>
+                  <div className="mb-1 text-[10px] font-semibold text-purple-600">
+                    品牌分摊明细（{ledgerRows.length} 个品牌 · 应收电费按品牌录入，用量 = 金额 ÷ 单价 倒推）
+                  </div>
+                  <div className="overflow-x-auto rounded-md border">
+                    <table className="w-full text-[11px]">
+                      <thead>
+                        <tr className="bg-slate-50 text-left text-slate-500">
+                          <th className="px-2 py-1.5 font-medium">品牌方</th>
+                          <th className="px-2 py-1.5 text-right font-medium">应收电量(度)</th>
+                          <th className="px-2 py-1.5 text-right font-medium">收款单价</th>
+                          <th className="px-2 py-1.5 text-right font-medium">应收(元)</th>
+                          <th className="px-2 py-1.5 text-right font-medium">不含税</th>
                         </tr>
-                      ))}
-                    </tbody>
-                  </table>
+                      </thead>
+                      <tbody>
+                        {ledgerRows.map((r: any, i: number) => (
+                          <tr key={i} className="border-t">
+                            <td className="px-2 py-1.5 font-medium text-slate-700">{r.brandName || "全品牌共享"}</td>
+                            <td className="px-2 py-1.5 text-right tabular-nums">
+                              {Number(r.collectUnitPrice ?? 0) > 0
+                                ? fmtNum(Math.round((Number(r.collectAmount ?? 0) / Number(r.collectUnitPrice)) * 100) / 100)
+                                : "—"}
+                            </td>
+                            <td className="px-2 py-1.5 text-right tabular-nums">{fmtMoney(Number(r.collectUnitPrice ?? 0))}</td>
+                            <td className="px-2 py-1.5 text-right tabular-nums text-emerald-600">{fmtMoney(Number(r.collectAmount ?? 0))}</td>
+                            <td className="px-2 py-1.5 text-right tabular-nums">{fmtMoney(Number(r.collectNet ?? 0))}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
                 </div>
               </div>
             ) : lg ? (
@@ -185,7 +235,7 @@ function ReadingDetailDialog({ target, onClose }: { target: { meterNo: string; p
                   <div key={i} className="mt-0.5 flex items-center justify-between">
                     <span>{a.brandName ?? `品牌${a.brandId}`}</span>
                     <span className="tabular-nums">
-                      应付 {fmtMoney(Number(a.collectAmount ?? 0))} 元
+                      应收 {fmtMoney(Number(a.collectAmount ?? 0))} 元
                       {a.unitPrice != null ? ` · 单价 ${fmtMoney(Number(a.unitPrice))}` : ""}
                     </span>
                   </div>
@@ -648,12 +698,14 @@ export default function Electricity() {
   // 抄表核对详情弹窗
   const [readingTarget, setReadingTarget] = useState<{ meterNo: string; period: string } | null>(null);
   // 付款/收款状态行内编辑（可反复修改）
-  const [statusEdit, setStatusEdit] = useState<{ recordId: number; field: "pay" | "collect" } | null>(null);
+  // key = 正在编辑的单元格；recordIds = 一起改的台账行（共享电表给场地方是一整笔付款，多品牌行同改）
+  const [statusEdit, setStatusEdit] = useState<{ key: string; recordIds: number[]; field: "pay" | "collect" } | null>(null);
   const queryClient = useQueryClient();
   const updateStatusMut = useMutation({
-    mutationFn: (p: { recordId: number; payStatus?: string; collectStatus?: string }) => {
-      if (!p.recordId) throw new Error("台账记录ID缺失，请刷新页面后重试");
-      return updateElectricityStatus(p.recordId, p);
+    mutationFn: (p: { recordIds: number[]; payStatus?: string; collectStatus?: string }) => {
+      const ids = (p.recordIds ?? []).filter((x) => x != null);
+      if (ids.length === 0) throw new Error("台账记录ID缺失，请刷新页面后重试");
+      return Promise.all(ids.map((id) => updateElectricityStatus(id, { payStatus: p.payStatus, collectStatus: p.collectStatus })));
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["electricity-monthly-ledger-range"] });
@@ -807,6 +859,11 @@ export default function Electricity() {
                             const rOpen = expanded.has(rKey);
                             const hasTransformerRatio = (g.details ?? []).some((d: any) => d.transformerRatio && d.transformerRatio !== 1);
                             const hasBrandDimension = (g.details ?? []).some((d: any) => d.brandName);
+                            // 明细按电表分组后摊平：共享表的付款信息只在第一行出现
+                            const meterGroups = groupDetailsByMeter(g.details ?? []);
+                            const flatDetails = meterGroups.flatMap((mg, gi) =>
+                              mg.rows.map((d: any, i: number) => ({ d, mg, gi, first: i === 0 })));
+                            const hasSharedMeter = meterGroups.some((mg) => mg.shared);
                             return (
                               <Fragment key={rKey}>
                                 <div
@@ -819,7 +876,10 @@ export default function Electricity() {
                                     <span className="truncate font-medium text-slate-700" title={g.name}>{g.name}</span>
                                   </span>
                                   <span className="text-right text-slate-500 tabular-nums">{fmtNum(g.kwh)} 度</span>
-                                  <span className="text-right tabular-nums text-rose-600">付 {fmtMoney(g.payAmount)}</span>
+                                  <span className="text-right tabular-nums text-rose-600"
+                                    title="应付电费（付给场地方）：合计本场地各电表；共享电表按整表读数 × 场地合同单价">
+                                    付 {fmtMoney(g.payAmount)}
+                                  </span>
                                   <span className="text-right tabular-nums text-emerald-600">收 {fmtMoney(g.collectNet)}</span>
                                   <span className="text-right tabular-nums text-slate-400">税 {fmtMoney(g.elecTax)}</span>
                                   <span className="text-right tabular-nums font-medium text-slate-700">利 {fmtMoney(g.profit)}</span>
@@ -856,60 +916,90 @@ export default function Electricity() {
                                         </tr>
                                       </thead>
                                       <tbody>
-                                        {(g.details ?? []).map((d: any, i: number) => (
-                                          <tr key={i} className="border-b last:border-0 hover:bg-slate-50/50">
-                                            <td className="px-2 py-1.5">
-                                              <div className="font-medium text-slate-700">{d.meterName ?? d.stationName ?? "—"}</div>
-                                              <div className="font-mono text-[10px] text-slate-400">{d.meterNo}{d.meterName ? ` · ${d.meterName}` : ""}</div>
-                                              {dim === "entity" && d.landlordName && (
-                                                <div className="text-[10px] text-slate-400">场地：{d.landlordName}</div>
-                                              )}
-                                              {d.dataSource === "manual" && (
-                                                <span className="mt-0.5 inline-block rounded bg-amber-100 px-1 text-[10px] text-amber-700">已人工修改</span>
-                                              )}
-                                              <button type="button" className="mt-0.5 block text-[11px] text-rose-600 hover:text-rose-700"
-                                                onClick={(e) => { e.stopPropagation(); setReadingTarget({ meterNo: d.meterNo, period: m.period }); }}>
-                                                详细
-                                              </button>
-                                            </td>
+                                        {flatDetails.map(({ d, mg, gi, first }, fi) => {
+                                          // 付款信息归「电表」：共享表只在第一行渲染（rowSpan 跨全部品牌行）
+                                          const payKey = `pay-${rKey}-${gi}`;
+                                          const collectKey = `collect-${d.recordId}`;
+                                          return (
+                                          <tr key={`${gi}-${fi}`} className="border-b last:border-0 hover:bg-slate-50/50">
+                                            {first && (
+                                              <td className="px-2 py-1.5 align-top" rowSpan={mg.rows.length}>
+                                                <div className="font-medium text-slate-700">{d.meterName ?? d.stationName ?? "—"}</div>
+                                                <div className="font-mono text-[10px] text-slate-400">{d.meterNo}{d.meterName ? ` · ${d.meterName}` : ""}</div>
+                                                {dim === "entity" && d.landlordName && (
+                                                  <div className="text-[10px] text-slate-400">场地：{d.landlordName}</div>
+                                                )}
+                                                {d.dataSource === "manual" && (
+                                                  <span className="mt-0.5 inline-block rounded bg-amber-100 px-1 text-[10px] text-amber-700">已人工修改</span>
+                                                )}
+                                                <button type="button" className="mt-0.5 block text-[11px] text-rose-600 hover:text-rose-700"
+                                                  onClick={(e) => { e.stopPropagation(); setReadingTarget({ meterNo: d.meterNo, period: m.period }); }}>
+                                                  详细
+                                                </button>
+                                              </td>
+                                            )}
                                             {hasBrandDimension && (
                                               <td className={`px-2 py-1.5 tabular-nums ${!d.brandName ? "font-medium text-purple-600" : ""}`}>
                                                 {d.brandName ?? "全品牌共享"}
                                               </td>
                                             )}
-                                            {hasTransformerRatio && <td className="px-2 py-1.5 tabular-nums">{fmtNum(d.transformerRatio)}</td>}
-                                            <td className="px-2 py-1.5 tabular-nums">{fmtNum(d.kwh ?? d.payKwh)}</td>
-                                            <td className="border-x px-2 py-1.5 text-right tabular-nums">{d.payUnitPrice != null ? fmtNum(d.payUnitPrice) : "—"}</td>
-                                            <td className="px-2 py-1.5 text-right tabular-nums text-rose-600">{fmtMoney(d.payAmount)}</td>
-                                            <td className="px-2 py-1.5 text-center">
-                                              {statusEdit && d.recordId != null && statusEdit.recordId === d.recordId && statusEdit.field === "pay" ? (
-                                                <div className="flex items-center justify-center gap-1">
-                                                  <button type="button" className="rounded bg-emerald-100 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 hover:bg-emerald-200"
-                                                    onClick={(e) => { e.stopPropagation(); updateStatusMut.mutate({ recordId: d.recordId, payStatus: "已付款" }); }}>已付款</button>
-                                                  <button type="button" className="rounded border border-slate-200 bg-white px-1.5 py-0.5 text-[10px] text-slate-500 hover:bg-slate-100"
-                                                    onClick={(e) => { e.stopPropagation(); updateStatusMut.mutate({ recordId: d.recordId, payStatus: "未付款" }); }}>未付款</button>
-                                                  <button type="button" className="rounded px-1 text-[10px] text-slate-400 hover:text-slate-600"
-                                                    onClick={(e) => { e.stopPropagation(); setStatusEdit(null); }}>取消</button>
-                                                </div>
-                                              ) : (
-                                                <button type="button" title={d.recordId != null ? "点击修改付款状态" : "台账记录ID缺失，请刷新页面后重试"}
-                                                  disabled={d.recordId == null}
-                                                  className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium ${d.payStatus === "已付款" ? "bg-emerald-100 text-emerald-700" : "border border-slate-200 bg-white text-slate-500"} hover:border-sky-300 disabled:cursor-not-allowed disabled:opacity-60`}
-                                                  onClick={(e) => { e.stopPropagation(); if (d.recordId != null) setStatusEdit({ recordId: d.recordId, field: "pay" }); }}>
-                                                  {d.payStatus ?? "—"}
-                                                </button>
-                                              )}
-                                            </td>
+                                            {hasTransformerRatio && first && (
+                                              <td className="px-2 py-1.5 align-top tabular-nums" rowSpan={mg.rows.length}>{fmtNum(d.transformerRatio)}</td>
+                                            )}
+                                            {/* 度数 + 付款信息：同一块电表只有一整笔（共享表 = 整表读数 × 场地单价） */}
+                                            {first && (
+                                              <>
+                                                <td className="px-2 py-1.5 align-top tabular-nums" rowSpan={mg.rows.length}>
+                                                  {fmtNum(mg.kwh)}
+                                                  {mg.shared && <div className="text-[10px] font-normal text-amber-600">整表</div>}
+                                                </td>
+                                                <td className="border-x px-2 py-1.5 text-right align-top tabular-nums" rowSpan={mg.rows.length}>
+                                                  {Number(mg.payUnitPrice ?? 0) > 0 ? fmtNum(mg.payUnitPrice) : "—"}
+                                                </td>
+                                                <td className="px-2 py-1.5 text-right align-top tabular-nums text-rose-600" rowSpan={mg.rows.length}
+                                                  title={mg.shared && Number(mg.payUnitPrice ?? 0) > 0
+                                                    ? `付场地方 = 整表 ${fmtNum(mg.kwh)} 度 × ${fmtNum(mg.payUnitPrice ?? 0)} 元/度（亏空按电量摊入各品牌）`
+                                                    : undefined}>
+                                                  {fmtMoney(mg.payAmount)}
+                                                  {mg.shared && !(Number(mg.payUnitPrice ?? 0) > 0) && (
+                                                    <div className="text-[10px] font-normal text-rose-500">场地合同未填电费单价</div>
+                                                  )}
+                                                </td>
+                                                <td className="px-2 py-1.5 text-center align-top" rowSpan={mg.rows.length}>
+                                                  {statusEdit?.key === payKey && statusEdit.field === "pay" ? (
+                                                    <div className="flex flex-wrap items-center justify-center gap-1">
+                                                      <button type="button" className="rounded bg-emerald-100 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 hover:bg-emerald-200"
+                                                        onClick={(e) => { e.stopPropagation(); updateStatusMut.mutate({ recordIds: mg.recordIds, payStatus: "已付款" }); }}>已付款</button>
+                                                      <button type="button" className="rounded border border-slate-200 bg-white px-1.5 py-0.5 text-[10px] text-slate-500 hover:bg-slate-100"
+                                                        onClick={(e) => { e.stopPropagation(); updateStatusMut.mutate({ recordIds: mg.recordIds, payStatus: "未付款" }); }}>未付款</button>
+                                                      <button type="button" className="rounded px-1 text-[10px] text-slate-400 hover:text-slate-600"
+                                                        onClick={(e) => { e.stopPropagation(); setStatusEdit(null); }}>取消</button>
+                                                    </div>
+                                                  ) : (
+                                                    <button type="button"
+                                                      title={mg.recordIds.length > 0
+                                                        ? (mg.shared ? "点击修改付款状态（该共享表全部品牌一起改）" : "点击修改付款状态")
+                                                        : "台账记录ID缺失，请刷新页面后重试"}
+                                                      disabled={mg.recordIds.length === 0}
+                                                      className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium ${mg.payStatus === "已付款" ? "bg-emerald-100 text-emerald-700" : "border border-slate-200 bg-white text-slate-500"} hover:border-sky-300 disabled:cursor-not-allowed disabled:opacity-60`}
+                                                      onClick={(e) => { e.stopPropagation(); if (mg.recordIds.length > 0) setStatusEdit({ key: payKey, recordIds: mg.recordIds, field: "pay" }); }}>
+                                                      {mg.payStatus}
+                                                    </button>
+                                                  )}
+                                                  {mg.shared && <div className="mt-0.5 text-[10px] text-slate-400">整表一笔</div>}
+                                                </td>
+                                              </>
+                                            )}
                                             <td className="border-x px-2 py-1.5 text-right tabular-nums">{d.collectUnitPrice != null ? fmtNum(d.collectUnitPrice) : "—"}</td>
                                             <td className="px-2 py-1.5 text-right tabular-nums">{fmtMoney(d.collectAmount)}</td>
                                             <td className="px-2 py-1.5 text-right tabular-nums text-emerald-600">{fmtMoney(d.collectNet)}</td>
                                             <td className="px-2 py-1.5 text-center">
-                                              {statusEdit && d.recordId != null && statusEdit.recordId === d.recordId && statusEdit.field === "collect" ? (
+                                              {statusEdit?.key === collectKey && statusEdit.field === "collect" && d.recordId != null ? (
                                                 <div className="flex items-center justify-center gap-1">
                                                   <button type="button" className="rounded bg-emerald-100 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 hover:bg-emerald-200"
-                                                    onClick={(e) => { e.stopPropagation(); updateStatusMut.mutate({ recordId: d.recordId, collectStatus: "已到账" }); }}>已到账</button>
+                                                    onClick={(e) => { e.stopPropagation(); updateStatusMut.mutate({ recordIds: [d.recordId], collectStatus: "已到账" }); }}>已到账</button>
                                                   <button type="button" className="rounded border border-slate-200 bg-white px-1.5 py-0.5 text-[10px] text-slate-500 hover:bg-slate-100"
-                                                    onClick={(e) => { e.stopPropagation(); updateStatusMut.mutate({ recordId: d.recordId, collectStatus: "未到账" }); }}>未到账</button>
+                                                    onClick={(e) => { e.stopPropagation(); updateStatusMut.mutate({ recordIds: [d.recordId], collectStatus: "未到账" }); }}>未到账</button>
                                                   <button type="button" className="rounded px-1 text-[10px] text-slate-400 hover:text-slate-600"
                                                     onClick={(e) => { e.stopPropagation(); setStatusEdit(null); }}>取消</button>
                                                 </div>
@@ -917,7 +1007,7 @@ export default function Electricity() {
                                                 <button type="button" title={d.recordId != null ? "点击修改收款状态" : "台账记录ID缺失，请刷新页面后重试"}
                                                   disabled={d.recordId == null}
                                                   className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium ${d.collectStatus === "已到账" ? "bg-emerald-100 text-emerald-700" : "border border-slate-200 bg-white text-slate-500"} hover:border-sky-300 disabled:cursor-not-allowed disabled:opacity-60`}
-                                                  onClick={(e) => { e.stopPropagation(); if (d.recordId != null) setStatusEdit({ recordId: d.recordId, field: "collect" }); }}>
+                                                  onClick={(e) => { e.stopPropagation(); if (d.recordId != null) setStatusEdit({ key: collectKey, recordIds: [d.recordId], field: "collect" }); }}>
                                                   {d.collectStatus ?? "—"}
                                                 </button>
                                               )}
@@ -926,9 +1016,16 @@ export default function Electricity() {
                                               {fmtMoney(d.profit ?? (Number(d.collectNet ?? 0) - Number(d.payAmount ?? 0)))}
                                             </td>
                                           </tr>
-                                        ))}
+                                          );
+                                        })}
                                       </tbody>
                                     </table>
+                                    {hasSharedMeter && (
+                                      <div className="border-t bg-amber-50/60 px-2 py-1.5 text-[10px] leading-4 text-amber-700">
+                                        共享电表（「所有品牌共用此电表」）：付给场地方只有一整笔 —— 度数＝整表读数，金额＝整表读数 × 场地合同单价；
+                                        各品牌行只显示自己的收款。亏空按电量比例摊在品牌上，但合计就是这一笔付款。
+                                      </div>
+                                    )}
                                   </div>
                                 )}
                               </Fragment>
