@@ -4,6 +4,8 @@ import { listBrands } from "@/api/directory";
 import { listContracts } from "@/api/contracts";
 import { listMeters } from "@/api/meters";
 import { listCabinets } from "@/api/cabinets";
+import { getSharedCabinetUsage } from "@/api/meterEnergy";
+import { buildSharedCabIndex } from "@/lib/alloc";
 import { listElectricity } from "@/api/electricity";
 import { getMonthlyLedger } from "@/api/rent";
 import { StatusBadge, Money } from "@/components/Stat";
@@ -58,6 +60,9 @@ export default function Brands() {
   const contracts = useQuery({ queryKey: ["contracts"], queryFn: () => listContracts() });
   const meters = useQuery({ queryKey: ["meters"], queryFn: () => listMeters() });
   const cabinets = useQuery({ queryKey: ["allCabinets"], queryFn: () => listCabinets() });
+  // 共享电表（场地总表）按品牌录入的柜数：品牌方在这类表下没有自己的电表，本地「数电表」取不到
+  const sharedCabsQ = useQuery({ queryKey: ["sharedCabinetUsage"], queryFn: () => getSharedCabinetUsage() });
+  const sharedCabIndex = useMemo(() => buildSharedCabIndex(sharedCabsQ.data?.meters), [sharedCabsQ.data]);
   const electricity = useQuery({
     queryKey: ["electricity", selectedMonth],
     queryFn: () => listElectricity({ period: selectedMonth || undefined }),
@@ -209,16 +214,38 @@ export default function Brands() {
           const rentIncomeAmt = Number(site.rentIncome?.monthlyRent) || 0;
           site.rentProfit = Math.round((rentIncomeAmt - (site.venueCostMonth ?? 0) - site.rentTax) * 100) / 100;
           site.netProfit = Math.round((site.elecProfit + site.rentProfit) * 100) / 100;
+
+          // 共享电表（场地总表）按品牌录入的柜数：该品牌在此场地没有自己的电表，本地「数电表」取不到
+          for (const it of sharedCabIndex.get(site.landlordId) ?? []) {
+            if (!it.managedByAlloc) continue;
+            site.cabinetCount += Number(it.brandCabs?.[String(brand.id)] || 0);
+          }
         }
 
-        // 只展示有电表关联的场地（合同补充的无电表场地不显示）
-        const sites = [...siteMap.values()].filter((s: any) => s.meters.length > 0).sort((a, b) => a.landlordName.localeCompare(b.landlordName));
+        // 只展示有电表关联的场地（合同补充的无电表场地不显示）；
+        // ⚠️ 共享电表（场地总表）下品牌方没有自己的电表 → site.meters 为空，
+        //    但该品牌确实在此场地经营（有品牌方合同 + 共享表按品牌录了柜数）→ 这类场地必须保留，
+        //    否则整个场地会从列表里消失（品牌 11/13/20 在龙泉路就是这种情况）。
+        const sites = [...siteMap.values()]
+          .filter((s: any) => s.meters.length > 0 || s.cabinetCount > 0)
+          .sort((a, b) => a.landlordName.localeCompare(b.landlordName));
+
+        // 该品牌在共享电表（场地总表）上按品牌录入的柜数合计：品牌方在这类表下没有自己的电表，
+        // 电表数恒为 0，柜数只能从这里来（否则该品牌会被下面的 meterCount 过滤掉，整条看不见）
+        let sharedCabCount = 0;
+        for (const items of sharedCabIndex.values()) {
+          for (const it of items) {
+            if (!it.managedByAlloc) continue;
+            sharedCabCount += Number(it.brandCabs?.[String(brand.id)] || 0);
+          }
+        }
 
         // 品牌汇总
         const summary = {
           siteCount: sites.length,
           meterCount: brandMeters.length,
-          cabinetCount: brandCabinets.length,
+          cabinetCount: brandCabinets.length + sharedCabCount,
+          sharedCabCount,
           contractCount: yearBrandContracts.length,
           totalMonthlyRent: yearBrandContracts.reduce((s: number, c: any) => s + (Number(c.monthlyRent) || 0), 0),
           totalElecPayKwh: sites.reduce((s, g) => s + g.elecPayKwh, 0),
@@ -236,9 +263,10 @@ export default function Brands() {
 
         return { ...brand, sites, summary };
       })
-      // 只显示在 meters 中关联了电表（实表）的品牌
-      .filter((b: any) => b.summary.meterCount > 0);
-  }, [brands.data, contracts.data, meters.data, cabinets.data, electricity.data, rentIncomeList, ledgerMap, keyword, year]);
+      // 只显示在 meters 中关联了电表（实表）的品牌，或仅通过共享电表（场地总表）经营的品牌
+      // （品牌方在这类表下没有自己的电表，meterCount=0 但确实在经营，不能过滤掉）
+      .filter((b: any) => b.summary.meterCount > 0 || b.summary.sharedCabCount > 0);
+  }, [brands.data, contracts.data, meters.data, cabinets.data, electricity.data, rentIncomeList, ledgerMap, sharedCabIndex, keyword, year]);
 
   const toggleExpand = (id: number) => setExpandedId(prev => prev === id ? null : id);
 

@@ -250,7 +250,9 @@ class DividendCalculator:
                 rent_income_details.append({
                     "brandId": c_brand,
                     "brandName": c.get("brand_name", ""),
-                    "cabinets": float(c.get("cabinets_count") or 0),
+                    # 计费柜数用实时口径（含共享电表按品牌录入值），与合同页/场租页一致；
+                    # 不用 contracts.cabinets_count 快照——电表后关联品牌、或共享表按品牌录柜数都不回写它
+                    "cabinets": float(landlord_brand_cabs.get(c_brand) or c.get("cabinets_count") or 0),
                     "unitMonthlyRent": float(c.get("unit_monthly_rent") or 0),
                     "amount": amount,
                     "isFirstMonth": is_first_month,
@@ -293,9 +295,10 @@ class DividendCalculator:
             "details": {
                 "electricity": [{
                     "meterNo": d["meter_no"],
-                    "kwh": float(d["kwh"] or 0),
+                    # 付款口径电量（共享电表含亏空分摊）；收款口径见 income.elecIncome.details
+                    "kwh": float(d.get("pay_kwh", d["kwh"]) or 0),
                     "unitPrice": elec_pay_price,
-                    "amount": round(float(d["kwh"] or 0) * elec_pay_price, 2),
+                    "amount": round(float(d.get("pay_kwh", d["kwh"]) or 0) * elec_pay_price, 2),
                 } for d in meter_details],
                 "rent": [{
                     "landlordName": c.get("landlord_name") or c.get("partner", ""),
@@ -332,12 +335,15 @@ class DividendCalculator:
             period=period_compact, contracts=contracts,
         )
         # 按品牌汇总电表度数（柜数统一用 landlord_brand_cabs：每电表 GREATEST(1,柜数)，与合同列表/场租页同口径）
+        # 电量分两套口径：brand_kwh = 收款口径（品牌倒推）；brand_pay_kwh = 付款口径（共享表含亏空分摊，付场地方）
         brand_kwh = {}
+        brand_pay_kwh = {}
         brand_kwh_entity = {}
         for d in meter_details:
             bid = d.get("brand_id")
             # bid=None 的共享电表组也聚合（键 None，供全品牌合同定价/计收入）
             brand_kwh[bid] = brand_kwh.get(bid, 0) + float(d.get("kwh") or 0)
+            brand_pay_kwh[bid] = brand_pay_kwh.get(bid, 0) + float(d.get("pay_kwh", d.get("kwh")) or 0)
             _bkey = (bid, d.get("entity_id"))
             brand_kwh_entity[_bkey] = brand_kwh_entity.get(_bkey, 0) + float(d.get("kwh") or 0)
         landlord_total_brand_cabs = sum(landlord_brand_cabs.values()) or 1  # 整场地品牌柜数（场地成本/运营费按此分摊）
@@ -376,6 +382,7 @@ class DividendCalculator:
         for bid, cs in contracts_by_brand.items():
             cabs = int(landlord_brand_cabs.get(bid, 0))  # 签了合同但无电表的品牌 = 0 柜，不参与分摊（保证各品牌分摊之和=场地成本）
             kwh = brand_kwh.get(bid, 0)
+            pay_kwh = brand_pay_kwh.get(bid, kwh) or 0
             b_elec_gross = 0.0
             b_elec_income = 0.0
             b_elec_tax = 0.0
@@ -418,7 +425,8 @@ class DividendCalculator:
 
             # 场地级成本按品牌柜数分摊（各品牌之和 = 整场地租金成本）
             b_venue_cost = round(rent_cost * cabs / landlord_total_brand_cabs, 2)
-            b_elec_cost = round(kwh * elec_pay_price, 2) if elec_pay_price else 0
+            # 电费成本按「付款口径电量」计（共享电表付场地方按整表读数，含亏空分摊）
+            b_elec_cost = round(pay_kwh * elec_pay_price, 2) if elec_pay_price else 0
             b_op = round(op_expense * cabs / landlord_total_brand_cabs, 2)
 
             b_income = round(b_elec_income + b_rent_income, 2)
@@ -445,12 +453,14 @@ class DividendCalculator:
         )
         entity_total = sum(entity_cabs_map.values()) or 1
         entity_kwh_map = {}
+        entity_pay_kwh_map = {}
         entity_elec_income = {}
         entity_elec_tax_map = {}
         for d in meter_details:
             eid = d.get("entity_id")
             kwh_d = float(d.get("kwh") or 0)
             entity_kwh_map[eid] = entity_kwh_map.get(eid, 0) + kwh_d
+            entity_pay_kwh_map[eid] = entity_pay_kwh_map.get(eid, 0) + float(d.get("pay_kwh", d.get("kwh")) or 0)
             _info = _elec_info(d) or {}
             _gross = _gross_of(d)
             if _info.get("tax_enabled") and _info.get("post_tax"):
@@ -492,7 +502,7 @@ class DividendCalculator:
         for eid in set(entity_cabs_map) | set(entity_kwh_map) | set(entity_elec_income) | set(entity_rent):
             cabs_e = entity_cabs_map.get(eid, 0)
             venue_e = round(rent_cost * cabs_e / entity_total, 2)
-            elec_cost_e = round(entity_kwh_map.get(eid, 0) * elec_pay_price, 2) if elec_pay_price else 0
+            elec_cost_e = round(entity_pay_kwh_map.get(eid, 0) * elec_pay_price, 2) if elec_pay_price else 0
             op_e = round(op_expense * cabs_e / entity_total, 2)
             e_income = round(entity_elec_income.get(eid, 0) + entity_rent.get(eid, 0), 2)
             e_cost = round(venue_e + elec_cost_e + op_e, 2)
@@ -639,28 +649,52 @@ class DividendCalculator:
                 kwh_map = {r["meter_no"]: float(r["kwh"] or 0) for r in rows}
                 actual_map = {r["meter_no"]: r["actual_kwh"] for r in rows if r.get("actual_kwh") is not None}
 
+                # 共享电表付款系数：付场地方按整表读数结算，品牌倒推合计与整表的差额（亏空/线损）
+                # 由我方承担 → 按各品牌用电量比例分摊进付款电量。口径与电费台账一致。
+                # 系数按表预算（用该表**全部**品牌分摊行，而非当前 brand_id 过滤后的子集）。
+                pay_scale = {}
+                for m in meters:
+                    allocs_m = alloc_map.get(m["meter_no"])
+                    if not allocs_m:
+                        continue
+                    alloc_sum = 0.0
+                    for a in allocs_m:
+                        info_a = brand_price_for(pricing, a["brand_id"], a.get("entity_id") or m.get("entity_id"))
+                        up_a = a.get("unit_price") or (info_a["price"] if info_a else None)
+                        if up_a:
+                            alloc_sum += round(float(a.get("collect_amount") or 0) / float(up_a), 2)
+                    full = actual_map.get(m["meter_no"])
+                    full = round(float(full), 2) if full is not None else \
+                        round(kwh_map.get(m["meter_no"], 0) * float(m.get("transformer_ratio") or 1), 2)
+                    pay_scale[m["meter_no"]] = (full / alloc_sum) if (full > 0 and alloc_sum > 0) else 1.0
+
                 for m in meters:
                     allocs = alloc_map.get(m["meter_no"]) if m.get("brand_id") is None else None
                     if allocs:
                         # 共享电表品牌分摊：逐品牌一条明细，收入取人工录入金额
                         picked = [a for a in allocs
                                   if brand_id is None or int(a["brand_id"]) == int(brand_id)]
+                        scale_a = pay_scale.get(m["meter_no"], 1.0)
                         for a in picked:
                             amount = round(float(a.get("collect_amount") or 0), 2)
-                            info = brand_price_for(pricing, a["brand_id"], m.get("entity_id"))
+                            alloc_entity = a.get("entity_id") or m.get("entity_id")
+                            info = brand_price_for(pricing, a["brand_id"], alloc_entity)
                             unit_price = a.get("unit_price")
                             if unit_price is None:
                                 unit_price = info["price"] if info else None
                             kwh_a = round(amount / float(unit_price), 2) if unit_price else 0.0
-                            total_kwh += kwh_a
+                            pay_kwh_a = round(kwh_a * scale_a, 2)
+                            total_kwh += pay_kwh_a
                             details.append({
                                 "meter_id": m["id"],
                                 "meter_no": m["meter_no"],
                                 "meter_name": m.get("meter_name"),
                                 "brand_id": a["brand_id"],
-                                "entity_id": m.get("entity_id"),
+                                # 报税主体：分摊行人工指定优先，未指定退回共享电表自身主体
+                                "entity_id": alloc_entity,
                                 "brand_name": a.get("brand_name"),
                                 "kwh": kwh_a,
+                                "pay_kwh": pay_kwh_a,
                                 "alloc_amount": amount,
                                 "alloc_unit_price": float(unit_price) if unit_price else None,
                                 "cabinet_count": 0,
@@ -727,10 +761,11 @@ class DividendCalculator:
         场地总表（tag='共享电表' 且 brand_id 为空）下各品牌没有自己的电表，
         「数电表」那套柜数统计数不到它们 —— 柜数只能来自分摊行人工录入
         （`meter_shared_allocations.cabinet_count`，逐月可调，当月没填则沿用最近一次）。
-        品牌归属主体：优先取本场地该品牌方合同的 entity_id；无合同则退回共享表自身主体。
+        品牌归属主体（优先级从高到低）：分摊行人工指定的报税主体 → 本场地该品牌方合同的
+        entity_id → 共享表自身主体。
         """
-        usage = shared_allocation_repo.cabinet_usage_by_meter(landlord_id=landlord_id, period=period)
-        if not usage:
+        items = shared_allocation_repo.shared_meter_cabinets(landlord_id=landlord_id, period=period)
+        if not items:
             return {}
         if contracts is None:
             contracts = self._get_contracts(landlord_id)
@@ -739,11 +774,14 @@ class DividendCalculator:
             if c.get("contract_type") == "品牌方合同" and c.get("brand_id") is not None:
                 brand_entity.setdefault(c["brand_id"], c.get("entity_id"))
         out = {}
-        for addr, entry in usage.items():
-            fallback_eid = entry.get("entityId")
-            for bid, cabs in (entry.get("brands") or {}).items():
-                # 品牌方合同没指定主体时同样退回共享表自身主体（entity_id 不会是 0）
-                eid = brand_entity.get(bid) or fallback_eid
+        for item in items:
+            if not item.get("managedByAlloc"):
+                continue
+            fallback_eid = item.get("entityId")
+            brand_entity_override = item.get("brandEntity") or {}
+            for bid, cabs in (item.get("brandCabs") or {}).items():
+                # 分摊行指定的报税主体优先；未指定退回品牌方合同主体，再退回共享表主体
+                eid = brand_entity_override.get(bid) or brand_entity.get(bid) or fallback_eid
                 out.setdefault(bid, {})
                 out[bid][eid] = out[bid].get(eid, 0) + cabs
         return out

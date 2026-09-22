@@ -308,6 +308,9 @@ async def get_shared_allocations(request: Request = None, meterNo: str = None, m
         cur.execute("SELECT id, name FROM brands ORDER BY name")
         all_brands = [{"brandId": r["id"], "brandName": r["name"]} for r in cur.fetchall()]
         brand_names = {b["brandId"]: b["brandName"] for b in all_brands}
+        cur.execute("SELECT id, name, short_name FROM entities ORDER BY id")
+        all_entities = [{"entityId": r["id"], "entityName": r["short_name"] or r["name"],
+                         "entityFullName": r["name"]} for r in cur.fetchall()]
     finally:
         cur.close()
         conn.close()
@@ -333,6 +336,7 @@ async def get_shared_allocations(request: Request = None, meterNo: str = None, m
         price, tax_rate, tax_enabled = _price_info(r.get("unit_price"), fallback)
         amount = float(r["collect_amount"] or 0)
         _, net = split_tax(amount, tax_rate) if tax_enabled else (0, amount)
+        entity_id = r.get("entity_id")
         allocations.append({
             "brandId": r["brand_id"],
             "brandName": r.get("brand_name") or brand_names.get(r["brand_id"], ""),
@@ -344,6 +348,8 @@ async def get_shared_allocations(request: Request = None, meterNo: str = None, m
             "kwh": _shared_kwh(amount, price),
             "collectNet": round(net, 2),
             "cabinetCount": int(r["cabinet_count"]) if r.get("cabinet_count") is not None else None,
+            "entityId": int(entity_id) if entity_id is not None else None,
+            "entityName": r.get("entity_name"),
             "remark": r.get("remark"),
         })
 
@@ -359,6 +365,9 @@ async def get_shared_allocations(request: Request = None, meterNo: str = None, m
         "sharedPrice": (pricing.get("shared_price") or {}).get("price"),
         "brands": candidates,
         "allBrands": all_brands,
+        "allEntities": all_entities,
+        # 默认报税主体 = 整场地口径：该共享电表自身的主体（未指定主体时展示为「未指定」）
+        "defaultEntityId": meter.get("entity_id"),
         "allocations": allocations,
         "periods": shared_allocation_repo.list_periods_for_meter(meterNo),
         # {"<brandId>": {"count": 12, "monthPeriod": "202608"}}
@@ -366,13 +375,30 @@ async def get_shared_allocations(request: Request = None, meterNo: str = None, m
     }
 
 
+@router.get("/shared-cabinet-usage")
+async def get_shared_cabinet_usage(request: Request = None, landlordId: int = None, period: str = None):
+    """共享电表柜数明细（供合同页按「场地 → 品牌」取计费柜数）。
+
+    共享电表下各品牌没有自己的电表，「数电表」数不到它们的柜数，只能取分摊行人工录入值。
+    period 为空时按「最近一次填写值」取值（合同列表无月份维度）。
+    """
+    allowed = scope_landlord_ids(request) if request is not None else None
+    items = shared_allocation_repo.shared_meter_cabinets(
+        landlord_id=landlordId, period=to_compact(period) or None
+    )
+    if allowed is not None:
+        items = [it for it in items if it.get("landlordId") in set(allowed)]
+    return {"period": to_compact(period) or None, "meters": items}
+
+
 @router.post("/shared-allocations")
 async def save_shared_allocations(data: dict, request: Request = None):
     """整体保存某共享电表某月的品牌分摊（应收电费），并按新分摊重算该月台账。
 
-    入参：{ address, monthPeriod, rows: [{ brandId, collectAmount, unitPrice?, cabinetCount?, remark? }] }
+    入参：{ address, monthPeriod, rows: [{ brandId, collectAmount, unitPrice?, cabinetCount?, entityId?, remark? }] }
     rows 为空数组 = 清空该月分摊（台账退回「读数 × 合同单价」口径）。
     cabinetCount = 该品牌当月在该表下投放的电柜数量（逐月可调，可空）。
+    entityId = 该品牌电柜的报税公司主体；留空 = 默认（整场地口径，取共享电表自身主体）。
     """
     address = data.get("address")
     month_period = to_compact(data.get("monthPeriod"))
@@ -425,8 +451,19 @@ async def save_shared_allocations(data: dict, request: Request = None):
         else:
             cabinet_count = None
 
+        # 报税主体：留空 = 默认（整场地口径，取共享电表自身主体）；填了则只改该品牌
+        entity_id = r.get("entityId")
+        if entity_id is not None and str(entity_id).strip() not in ("", "null"):
+            try:
+                entity_id = int(float(str(entity_id).strip()))
+            except (TypeError, ValueError):
+                raise HTTPException(400, f"报税主体格式无效：{entity_id}")
+        else:
+            entity_id = None
+
         rows.append({
             "brandId": brand_id,
+            "entityId": entity_id,
             "collectAmount": amount,
             "unitPrice": unit_price,
             "cabinetCount": cabinet_count,

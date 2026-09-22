@@ -445,12 +445,42 @@ async def delete_electricity(record_id: int):
     return {"ok": True}
 
 
+def _alloc_unit_price(pricing: dict, alloc: dict, meter_entity_id=None):
+    """共享电表分摊行的有效收款单价：表单人工覆盖优先，其次该品牌（按分摊行主体匹配）合同单价。
+
+    Returns: (price, brand_info)
+    """
+    from ..domain.electricity_pricing import brand_price_for
+    entity_id = alloc.get("entity_id") or meter_entity_id
+    info = brand_price_for(pricing, alloc.get("brand_id"), entity_id)
+    price = alloc.get("unit_price")
+    if price is None:
+        price = info["price"] if info else None
+    return price, info
+
+
+def _shared_full_kwh(readings: dict, meter: dict) -> float:
+    """共享电表「整表实际用电量」：人工补录的 actual_kwh 优先，否则 原始表码 × 互感器倍数。
+
+    这是付给场地方的结算电量口径（品牌倒推合计与它的差额即亏空/线损，由我方承担）。
+    """
+    row = readings.get(meter["meter_no"]) or {}
+    if row.get("actual") is not None:
+        return round(float(row["actual"]), 2)
+    return round(float(row.get("kwh") or 0) * float(meter.get("transformer_ratio") or 1), 2)
+
+
 @router.post("/generate")
 async def generate_electricity(data: dict):
     """从 meter_monthly + contracts 自动生成电费台账（v3.1：按 场地×品牌×主体 全量生成）
 
     主体归属：按电表的 meters.entity_id（一表一主体）；
+    共享电表可按品牌分摊行指定报税主体（alloc.entity_id），未指定才退回电表主体。
     同场地同品牌下不同主体的电表拆成多行台账，各行只含本主体电表的明细。
+
+    共享电表付款口径（2026-09）：付场地方 = **整表读数 × 场地单价**；
+    品牌倒推电量合计与整表读数的差额（亏空/线损）由我方承担，按各品牌用电量比例分摊进
+    各品牌明细的付款金额（收款金额不受影响）。
     """
     period = data.get("period")
     if not period:
@@ -523,9 +553,38 @@ async def generate_electricity(data: dict):
             allocs = alloc_map.get(m["meter_no"])
             if allocs:
                 for a in allocs:
-                    groups[(m["landlord_id"], a["brand_id"], m["entity_id"])].append({"meter": m, "alloc": a})
+                    # 报税主体：分摊行人工指定优先；留空 = 默认（整场地口径，取共享电表自身主体）
+                    groups[(m["landlord_id"], a["brand_id"], a.get("entity_id") or m["entity_id"])].append(
+                        {"meter": m, "alloc": a}
+                    )
             else:
                 groups[(m["landlord_id"], m["brand_id"], m["entity_id"])].append({"meter": m, "alloc": None})
+
+        # 共享电表「品牌倒推电量合计」（逐表）：付场地方按整表读数结算，两者差额即亏空，
+        # 按各品牌用电量比例分摊进付款金额（见 _alloc_unit_price / _shared_full_kwh）。
+        from ..domain.electricity_pricing import resolve_prices
+        meter_by_no = {m["meter_no"]: m for m in meters}
+        _pricing_cache = {}
+
+        def _pricing_of(lid):
+            if lid not in _pricing_cache:
+                _pricing_cache[lid] = resolve_prices(landlord_contracts_map.get(lid, []) if lid else [])
+            return _pricing_cache[lid]
+
+        alloc_kwh_by_meter = {}
+        for addr, allocs in alloc_map.items():
+            m0 = meter_by_no.get(addr)
+            if not m0:
+                continue
+            pr = _pricing_of(m0["landlord_id"])
+            total_alloc_kwh = 0.0
+            for a in allocs:
+                price, _info = _alloc_unit_price(pr, a, m0.get("entity_id"))
+                if not price:
+                    continue
+                total_alloc_kwh += round(float(a.get("collect_amount") or 0) / float(price), 2)
+            if total_alloc_kwh > 0:
+                alloc_kwh_by_meter[addr] = total_alloc_kwh
 
         # 预加载已有台账（按 landlord+brand+entity）
         cur.execute("SELECT id, landlord_id, brand_id, entity_id FROM electricity_records WHERE period = %s", (period,))
@@ -574,10 +633,7 @@ async def generate_electricity(data: dict):
 
                 if alloc is not None:
                     # ── 共享电表品牌分摊：金额人工录入，用电量 = 金额 ÷ 单价 倒推 ──
-                    brand_info = brand_price_for(pricing, alloc["brand_id"], m.get("entity_id"))
-                    unit_price = alloc.get("unit_price")
-                    if unit_price is None:
-                        unit_price = brand_info["price"] if brand_info else None
+                    unit_price, brand_info = _alloc_unit_price(pricing, alloc, m.get("entity_id"))
                     collect_amount = round(float(alloc["collect_amount"] or 0), 2)
                     if not unit_price:
                         warnings.append(
@@ -586,17 +642,28 @@ async def generate_electricity(data: dict):
                         )
                         continue
                     actual_kwh = round(collect_amount / float(unit_price), 2)
+                    # 付款口径：付场地方按整表读数结算，品牌倒推合计小于整表读数的差额（亏空/线损）
+                    # 由我方承担 —— 按该品牌用电量占比分摊进付款电量（收款金额不受影响）。
+                    full_kwh = _shared_full_kwh(readings, m)
+                    alloc_kwh_sum = alloc_kwh_by_meter.get(m["meter_no"]) or 0.0
+                    scale = (full_kwh / alloc_kwh_sum) if (full_kwh > 0 and alloc_kwh_sum > 0) else 1.0
+                    pay_kwh = round(actual_kwh * scale, 2)
                     detail_rate = brand_info["tax_rate"] if (brand_info and brand_info.get("tax_enabled")) else None
-                    pay_amount = round(actual_kwh * float(landlord_price or 0), 2) if landlord_price else 0
+                    pay_amount = round(pay_kwh * float(landlord_price or 0), 2) if landlord_price else 0
                     _, collect_net = split_tax(collect_amount, detail_rate)
-                    total_pay_kwh += actual_kwh
+                    total_pay_kwh += pay_kwh
                     total_collect_kwh += actual_kwh
+                    if scale != 1.0 and abs(full_kwh - alloc_kwh_sum) > max(1, full_kwh * 0.01):
+                        warnings.append(
+                            f"{m['meter_no']} {period} 整表读数 {full_kwh} 度 ÷ 品牌倒推合计 {round(alloc_kwh_sum, 2)} 度"
+                            f" = 系数 {round(scale, 4)}（差额 {round(full_kwh - alloc_kwh_sum, 2)} 度按品牌用电量比例计入付款）"
+                        )
                     meter_details.append({
                         "meterId": m["id"],
                         "meterNo": m["meter_no"],
                         "brandId": alloc["brand_id"],
                         "brandName": alloc.get("brand_name"),
-                        "kwh": actual_kwh,
+                        "kwh": pay_kwh,
                         "payUnitPrice": float(landlord_price or 0),
                         "payAmount": pay_amount,
                         "collectUnitPrice": float(unit_price),

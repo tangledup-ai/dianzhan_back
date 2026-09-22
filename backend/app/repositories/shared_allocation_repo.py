@@ -292,3 +292,92 @@ def cabinet_totals_by_brand(landlord_id: int = None, period: str = None) -> dict
         for bid, cabs in (entry.get("brands") or {}).items():
             out[bid] = out.get(bid, 0) + cabs
     return out
+
+
+def shared_meter_cabinets(landlord_id: int = None, period: str = None) -> list:
+    """共享电表（tag='共享电表' 且无品牌）的柜数明细，供「合同页/分红」按场地取柜数。
+
+    每块表返回一行：
+      - managedByAlloc=True  → 该表已按品牌录入柜数，`brandCabs={brand_id: cabs}`（按月取值）；
+        `fallbackCabs` 此时无意义（调用方不得再用整表读数式计数，否则与品牌柜数双算）。
+      - managedByAlloc=False → 完全没录过柜数，只能退回「整表至少 1 柜」= `fallbackCabs`。
+      - `brandEntity={brand_id: entity_id}`：分摊行人工指定的报税主体（未指定则不在字典里）。
+
+    口径与 `cabinet_usage_by_meter` / `cabinet_records` 完全一致（同一 `_pick_cabinet`）。
+    """
+    conn = get_connection()
+    cur = get_dict_cursor(conn)
+    try:
+        conditions, values = [
+            "m.tag = '共享电表'", "m.brand_id IS NULL",
+            "m.landlord_id IS NOT NULL", "m.meter_no NOT LIKE 'TEST%%'",
+        ], []
+        if landlord_id:
+            conditions.append("m.landlord_id = %s"); values.append(landlord_id)
+        cur.execute(f"""
+            SELECT m.id, m.meter_no, m.landlord_id, m.entity_id,
+                   GREATEST(1, (SELECT COUNT(*) FROM cabinets cab WHERE cab.meter_id = m.id)) AS fallback_cabs
+            FROM meters m
+            WHERE {' AND '.join(conditions)}
+            ORDER BY m.id
+        """, values)
+        meters = cur.fetchall()
+
+        ac, av = ["a.cabinet_count IS NOT NULL"], []
+        if landlord_id:
+            ac.append("m2.landlord_id = %s"); av.append(landlord_id)
+        cur.execute(f"""
+            SELECT a.address, a.brand_id, a.month_period, a.cabinet_count, a.entity_id
+            FROM meter_shared_allocations a
+            JOIN meters m2 ON m2.meter_no = a.address
+            WHERE m2.tag = '共享电表' AND m2.brand_id IS NULL
+              AND m2.meter_no NOT LIKE 'TEST%%'
+              AND {' AND '.join(ac)}
+            ORDER BY a.address, a.brand_id, a.month_period
+        """, av)
+        alloc_rows = cur.fetchall()
+    finally:
+        cur.close()
+        conn.close()
+
+    hist, entity_by_brand = {}, {}
+    for r in alloc_rows:
+        addr = r["address"]
+        hist.setdefault(addr, {}).setdefault(int(r["brand_id"]), []).append(
+            (str(r["month_period"]), int(r["cabinet_count"]))
+        )
+        if r.get("entity_id") is not None:
+            entity_by_brand.setdefault(addr, {})[int(r["brand_id"])] = r["entity_id"]
+
+    out = []
+    for m in meters:
+        addr = m["meter_no"]
+        brand_cabs = {}
+        for bid, h in (hist.get(addr) or {}).items():
+            chosen = _pick_cabinet(h, period)
+            if chosen is not None:
+                brand_cabs[bid] = int(chosen)
+        out.append({
+            "meterId": m["id"],
+            "meterNo": addr,
+            "landlordId": m.get("landlord_id"),
+            "entityId": m.get("entity_id"),
+            "managedByAlloc": bool(brand_cabs),
+            "brandCabs": brand_cabs,
+            "brandEntity": entity_by_brand.get(addr) or {},
+            "fallbackCabs": int(m.get("fallback_cabs") or 1),
+        })
+    return out
+
+
+def cabinet_entity_by_brand(landlord_id: int = None, period: str = None) -> dict:
+    """共享电表分摊行人工指定的报税主体：{landlord_id: {brand_id: entity_id}}
+
+    未指定主体的分摊行不出现（调用方按「品牌方合同主体 → 共享表自身主体」兜底）。
+    """
+    out = {}
+    for item in shared_meter_cabinets(landlord_id=landlord_id, period=period):
+        lid = item.get("landlordId")
+        for bid, eid in (item.get("brandEntity") or {}).items():
+            out.setdefault(lid, {})[bid] = eid
+    return out

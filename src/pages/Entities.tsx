@@ -12,7 +12,8 @@ import { Button } from "@/components/ui/button";
 import { inputCls } from "@/components/fields";
 import * as XLSX from "xlsx";
 import { fmtMoney, fmtNum, fmtDate } from "@/lib/format";
-import { cabinetCounter, splitByAllocs } from "@/lib/alloc";
+import { cabinetCounter, splitByAllocs, buildSharedCabIndex, allocManagedMeterIds } from "@/lib/alloc";
+import { getSharedCabinetUsage } from "@/api/meterEnergy";
 import { Download, Search, ChevronDown, ChevronRight, FileText, Building2, DollarSign, Landmark, ExternalLink } from "lucide-react";
 import { toast } from "sonner";
 
@@ -30,6 +31,9 @@ export default function Entities() {
   const contracts = useQuery({ queryKey: ["contracts"], queryFn: () => listContracts() });
   const meters = useQuery({ queryKey: ["meters"], queryFn: () => listMeters() });
   const cabinets = useQuery({ queryKey: ["allCabinets"], queryFn: () => listCabinets() });
+  // 共享电表（场地总表）按品牌录入的柜数：各品牌在这类表下没有自己的电表，本地「数电表」取不到
+  const sharedCabsQ = useQuery({ queryKey: ["sharedCabinetUsage"], queryFn: () => getSharedCabinetUsage() });
+  const sharedCabIndex = useMemo(() => buildSharedCabIndex(sharedCabsQ.data?.meters), [sharedCabsQ.data]);
 
   const entityData = useMemo(() => {
     const entityList = entities.data ?? [];
@@ -46,17 +50,35 @@ export default function Entities() {
     const weightIncome = new Map<string, Map<number, number>>();   // "场地:品牌" -> 主体 -> 柜数
     const weightLandlord = new Map<number, Map<number, number>>(); // 场地 -> 主体 -> 柜数
     const cabsOf = cabinetCounter(cabinetList);
+    const addW = (map: Map<any, Map<number, number>>, key: any, eid: number, cabs: number) => {
+      const inner = map.get(key) ?? new Map<number, number>();
+      inner.set(eid, (inner.get(eid) || 0) + cabs);
+      map.set(key, inner);
+    };
     for (const m of meterList) {
-      if (!m.landlordId || m.entityId == null) continue;
-      if (!(m.brandId != null || m.tag === "共享电表")) continue;
+      if (!m.landlordId) continue;
+      const sharedItems = sharedCabIndex.get(m.landlordId);
+      const isSharedHost = m.tag === "共享电表" && m.brandId == null;
+      if (isSharedHost && allocManagedMeterIds(sharedItems).has(m.id)) {
+        // 该共享表已按品牌录柜数 → 柜数归到各品牌（报税主体：分摊行指定 → 电表主体）；
+        // 不能再按「整表 max(1,柜数)」计数，否则与品牌柜数双算（口径同后端 shared_allocation_repo）
+        for (const it of sharedItems ?? []) {
+          if (it.meterId !== m.id) continue;
+          for (const [bidStr, c] of Object.entries(it.brandCabs ?? {})) {
+            const cabs = Number(c || 0);
+            const eid = it.brandEntity?.[bidStr] ?? m.entityId;
+            if (!cabs || eid == null) continue;
+            addW(weightLandlord, m.landlordId, eid, cabs);
+            addW(weightIncome, `${m.landlordId}:${Number(bidStr)}`, eid, cabs);
+          }
+        }
+        continue;
+      }
+      if (m.entityId == null) continue;
+      if (!(m.brandId != null || isSharedHost)) continue;
       const cabs = cabsOf(m.id);
-      const lk = weightLandlord.get(m.landlordId) ?? new Map<number, number>();
-      lk.set(m.entityId, (lk.get(m.entityId) || 0) + cabs);
-      weightLandlord.set(m.landlordId, lk);
-      const bkey = `${m.landlordId}:${m.brandId ?? "shared"}`;
-      const bk = weightIncome.get(bkey) ?? new Map<number, number>();
-      bk.set(m.entityId, (bk.get(m.entityId) || 0) + cabs);
-      weightIncome.set(bkey, bk);
+      addW(weightLandlord, m.landlordId, m.entityId, cabs);
+      addW(weightIncome, `${m.landlordId}:${m.brandId ?? "shared"}`, m.entityId, cabs);
     }
     for (const c of contractList) {
       if (c.landlordId == null) { unattributedContracts.push(c); continue; }
@@ -238,7 +260,7 @@ export default function Entities() {
       }];
     }
     return result;
-  }, [entities.data, contracts.data, meters.data, cabinets.data, keyword]);
+  }, [entities.data, contracts.data, meters.data, cabinets.data, sharedCabIndex, keyword]);
 
   const toggleExpand = (id: number) => {
     setExpandedId(prev => prev === id ? null : id);

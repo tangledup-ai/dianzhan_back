@@ -13,6 +13,53 @@ export function cabinetCounter(cabinets: { meterId: number }[]): (meterId: numbe
 
 export type Alloc = { entityId: number; ratio: number };
 
+// ── 共享电表（场地总表）柜数：场地内各品牌没有自己的电表，「数电表」数不到它们的柜数 ──
+// 柜数只能取分摊行人工录入值（meter_shared_allocations.cabinet_count，按月）。
+// 与后端 contract_repo / dividend_calc / shared_allocation_repo 同口径：
+//   managedByAlloc=true  该表已按品牌录柜数 → 用 brandCabs，整表读数式的计数必须停用（否则双算）
+//   managedByAlloc=false 完全没录过 → 退回「整表 max(1, 柜子数)」= fallbackCabs，归共享组
+export type SharedCabItem = {
+  meterId: number;
+  landlordId?: number | null;
+  entityId: number | null;
+  managedByAlloc: boolean;
+  brandCabs: Record<string, number>;
+  brandEntity: Record<string, number>;
+  fallbackCabs: number;
+};
+
+export function buildSharedCabIndex(items: any[] | undefined): Map<number, SharedCabItem[]> {
+  const out = new Map<number, SharedCabItem[]>();
+  for (const it of items ?? []) {
+    if (it?.landlordId == null) continue;
+    const arr = out.get(it.landlordId) ?? [];
+    arr.push(it as SharedCabItem);
+    out.set(it.landlordId, arr);
+  }
+  return out;
+}
+
+export const sumObj = (o: Record<string, number> | undefined): number =>
+  Object.values(o ?? {}).reduce((s: number, v: any) => s + Number(v || 0), 0);
+
+/** 共享表按品牌录入的柜数：brandId=null 表示「全品牌/共享组」→ 各品牌录入值之和。
+ *  未录柜数的共享表不在这里统计（由「整表 max(1,柜数)」口径覆盖），避免双算。 */
+export function sharedCabsOf(items: SharedCabItem[] | undefined, brandId: number | null): number {
+  let n = 0;
+  for (const it of items ?? []) {
+    if (!it.managedByAlloc) continue;
+    n += brandId == null ? sumObj(it.brandCabs) : Number(it.brandCabs?.[String(brandId)] || 0);
+  }
+  return n;
+}
+
+/** 已按品牌录柜数的共享表 id：这些表不能再按「整表 max(1,柜数)」计数 */
+export function allocManagedMeterIds(items: SharedCabItem[] | undefined): Set<number> {
+  const s = new Set<number>();
+  for (const it of items ?? []) if (it.managedByAlloc) s.add(it.meterId);
+  return s;
+}
+
 const round2 = (x: number) => Math.round(x * 100) / 100;
 
 // 合同金额按主体分片：每片舍入到分，尾差（其余主体按比例舍入后的差额）归占比最大的主体，

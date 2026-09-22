@@ -15,9 +15,12 @@ import * as XLSX from "xlsx";
 import { fmtMoney, fmtNum, fmtDate, numOrNull } from "@/lib/format";
 import { Download, Plus, Search, Pencil, Trash2, AlertTriangle, FileText, ArrowDownCircle, ArrowUpCircle, ExternalLink, ChevronDown, ChevronRight, Upload, Landmark } from "lucide-react";
 import { groupByEntity } from "@/lib/groupColors";
-import { cabinetCounter, splitByAllocs } from "@/lib/alloc";
+import { cabinetCounter, splitByAllocs, buildSharedCabIndex, sharedCabsOf, allocManagedMeterIds } from "@/lib/alloc";
+import { getSharedCabinetUsage } from "@/api/meterEnergy";
 import { ContractSchedule } from "@/components/ContractSchedule";
 import { toast } from "sonner";
+
+// ── 共享电表（场地总表）柜数口径见 @/lib/alloc（contract_repo / dividend_calc 同口径）──
 
 // ── 拆期预检（与后端 contract_schedule_repo._split_periods 同一算法：按合同周年日推进）──
 const PERIOD_MONTHS: Record<string, number> = { "月付": 1, "季付": 3, "半年付": 6, "年付": 12 };
@@ -136,6 +139,9 @@ export default function Contracts() {
   const metersQ = useQuery({ queryKey: ["meters"], queryFn: () => listMeters() });
   // 柜子数据页面级加载：主体分组按「电表柜数」分摊需要它（GREATEST(1,柜数) 口径）
   const cabinetsQ = useQuery({ queryKey: ["allCabinets"], queryFn: () => listCabinets() });
+  // 共享电表按品牌人工录入的柜数（数电表数不到，需单独取）
+  const sharedCabsQ = useQuery({ queryKey: ["sharedCabinetUsage"], queryFn: () => getSharedCabinetUsage() });
+  const sharedCabIndex = useMemo(() => buildSharedCabIndex(sharedCabsQ.data?.meters), [sharedCabsQ.data]);
   const list = useQuery({
     queryKey: ["contracts", keyword, brandId, landlordId, contractType],
     queryFn: () => listContracts({
@@ -267,20 +273,44 @@ export default function Contracts() {
 
     // 电表主体权重（与主体损益表口径一致）：每块计费电表按 max(1, 实际柜数) 计
     const cabsOf = cabinetCounter(cabinetsQ.data ?? []);
+    // 品牌方合同主体：共享表下的品牌没有自己的电表，主体按「分摊行指定 → 品牌方合同 → 共享表主体」判定
+    const brandConEntity = new Map<string, number>();
+    for (const c of list.data ?? []) {
+      if (c.contractType === "品牌方合同" && c.brandId != null && c.landlordId != null && c.entityId != null) {
+        const k = `${c.landlordId}:${c.brandId}`;
+        if (!brandConEntity.has(k)) brandConEntity.set(k, c.entityId);
+      }
+    }
     const weightIncome = new Map<string, Map<number, number>>();   // "场地:品牌" -> 主体 -> 柜数
     const weightLandlord = new Map<number, Map<number, number>>(); // 场地 -> 主体 -> 柜数
+    const addWeight = (lid: number, bkey: string, entityId: number, cabs: number) => {
+      const lk = weightLandlord.get(lid) ?? new Map<number, number>();
+      lk.set(entityId, (lk.get(entityId) || 0) + cabs);
+      weightLandlord.set(lid, lk);
+      const bk = weightIncome.get(bkey) ?? new Map<number, number>();
+      bk.set(entityId, (bk.get(entityId) || 0) + cabs);
+      weightIncome.set(bkey, bk);
+    };
     for (const m of metersQ.data ?? []) {
       if (!m.landlordId || m.entityId == null) continue;
       if (!(m.brandId != null || m.tag === "共享电表")) continue;
       if (String(m.meterNo || "").startsWith("TEST")) continue;
-      const cabs = cabsOf(m.id);
-      const lk = weightLandlord.get(m.landlordId) ?? new Map<number, number>();
-      lk.set(m.entityId, (lk.get(m.entityId) || 0) + cabs);
-      weightLandlord.set(m.landlordId, lk);
-      const bkey = `${m.landlordId}:${m.brandId ?? "shared"}`;
-      const bk = weightIncome.get(bkey) ?? new Map<number, number>();
-      bk.set(m.entityId, (bk.get(m.entityId) || 0) + cabs);
-      weightIncome.set(bkey, bk);
+      // 已按品牌录柜数的共享表：柜数由分摊行提供（下方单独统计），此处跳过避免双算
+      if (m.brandId == null && allocManagedMeterIds(sharedCabIndex.get(m.landlordId)).has(m.id)) continue;
+      addWeight(m.landlordId, `${m.landlordId}:${m.brandId ?? "shared"}`, m.entityId, cabsOf(m.id));
+    }
+    // 共享表按品牌人工录入的柜数 → 归到品牌 / 场地主体权重
+    for (const [lid, items] of sharedCabIndex) {
+      for (const it of items) {
+        if (!it.managedByAlloc) continue;
+        for (const [b, cabs] of Object.entries(it.brandCabs ?? {})) {
+          if (!cabs) continue;
+          const bid = Number(b);
+          const eid = it.brandEntity?.[String(bid)] ?? brandConEntity.get(`${lid}:${bid}`) ?? it.entityId;
+          if (eid == null) continue;
+          addWeight(lid, `${lid}:${bid}`, eid, Number(cabs));
+        }
+      }
     }
 
     // 合同 → 主体分配：一律按电表柜数比例分摊（收入按品牌电表，成本按场地电表含共享表）；
@@ -337,7 +367,7 @@ export default function Contracts() {
       for (const c of g.incomeContracts) push(c, true);
     }
     return groupByEntity([...slices.values()]);
-  }, [groupedByLandlord, metersQ.data, entitiesQ.data, cabinetsQ.data]);
+  }, [groupedByLandlord, metersQ.data, entitiesQ.data, cabinetsQ.data, sharedCabIndex, list.data]);
 
   const doExport = () => {
     // 导出全部合同（按当前筛选），样式参考"共享合同监控表"：按合同类型分 sheet
@@ -849,6 +879,8 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
   const entities = useQuery({ queryKey: ["entities"], queryFn: listEntities, enabled: open });
   const meters = useQuery({ queryKey: ["meters"], queryFn: () => listMeters(), enabled: open });
   const cabinets = useQuery({ queryKey: ["allCabinets"], queryFn: () => listCabinets(), enabled: open });
+  const sharedCabsF = useQuery({ queryKey: ["sharedCabinetUsage"], queryFn: () => getSharedCabinetUsage(), enabled: open });
+  const sharedCabIndexF = useMemo(() => buildSharedCabIndex(sharedCabsF.data?.meters), [sharedCabsF.data]);
   const contracts = useQuery({ queryKey: ["contracts"], queryFn: () => listContracts(), enabled: open });
   const audit = useQuery({
     queryKey: ["contractAudit", record?.id],
@@ -858,15 +890,19 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
 
   // 计费柜数自动计算：匹配(场地方+品牌方)的电表，每块电表至少 1 柜（max(1, 实际柜子数)），
   // 排除 TEST 前缀电表——与后端 live_cabinets_count 口径一致；
-  // 收入合同不指定品牌（空 / "shared"）= 全品牌合同，匹配该场地的共享电表（无品牌且标签=共享电表）
+  // 收入合同不指定品牌（空 / "shared"）= 全品牌合同，匹配该场地的共享电表（无品牌且标签=共享电表）；
+  // 共享电表已按品牌录入柜数时，柜数取分摊行人工录入值（数电表数不到），不再按整表计数
   const autoCabinetCount = useMemo(() => {
     if (!f.landlordId || f.contractType !== "品牌方合同") return null;
     const isShared = !f.brandId || f.brandId === "shared";
-    // 找到匹配的电表
+    const sharedItems = sharedCabIndexF.get(Number(f.landlordId));
+    const allocMeters = allocManagedMeterIds(sharedItems);
+    // 找到匹配的电表（已按品牌录柜数的共享表交给分摊行数据统计）
     const matchedMeters = (meters.data ?? []).filter((m: any) =>
       m.landlordId === Number(f.landlordId)
       && (isShared ? (!m.brandId && m.tag === "共享电表") : m.brandId === Number(f.brandId))
       && !String(m.meterNo || "").startsWith("TEST")
+      && !(m.brandId == null && allocMeters.has(m.id))
     );
     const meterIds = new Set(matchedMeters.map((m: any) => m.id));
     // 这些电表下的实际柜子数
@@ -874,9 +910,10 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
     (cabinets.data ?? []).forEach((c: any) => {
       if (meterIds.has(c.meterId)) cabByMeter.set(c.meterId, (cabByMeter.get(c.meterId) || 0) + 1);
     });
-    // 每块电表至少计 1 柜
-    return matchedMeters.reduce((sum: number, m: any) => sum + Math.max(1, cabByMeter.get(m.id) || 0), 0);
-  }, [f.landlordId, f.brandId, f.contractType, meters.data, cabinets.data]);
+    // 每块电表至少计 1 柜 + 共享表按品牌录入的柜数
+    const base = matchedMeters.reduce((sum: number, m: any) => sum + Math.max(1, cabByMeter.get(m.id) || 0), 0);
+    return base + sharedCabsOf(sharedItems, isShared ? null : Number(f.brandId));
+  }, [f.landlordId, f.brandId, f.contractType, meters.data, cabinets.data, sharedCabIndexF]);
 
   // 该场地下所有收入合同（品牌方合同）的计费柜数总和（实时：与品牌方合同行同口径，
   // 优先后端实时统计 liveCabinetsCount，电表归属变更后自动跟随；存储 cabinetsCount 仅兜底）
@@ -909,18 +946,25 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
       .filter((c: any) => c.landlordId === landlordId && c.contractType === "场地合同")
       .reduce((sum: number, c: any) => sum + Number(c.monthlyRent || 0), 0);
 
-    // 2) 该场地下已归属品牌的电表 + 共享电表（排除 TEST 前缀，与后端 NOT LIKE 'TEST%' 一致）
+    // 2) 该场地下已归属品牌的电表 + 共享电表（排除 TEST 前缀，与后端 NOT LIKE 'TEST%' 一致）；
+    //    已按品牌录柜数的共享表由分摊行提供柜数，此处剔除避免与品牌柜数双算
+    const sharedItems = sharedCabIndexF.get(landlordId);
+    const allocMeters = allocManagedMeterIds(sharedItems);
     const siteMeters = (meters.data ?? []).filter(
-      (m: any) => m.landlordId === landlordId && (m.brandId != null || m.tag === "共享电表") && !String(m.meterNo || "").startsWith("TEST")
+      (m: any) => m.landlordId === landlordId && (m.brandId != null || m.tag === "共享电表")
+        && !String(m.meterNo || "").startsWith("TEST")
+        && !(m.brandId == null && allocMeters.has(m.id))
     );
 
-    // 3) 本合同覆盖柜数 / 该场地总柜数（每块表按 max(1, 实际柜数) 计，与后端、合同页分组同口径）
+    // 3) 本合同覆盖柜数 / 该场地总柜数（自有表按 max(1,实际柜数)；共享表按分摊行录入柜数）
     const cabsOf = cabinetCounter(cabinets.data ?? []);
     const liveCabs = (isShared
       ? siteMeters.filter((m: any) => !m.brandId)
       : siteMeters.filter((m: any) => m.brandId === brandId)
-    ).reduce((s: number, m: any) => s + cabsOf(m.id), 0);
-    const totalCabs = siteMeters.reduce((s: number, m: any) => s + cabsOf(m.id), 0);
+    ).reduce((s: number, m: any) => s + cabsOf(m.id), 0)
+      + sharedCabsOf(sharedItems, brandId);
+    const totalCabs = siteMeters.reduce((s: number, m: any) => s + cabsOf(m.id), 0)
+      + sharedCabsOf(sharedItems, null);
 
     // 无场地合同（月租合计 0）与 无电表可分摊（总柜数 0）是两种不同情况，展示时区分提示
     const value = venueMonthlyRent > 0 && totalCabs > 0
@@ -929,7 +973,7 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
     // 每柜成本（3 位小数，仅展示）：场地月租 ÷ 总柜数
     const unitCost = venueMonthlyRent > 0 && totalCabs > 0 ? venueMonthlyRent / totalCabs : null;
     return { venueMonthlyRent, liveCabs, totalCabs, value, unitCost };
-  }, [f.landlordId, f.brandId, f.contractType, contracts.data, meters.data, cabinets.data]);
+  }, [f.landlordId, f.brandId, f.contractType, contracts.data, meters.data, cabinets.data, sharedCabIndexF]);
   const venueCostLive = venueCostInfo?.value ?? null;
 
   // 当使用"按柜子数量"方式时，自动计算场地月租金，并同步年租金 = 月租金 × 12

@@ -766,7 +766,7 @@ function ExpandedDetail({ landlordId, meters, period, summary, landlordName }: {
                 </thead>
                 <tbody>
                   {breakdown.map((sb: any) => (
-                    <tr key={sb.brandId ?? sb.stationId} className="border-b last:border-0">
+                    <tr key={sb.brandId ?? sb.stationId ?? "__shared__"} className="border-b last:border-0">
                       <td className="px-2.5 py-1.5 font-medium">{sb.brandName || sb.stationName || "未分配品牌"}</td>
                       <td className="px-2.5 py-1.5 text-right tabular-nums">{sb.meterCount}</td>
                       <td className="px-2.5 py-1.5 text-right tabular-nums">{fmtNum(sb.kwh)}</td>

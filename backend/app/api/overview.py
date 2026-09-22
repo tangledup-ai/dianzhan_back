@@ -11,6 +11,40 @@ def _entity_group_name(c: dict) -> str:
     return c.get("entity_name") or (c.get("pay_entity") or "").strip() or "未指定主体"
 
 
+def _shared_cab_weights(period: str, brand_entity_map: dict = None, allowed=None) -> tuple:
+    """共享电表「已按品牌录柜数」的柜数权重：((landlord, brand) -> {entity_id: cabs}, landlord -> {entity_id: cabs})
+
+    场地总表（tag='共享电表' 且 brand_id 为空）下各品牌没有自己的电表，「数电表」数不到它们，
+    柜数只能取分摊行人工录入值（`meter_shared_allocations.cabinet_count`，按月取值、逐月可调）。
+
+    ⚠️ 调用方在统计整场地柜数时**必须排除**这些已录柜数的共享表，否则整表计数会与品牌柜数双算。
+
+    归属主体优先级：分摊行指定 → 品牌方合同主体（brand_entity_map）→ 共享表自身主体。
+    """
+    from ..repositories import shared_allocation_repo
+    from ..infra.period import to_compact
+
+    period6 = to_compact(period) if period else None
+    if not period6:
+        return {}, {}
+    brand_entity_map = brand_entity_map or {}
+    wb, wl = {}, {}
+    for item in shared_allocation_repo.shared_meter_cabinets(period=period6):
+        lid = item.get("landlordId")
+        if lid is None or (allowed is not None and lid not in allowed):
+            continue
+        if not item.get("managedByAlloc"):
+            continue  # 完全没录过柜数 → 由 SQL 侧按「整表至少 1 柜」兜底
+        brand_entity = item.get("brandEntity") or {}
+        for bid, cabs in (item.get("brandCabs") or {}).items():
+            eid = brand_entity.get(bid) or brand_entity_map.get((lid, bid)) or item.get("entityId")
+            wb.setdefault((lid, bid), {})
+            wb[(lid, bid)][eid] = wb[(lid, bid)].get(eid, 0.0) + float(cabs)
+            wl.setdefault(lid, {})
+            wl[lid][eid] = wl[lid].get(eid, 0.0) + float(cabs)
+    return wb, wl
+
+
 @router.get("")
 async def overview(request: Request):
     """经营总览 API（股东账号只统计其关联场地的数据）- 热重载测试"""
@@ -560,13 +594,17 @@ async def monthly_detail(request: Request, period: str = None):
         rent_profit = round(rent_income - rent_cost - rent_tax, 2)
 
         # 电表柜数权重（主体归属：与主体损益表同口径；每块计费电表至少 1 柜）
+        # 已按品牌录柜数的共享电表必须排除（其柜数按品牌/主体归属，见下方叠加），否则整表计数双算
         cur.execute(f"""
             SELECT m.landlord_id, m.entity_id, m.brand_id,
                    COALESCE(SUM(GREATEST(1, cab.cnt)), 0) AS cabs
             FROM meters m
             LEFT JOIN LATERAL (SELECT COUNT(*) AS cnt FROM cabinets cab WHERE cab.meter_id = m.id) cab ON TRUE
             WHERE m.landlord_id IS NOT NULL AND m.meter_no NOT LIKE 'TEST%%'
-              AND (m.brand_id IS NOT NULL OR m.tag = '共享电表')
+              AND (m.brand_id IS NOT NULL
+                   OR (m.tag = '共享电表' AND m.brand_id IS NULL AND NOT EXISTS (
+                         SELECT 1 FROM meter_shared_allocations sa
+                         WHERE sa.address = m.meter_no AND sa.cabinet_count IS NOT NULL)))
               {'AND m.landlord_id = ANY(%s::int[])' if allowed is not None else ''}
             GROUP BY m.landlord_id, m.entity_id, m.brand_id
         """, (allowed,) if allowed is not None else ())
@@ -578,6 +616,22 @@ async def monthly_detail(request: Request, period: str = None):
             weights_brand[(r["landlord_id"], r["brand_id"])][r["entity_id"]] += cabs
             weights_ll.setdefault(r["landlord_id"], {}).setdefault(r["entity_id"], 0.0)
             weights_ll[r["landlord_id"]][r["entity_id"]] += cabs
+
+        # 共享电表按品牌录入的柜数：归到「品牌 → 报税主体」，与合同页/分红同口径
+        brand_entity_of = {}
+        for c in rent_income_contracts:
+            _lid, _bid, _eid = c.get("landlord_id"), c.get("brand_id"), c.get("entity_id")
+            if _bid is not None and _eid is not None:
+                brand_entity_of.setdefault((_lid, _bid), _eid)
+        _wb, _wl = _shared_cab_weights(month_compact, brand_entity_of, allowed)
+        for _k, _emap in _wb.items():
+            weights_brand.setdefault(_k, {})
+            for _eid, _c in _emap.items():
+                weights_brand[_k][_eid] = weights_brand[_k].get(_eid, 0.0) + _c
+        for _lid, _emap in _wl.items():
+            weights_ll.setdefault(_lid, {})
+            for _eid, _c in _emap.items():
+                weights_ll[_lid][_eid] = weights_ll[_lid].get(_eid, 0.0) + _c
         cur.execute("SELECT id, name FROM entities")
         entity_names = {r["id"]: r["name"] for r in cur.fetchall()}
 
@@ -780,7 +834,7 @@ async def station_board(request: Request, landlordId: int = None, keyword: str =
                     brand_names[b["id"]] = b["name"]
 
             # 从合同计算场地成本（租金 = Σ 场地合同月租）和电费单价（#2 统一口径）
-            from ..domain.electricity_pricing import resolve_prices, split_tax
+            from ..domain.electricity_pricing import resolve_prices, split_tax, brand_price_for
             rent_cost = 0       # 场地合同月租金合计（= 该场地所有合同金额加和 = 成本）
             for c in contracts:
                 if c["contract_type"] == "场地合同" and c["monthly_rent"]:
@@ -819,18 +873,85 @@ async def station_board(request: Request, landlordId: int = None, keyword: str =
                 station_breakdown.sort(key=lambda x: -x["kwh"])
                 total_kwh = sum(float(a["kwh"]) for a in station_breakdown)
 
-            # 电费成本 = 度数 × 场地合同电费单价
+            # ── 共享电表（场地总表）并入电费口径 ──────────────────────────────
+            # 品牌方在这类表下没有自己的电表，「数电表」取不到它们的电量，必须单独补上：
+            #   付款侧：付场地方 = 整表读数 × 场地单价（亏空/线损由我方承担，与台账/分红同口径）
+            #   收款侧：已录品牌分摊 → 人工录入应收电费；未录分摊 → 整表读数 × 全品牌合同单价
+            # 同一品牌若既有自有电表又在共享表有分摊，两处电量合并成一行，不产生重复品牌行。
+            _sb_index = {a.get("brand_id"): a for a in station_breakdown}
+
+            def _merge_brand_row(bid, brand_name, entity_id, kwh_add, alloc_amount=None):
+                row = _sb_index.get(bid)
+                if row is None:
+                    row = {
+                        "brand_id": bid,
+                        "brand_name": brand_name or (f"品牌#{bid}" if bid is not None else "全品牌共享"),
+                        "entity_id": entity_id,
+                        "kwh": 0.0,
+                        "meter_count": 0,
+                        "alloc_amount": None,
+                    }
+                    station_breakdown.append(row)
+                    _sb_index[bid] = row
+                row["kwh"] = round(float(row["kwh"]) + float(kwh_add), 2)
+                if alloc_amount is not None:
+                    row["alloc_amount"] = round(float(row.get("alloc_amount") or 0) + float(alloc_amount), 2)
+
+            if period:
+                from ..repositories import shared_allocation_repo as _shared_repo
+                _month_period = period.replace("-", "")
+                cur.execute("""
+                    SELECT m.id, m.meter_no, m.entity_id,
+                           COALESCE(mm.actual_kwh, ROUND(mm.kwh * COALESCE(m.transformer_ratio, 1), 2)) AS kwh
+                    FROM meters m
+                    LEFT JOIN meter_monthly mm ON mm.address = m.meter_no AND mm.month_period = %s
+                    WHERE m.landlord_id = %s AND m.tag = '共享电表' AND m.brand_id IS NULL
+                      AND m.meter_no NOT LIKE 'TEST%%'
+                    ORDER BY m.id
+                """, (_month_period, lid))
+                _alloc_by_meter = _shared_repo.list_allocations_by_period(_month_period)
+                for sm in cur.fetchall():
+                    full = float(sm["kwh"] or 0)      # 整表实际用电量 = 付款口径
+                    total_kwh += full
+                    allocs = _alloc_by_meter.get(sm["meter_no"]) or []
+                    if allocs:
+                        # 品牌倒推电量合计 → 亏空按电量比例摊入各品牌付款电量（与台账完全一致）
+                        picked, alloc_sum = [], 0.0
+                        for a in allocs:
+                            eid_a = a.get("entity_id") or sm.get("entity_id")
+                            price_a = a.get("unit_price")
+                            if price_a is None:
+                                info_a = brand_price_for(pricing, a["brand_id"], eid_a)
+                                price_a = info_a["price"] if info_a else None
+                            kwh_a = round(float(a.get("collect_amount") or 0) / float(price_a), 2) if price_a else 0.0
+                            picked.append((a, eid_a, kwh_a))
+                            alloc_sum += kwh_a
+                        scale = (full / alloc_sum) if (full > 0 and alloc_sum > 0) else 1.0
+                        for a, eid_a, kwh_a in picked:
+                            _merge_brand_row(a["brand_id"], a.get("brand_name"), eid_a,
+                                             round(kwh_a * scale, 2),
+                                             float(a.get("collect_amount") or 0))
+                    else:
+                        # 未录分摊：整表电量归「全品牌共享」行，收款走全品牌合同单价
+                        _merge_brand_row(None, "全品牌共享", sm.get("entity_id"), full)
+                station_breakdown.sort(key=lambda x: -float(x.get("kwh") or 0))
+
+            # 电费成本 = 付款口径总电量（含共享表整表读数）× 场地合同电费单价
             elec_pay = total_kwh * elec_pay_price if elec_pay_price else 0
 
-            # 电费收入（#2 统一口径：按品牌各算各的——品牌度数 × 该品牌方合同单价；
-            # 收入统一为不含税（启用税率的品牌 split_tax 拆分），税费独立展示，不混入利润，与台账/分红一致）
+            # 电费收入（#2 统一口径：品牌各算各的；共享表品牌分摊以人工录入金额为准，
+            # 收入统一为不含税（启用税率的品牌 split_tax 拆分），与台账/分红一致）
             def _station_collect(sb):
+                eid = sb.get("entity_id")
                 bid = sb.get("brand_id")
-                info = pricing["brand_prices"].get(int(bid)) if bid is not None else None
-                if not info:
-                    return 0.0
-                gross = round(float(sb.get("kwh") or 0) * float(info.get("price") or 0), 2)
-                if info.get("tax_enabled") and info.get("post_tax"):
+                info = brand_price_for(pricing, bid, eid)
+                if sb.get("alloc_amount") is not None:
+                    gross = round(float(sb["alloc_amount"]), 2)
+                else:
+                    if not info or info.get("price") is None:
+                        return 0.0
+                    gross = round(float(sb.get("kwh") or 0) * float(info["price"]), 2)
+                if info and info.get("tax_enabled") and info.get("post_tax"):
                     _, net = split_tax(gross, info.get("tax_rate"))
                     return round(net, 2)
                 return gross
@@ -1135,6 +1256,23 @@ async def landlord_station_monthly(request: Request, landlordId: int, months: in
         """, (landlordId,))
         brands = cur.fetchall()
 
+        # 共享电表品牌分摊行里出现的品牌也要进趋势图：该品牌方在这类表下没有自己的电表，
+        # 「数电表」不会把它带出来，但它在共享表上有分摊份额（否则趋势图会漏掉整个品牌）。
+        cur.execute("""
+            SELECT DISTINCT a.brand_id, b.name AS brand_name
+            FROM meter_shared_allocations a
+            JOIN meters m ON m.meter_no = a.address
+            LEFT JOIN brands b ON b.id = a.brand_id
+            WHERE m.landlord_id = %s AND m.tag = '共享电表' AND m.brand_id IS NULL
+              AND a.brand_id IS NOT NULL
+        """, (landlordId,))
+        _known_bids = {b["brand_id"] for b in brands}
+        for r in cur.fetchall():
+            if r["brand_id"] not in _known_bids:
+                brands.append(r)
+                _known_bids.add(r["brand_id"])
+        brands.sort(key=lambda x: (x["brand_id"] is None, x["brand_id"] or 0))
+
         # 获取合同（含租金首月/退款字段，供按月度口径计算）
         cur.execute("""
             SELECT contract_type, electricity_price, monthly_rent, brand_id,
@@ -1169,15 +1307,60 @@ async def landlord_station_monthly(request: Request, landlordId: int, months: in
         """, (landlordId,))
         all_rows = cur.fetchall()
 
-        # 按月分组：月 → 品牌 → {kwh}
+        # 按月分组：月 → 品牌 → {kwh, own_kwh, alloc_amount}
+        #   kwh          = 付款口径电量（自有电表 + 共享表品牌分摊摊入的整表电量）
+        #   own_kwh      = 自有电表电量（收款口径基准）
+        #   alloc_amount = 共享表品牌分摊人工录入的应收电费（含税）
         month_map: dict = {}
         for r in all_rows:
             mp = r["month_period"]
             bid = r["brand_id"]
-            if mp not in month_map:
-                month_map[mp] = {}
-            cell = month_map[mp].setdefault(bid, {"kwh": 0.0})
+            cell = month_map.setdefault(mp, {}).setdefault(
+                bid, {"kwh": 0.0, "own_kwh": 0.0, "alloc_amount": None})
             cell["kwh"] += float(r["kwh"] or 0)
+            cell["own_kwh"] += float(r["kwh"] or 0)
+
+        # ── 共享电表（场地总表）并入：品牌方在这类表下没有自己的电表，电量只能取分摊行倒推；
+        #    付款按整表读数摊入（亏空/线损我方承担），与台账/分红同口径。未录分摊的表不归任何品牌。
+        from ..repositories import shared_allocation_repo as _shared_repo
+        from ..domain.electricity_pricing import brand_price_for as _brand_price_for
+        cur.execute("""
+            SELECT m.meter_no, m.entity_id, mm.month_period,
+                   COALESCE(mm.actual_kwh, ROUND(mm.kwh * COALESCE(m.transformer_ratio, 1), 2)) AS kwh
+            FROM meters m
+            LEFT JOIN meter_monthly mm ON mm.address = m.meter_no
+            WHERE m.landlord_id = %s AND m.tag = '共享电表' AND m.brand_id IS NULL
+              AND m.meter_no NOT LIKE 'TEST%%'
+        """, (landlordId,))
+        shared_full: dict = {}   # (meter_no, month_period) -> 整表实际用电量
+        shared_meta: dict = {}   # meter_no -> 共享表自身主体
+        for r in cur.fetchall():
+            shared_meta[r["meter_no"]] = r.get("entity_id")
+            if r["month_period"]:
+                shared_full[(r["meter_no"], str(r["month_period"]))] = float(r["kwh"] or 0)
+        if shared_meta:
+            alloc_by_meter_month: dict = {}
+            for a in _shared_repo.list_allocations():
+                if a["address"] in shared_meta:
+                    alloc_by_meter_month.setdefault(
+                        (a["address"], str(a["month_period"])), []).append(a)
+            for (addr, mp), allocs in alloc_by_meter_month.items():
+                full = shared_full.get((addr, mp), 0.0)
+                picked, alloc_sum = [], 0.0
+                for a in allocs:
+                    eid_a = a.get("entity_id") or shared_meta.get(addr)
+                    info_a = _brand_price_for(pricing, a["brand_id"], eid_a)
+                    price_a = a.get("unit_price") or (info_a["price"] if info_a else None)
+                    kwh_a = round(float(a.get("collect_amount") or 0) / float(price_a), 2) if price_a else 0.0
+                    picked.append((a, kwh_a))
+                    alloc_sum += kwh_a
+                scale = (full / alloc_sum) if (full > 0 and alloc_sum > 0) else 1.0
+                for a, kwh_a in picked:
+                    cell = month_map.setdefault(mp, {}).setdefault(
+                        a["brand_id"], {"kwh": 0.0, "own_kwh": 0.0, "alloc_amount": None})
+                    cell["kwh"] += round(kwh_a * scale, 2)
+                    cell["alloc_amount"] = round(
+                        float(cell["alloc_amount"] or 0) + float(a.get("collect_amount") or 0), 2)
 
         recent_months = sorted(month_map.keys(), reverse=True)[:months]
         recent_months.reverse()
@@ -1195,13 +1378,15 @@ async def landlord_station_monthly(request: Request, landlordId: int, months: in
             brand_profits = []
             for b in brands:
                 bid = b["brand_id"]
-                cell = brand_data.get(bid, {"kwh": 0.0})
-                kwh = float(cell["kwh"])
+                cell = brand_data.get(bid) or {"kwh": 0.0, "own_kwh": 0.0, "alloc_amount": None}
+                kwh = float(cell.get("kwh") or 0)          # 付款口径电量（含共享表摊入）
+                own_kwh = float(cell.get("own_kwh") or 0)  # 自有电表电量
                 ep = round(kwh * elec_pay_price, 2)
-                ec = round(
-                    float(kwh) * (pricing["brand_prices"].get(int(bid), {}).get("price") or 0),
-                    2
-                )
+                own_price = (pricing["brand_prices"].get(int(bid)) or {}).get("price") if bid is not None else None
+                ec = round(own_kwh * float(own_price or 0), 2)
+                if cell.get("alloc_amount") is not None:
+                    # 共享表品牌分摊：收入以人工录入应收为准（与台账一致）
+                    ec = round(ec + float(cell["alloc_amount"]), 2)
                 eprofit = round(ec - ep, 2)
                 # 租金利润按品牌均摊（场地合同是整场地成本，品牌方合同按品牌归属）
                 rent_profit_per_brand = round(rent_profit_total / brand_count, 2)
@@ -1330,13 +1515,17 @@ async def entity_monthly(request: Request, period: str = None):
         elec_rows = cur.fetchall()
 
         # 2) 柜数权重：每块计费电表至少 1 柜（与分红分摊同口径）
+        # 已按品牌录柜数的共享电表排除整表计数（其柜数按品牌/主体归属，见下方叠加）
         cur.execute(f"""
             SELECT m.landlord_id, m.entity_id, m.brand_id,
                    COALESCE(SUM(GREATEST(1, cab.cnt)), 0) AS cabs
             FROM meters m
             LEFT JOIN LATERAL (SELECT COUNT(*) AS cnt FROM cabinets cab WHERE cab.meter_id = m.id) cab ON TRUE
             WHERE m.landlord_id IS NOT NULL AND m.meter_no NOT LIKE 'TEST%%'
-              AND (m.brand_id IS NOT NULL OR m.tag = '共享电表'){scope_cond.replace('landlord_id', 'm.landlord_id')}
+              AND (m.brand_id IS NOT NULL
+                   OR (m.tag = '共享电表' AND m.brand_id IS NULL AND NOT EXISTS (
+                         SELECT 1 FROM meter_shared_allocations sa
+                         WHERE sa.address = m.meter_no AND sa.cabinet_count IS NOT NULL))){scope_cond.replace('landlord_id', 'm.landlord_id')}
             GROUP BY m.landlord_id, m.entity_id, m.brand_id
         """, tuple(scope_vals))
         weight_rows = cur.fetchall()
@@ -1358,6 +1547,22 @@ async def entity_monthly(request: Request, period: str = None):
         """)
         contracts = [c for c in cur.fetchall() if _covers_period(c, period)
                      and (allowed is None or c["landlord_id"] in allowed)]
+
+        # 2.5) 共享电表按品牌录入的柜数 → 归到「品牌 → 报税主体」（与合同页/分红同口径）
+        _brand_entity_of = {}
+        for _c in contracts:
+            _lid, _bid, _eid = _c.get("landlord_id"), _c.get("brand_id"), _c.get("entity_id")
+            if _bid is not None and _eid is not None:
+                _brand_entity_of.setdefault((_lid, _bid), _eid)
+        _wb, _wl = _shared_cab_weights(period, _brand_entity_of, allowed)
+        for _k, _emap in _wb.items():
+            weights_brand.setdefault(_k, {})
+            for _eid, _c_ in _emap.items():
+                weights_brand[_k][_eid] = weights_brand[_k].get(_eid, 0.0) + _c_
+        for _lid, _emap in _wl.items():
+            weights_ll.setdefault(_lid, {})
+            for _eid, _c_ in _emap.items():
+                weights_ll[_lid][_eid] = weights_ll[_lid].get(_eid, 0.0) + _c_
 
         # 4) 运营费用（该月全部行）
         cur.execute(f"""

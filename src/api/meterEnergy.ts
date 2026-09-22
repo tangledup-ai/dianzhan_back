@@ -60,7 +60,15 @@ export interface SharedAllocationRow {
   unitPrice?: number | null;
   /** 该品牌当月在此共享表下投放的电柜数量（逐月可调；留空 = 未填） */
   cabinetCount?: number | null;
+  /** 该品牌电柜的报税公司主体；留空 = 默认（整场地口径，取共享电表自身主体） */
+  entityId?: number | null;
   remark?: string | null;
+}
+
+export interface SharedAllocationBrandEntity {
+  entityId: number;
+  entityName: string;
+  entityFullName?: string;
 }
 
 export interface SharedAllocationForm {
@@ -72,6 +80,10 @@ export interface SharedAllocationForm {
   sharedPrice: number | null;
   brands: SharedAllocationBrandOption[];
   allBrands: { brandId: number; brandName: string }[];
+  /** 可选报税主体列表 */
+  allEntities?: SharedAllocationBrandEntity[];
+  /** 默认报税主体 = 整场地口径（共享电表自身主体） */
+  defaultEntityId?: number | null;
   allocations: {
     brandId: number;
     brandName: string;
@@ -83,12 +95,36 @@ export interface SharedAllocationForm {
     kwh: number | null;
     collectNet: number;
     cabinetCount: number | null;
+    entityId?: number | null;
+    entityName?: string | null;
     remark?: string | null;
   }[];
   periods: string[];
   /** 电柜数量默认值：该品牌最近一次填写值，键为 brandId 字符串 */
   cabinetDefaults?: Record<string, { count: number; monthPeriod: string }>;
 }
+
+// 共享电表柜数明细（合同页实时计算计费柜数用）
+export interface SharedCabinetUsageItem {
+  meterId: number;
+  meterNo: string;
+  landlordId: number | null;
+  entityId: number | null;
+  /** true = 该表已按品牌录入柜数；false = 完全没录过，只能按整表兜底（max(1, 柜子数)） */
+  managedByAlloc: boolean;
+  /** brandId(字符串键经 JSON 后) → 柜数 */
+  brandCabs: Record<string, number>;
+  /** brandId → 分摊行人工指定的报税主体 */
+  brandEntity: Record<string, number>;
+  fallbackCabs: number;
+}
+
+// 共享电表柜数明细（不传 landlordId 返回全部）
+export const getSharedCabinetUsage = (params?: { landlordId?: number; period?: string }):
+  Promise<{ period: string | null; meters: SharedCabinetUsageItem[] }> =>
+  client.get<{ period: string | null; meters: SharedCabinetUsageItem[] }>(
+    "/meter-energy/shared-cabinet-usage", { params }).then(r => r.data);
+
 
 // 共享电表品牌分摊录入数据（电表信息 + 候选品牌单价 + 已录入分摊）
 export const getSharedAllocationForm = (params: { meterNo: string; monthPeriod: string }) =>

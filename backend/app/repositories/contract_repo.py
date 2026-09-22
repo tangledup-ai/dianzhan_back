@@ -55,9 +55,13 @@ def list_contracts(brand_id: int = None, landlord_id: int = None, station_id: in
                     AND m.meter_no NOT LIKE 'TEST%%'
                     AND (
                       (c.brand_id IS NOT NULL AND m.brand_id = c.brand_id)
-                      -- 全品牌收入合同（无品牌）：匹配该场地的共享电表
+                      -- 全品牌收入合同（无品牌）：匹配该场地的共享电表；
+                      -- 该共享表已按品牌录入分摊柜数时不再按整表计（柜数由分摊行提供，见下方归集）
                       OR (c.contract_type = '品牌方合同' AND c.brand_id IS NULL
-                          AND m.brand_id IS NULL AND m.tag = '共享电表')
+                          AND m.brand_id IS NULL AND m.tag = '共享电表'
+                          AND NOT EXISTS (SELECT 1 FROM meter_shared_allocations sa
+                                          WHERE sa.address = m.meter_no
+                                            AND sa.cabinet_count IS NOT NULL))
                     )
                 ) t
               ) AS live_cabinets_count,
@@ -70,7 +74,11 @@ def list_contracts(brand_id: int = None, landlord_id: int = None, station_id: in
                   SELECT m.id, (SELECT COUNT(*) FROM cabinets cab WHERE cab.meter_id = m.id) AS cab_cnt
                   FROM meters m
                   WHERE m.landlord_id = c.landlord_id
-                    AND (m.brand_id IS NOT NULL OR m.tag = '共享电表')
+                    AND (m.brand_id IS NOT NULL
+                         OR (m.tag = '共享电表'
+                             AND NOT EXISTS (SELECT 1 FROM meter_shared_allocations sa
+                                             WHERE sa.address = m.meter_no
+                                               AND sa.cabinet_count IS NOT NULL)))
                     AND m.meter_no NOT LIKE 'TEST%%'
                 ) t
               ) AS total_brand_cabinets,
@@ -92,6 +100,9 @@ def list_contracts(brand_id: int = None, landlord_id: int = None, station_id: in
                       )
                       OR (
                         m.brand_id IS NULL AND m.tag = '共享电表'
+                        AND NOT EXISTS (SELECT 1 FROM meter_shared_allocations sa
+                                        WHERE sa.address = m.meter_no
+                                          AND sa.cabinet_count IS NOT NULL)
                         AND EXISTS (
                           SELECT 1 FROM contracts v2
                           WHERE v2.landlord_id = c.landlord_id
@@ -110,6 +121,58 @@ def list_contracts(brand_id: int = None, landlord_id: int = None, station_id: in
             ORDER BY c.landlord_id, c.contract_type, c.id
         """, values)
         rows = cur.fetchall()
+
+        # ── 共享电表（场地总表）按品牌人工录入的柜数：不在 meters→cabinets 里，SQL 数不到 ──
+        # 龙泉路这类「整个场地只有一块共享表」的场景，品牌方合同没有自己的电表，
+        # 计费柜数只能来自分摊行录入值（meter_shared_allocations.cabinet_count，按月，取最近一次）。
+        if rows:
+            from . import shared_allocation_repo
+            shared_meters = shared_allocation_repo.shared_meter_cabinets()
+            site_brand_cabs, site_fallback_cabs = {}, {}
+            for item in shared_meters:
+                lid = item.get("landlordId")
+                if lid is None:
+                    continue
+                if item.get("managedByAlloc"):
+                    bucket = site_brand_cabs.setdefault(lid, {})
+                    for bid, cabs in (item.get("brandCabs") or {}).items():
+                        bucket[bid] = bucket.get(bid, 0) + cabs
+                else:
+                    site_fallback_cabs[lid] = site_fallback_cabs.get(lid, 0) + int(item.get("fallbackCabs") or 1)
+
+            # 场地级：有品牌的合同集合 / 是否存在全品牌合同（用于 income_cabinets_total 归集）
+            brands_with_contract, has_full_brand_contract = {}, {}
+            for r in rows:
+                if r.get("contract_type") != "品牌方合同" or r.get("landlord_id") is None:
+                    continue
+                lid = r["landlord_id"]
+                if r.get("brand_id") is None:
+                    has_full_brand_contract[lid] = True
+                else:
+                    brands_with_contract.setdefault(lid, set()).add(r["brand_id"])
+
+            for r in rows:
+                lid = r.get("landlord_id")
+                if lid is None:
+                    continue
+                brand_cabs = site_brand_cabs.get(lid, {})
+                fallback = site_fallback_cabs.get(lid, 0)
+                if r.get("contract_type") == "品牌方合同":
+                    if r.get("brand_id") is not None:
+                        r["live_cabinets_count"] = int(r.get("live_cabinets_count") or 0) + brand_cabs.get(r["brand_id"], 0)
+                    else:
+                        # 全品牌合同：覆盖本场地全部品牌柜数 + 未录柜数共享表的兜底
+                        r["live_cabinets_count"] = int(r.get("live_cabinets_count") or 0) \
+                            + sum(brand_cabs.values()) + fallback
+                # 场地总柜数：自有电表 + 共享表按品牌录入 + 未录柜数的共享表兜底（整表至少 1 柜）
+                r["total_brand_cabinets"] = int(r.get("total_brand_cabinets") or 0) \
+                    + sum(brand_cabs.values()) + fallback
+                # 收入侧总柜数：仅统计「有品牌方合同覆盖」的柜数（含全品牌合同对兜底共享表的覆盖）
+                income_extra = sum(c for bid, c in brand_cabs.items()
+                                   if bid in brands_with_contract.get(lid, set()))
+                if has_full_brand_contract.get(lid):
+                    income_extra += fallback
+                r["income_cabinets_total"] = int(r.get("income_cabinets_total") or 0) + income_extra
 
         # 批量查询所有合同的分期状态（用于推导付款状态：全部分期已付→已付款，否则未付款）
         if rows:
