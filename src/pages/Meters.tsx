@@ -5,8 +5,8 @@ import { listContracts } from "@/api/contracts";
 import { listCabinets, createCabinet, updateCabinet, deleteCabinet } from "@/api/cabinets";
 import { listBrands, listLandlords, listEntities } from "@/api/directory";
 import { generateElectricity } from "@/api/electricity";
-import { triggerSync, saveMeterReading, getMeterReadings, getSharedAllocationForm, saveSharedAllocations, getSharedCabinetUsage, type SharedCabinetUsageItem } from "@/api/meterEnergy";
-import { StatusBadge } from "@/components/Stat";
+import { triggerSync, saveMeterReading, getMeterReadings, getMonthlyKwh, getSharedAllocationForm, saveSharedAllocations, getSharedCabinetUsage, type SharedCabinetUsageItem } from "@/api/meterEnergy";
+import "@/components/excel-table.css";   // ★ Excel 风表格样式（仅本页/场租台账/电费台账使用）
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Switch } from "@/components/ui/switch";
@@ -14,9 +14,37 @@ import { Field, NumInput, TextInput, SelectInput, SearchSelect, inputCls } from 
 import { exportXlsx } from "@/lib/export";
 import { fmtNum, fmtMoney } from "@/lib/format";
 import { toCompact, toDisplay } from "@/lib/period";
-import { Download, Search, Plus, Pencil, Trash2, Gauge, ChevronDown, ChevronRight, RefreshCw, BookOpen, Upload } from "lucide-react";
+import { Download, Search, Plus, Pencil, Trash2, ChevronDown, ChevronRight, RefreshCw, BookOpen, Upload } from "lucide-react";
 import { toast } from "sonner";
 import { useAuth } from "@/providers/auth";
+
+// ─── ★V5：电表大类 与「是否所有品牌共用一个表」彻底解耦 ───
+//   categoryCode = 电表大类（= 分给哪个财务管的标签，**不参与任何算法**）
+//   isShared     = 表级属性：这块表是不是"所有品牌共用一个表"（**人工勾选，与大类无关**）
+const CATEGORY_OPTIONS = [
+  { value: "partner", label: "合作商电表" },
+  { value: "civil", label: "民用电表" },
+  { value: "shared", label: "共享电表" },
+];
+const CATEGORY_LABEL: Record<string, string> = {
+  partner: "合作商电表", civil: "民用电表", shared: "共享电表",
+};
+const CATEGORY_BADGE: Record<string, string> = {
+  partner: "bg-blue-100 text-blue-700",
+  civil: "bg-amber-100 text-amber-700",
+  shared: "bg-purple-100 text-purple-700",
+};
+// 兼容：老数据/老入参仍可能是中文 tag
+const TAG_TO_CODE: Record<string, string> = {
+  "合作商电表": "partner", "民用电表": "civil", "共享电表": "shared",
+};
+const codeOf = (m: any): string => m?.categoryCode || TAG_TO_CODE[m?.tag] || "partner";
+const categoryLabelOf = (m: any): string => CATEGORY_LABEL[codeOf(m)] || "合作商电表";
+/** 是不是「所有品牌共用一个电表」——只读表级 isShared，**绝不看大类** */
+const isSharedOf = (m: any): boolean => !!m?.isShared;
+
+/** 是否共享电表大类（= 是不是「电表大类」里的共享电表） */
+const isSharedMeterRow = (m: any) => !!m?.isShared;
 
 // ─── 倒计时格式化 ───
 function formatCountdown(seconds: number): string {
@@ -92,15 +120,41 @@ export default function Meters() {
   const [keyword, setKeyword] = useState("");
   const [landlordId, setLandlordId] = useState("");
   const [brandId, setBrandId] = useState("");
-  const [tag, setTag] = useState(tagScope);
+  // ★ 大类筛选：值改用**码值**（partner/civil/shared），与后端 category_code 对齐
+  const [catFilter, setCatFilter] = useState(() => (tagScope ? (TAG_TO_CODE[tagScope] || tagScope) : ""));
+  // ★ 表类型（"所有品牌共用" 是【表级属性】，不再混进品牌维度）
+  const [meterKind, setMeterKind] = useState<"" | "shared" | "normal">("");
+  // ★ 月份（V5 §10：筛选含月份；用于显示该月「平台值 / 实际值」）
+  // ★ 月份区间（V5 §10：筛选含月份）
+  //   · 默认「本月」= 单月，行为与之前完全一致
+  //   · 选多个月时：展开行就显示这几个月的读数；主表「平台/实际电量」为区间合计
+  //   · period = 区间末月（单月时就是所选月）：用于行内改实际电量、共用表品牌分摊的默认月份
+  const currentMonth = () => new Date().toISOString().slice(0, 7);
+  const [periodFrom, setPeriodFrom] = useState(currentMonth);
+  const [periodTo, setPeriodTo] = useState(currentMonth);
+  const period = periodTo;
+
+  // 月份位移 / 区间快捷（本月 / 近 3 月 / 近 6 月 / 近 12 月 / 本年）
+  const shiftMonth = (ym: string, delta: number) => {
+    const d = new Date(Number(ym.slice(0, 4)), Number(ym.slice(5, 7)) - 1 + delta, 1);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+  };
+  const applyPreset = (months: number | "year") => {
+    const to = currentMonth();
+    if (months === "year") { setPeriodFrom(`${to.slice(0, 4)}-01`); setPeriodTo(to); return; }
+    setPeriodFrom(shiftMonth(to, -(months - 1)));
+    setPeriodTo(to);
+  };
+  // ★ 只看本月无读数的表（漏录告警的落地）
+  const [onlyMissing, setOnlyMissing] = useState(false);
   const [formOpen, setFormOpen] = useState(false);
   const [editRecord, setEditRecord] = useState<any>(null);
   const [expandedMeterId, setExpandedMeterId] = useState<number | null>(null);
+  // ★从合同页「计费柜数 · 去修改」跳来（?highlight=cabinet）：等列表出来自动展开目标表并滚到「品牌分摊」
+  const [highlightCabinet, setHighlightCabinet] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [syncProgress, setSyncProgress] = useState("");
   const [syncConfirmOpen, setSyncConfirmOpen] = useState(false);
-  const [highlightCabinet, setHighlightCabinet] = useState(false);
-  const [readingMeter, setReadingMeter] = useState<any>(null);
   const syncLimit = useSyncLimit();
   const lastClickRef = useRef(0);
   const cooldownRef = useRef(false);
@@ -110,18 +164,16 @@ export default function Meters() {
     const params = new URLSearchParams(window.location.search);
     const landlord = params.get("landlord");
     const brand = params.get("brand");
-    const highlight = params.get("highlight");
     const meter = params.get("meter");
+    const highlight = params.get("highlight");
     if (landlord) setLandlordId(landlord);
-    if (brand) setBrandId(brand);
-    if (highlight === "cabinet") {
-      setHighlightCabinet(true);
-      // 5秒后取消高亮
-      setTimeout(() => setHighlightCabinet(false), 5000);
-    }
+    // 兼容旧链接 ?brand=shared（以前把「全品牌共用」混在品牌下拉里）
+    if (brand === "shared") setMeterKind("shared");
+    else if (brand) setBrandId(brand);
     if (meter) setKeyword(meter); // 直达某块电表：预填搜索框
+    if (highlight === "cabinet") setHighlightCabinet(true);
     // 清除 URL 参数
-    if (landlord || brand || highlight || meter) {
+    if (landlord || brand || meter || highlight) {
       window.history.replaceState({}, "", window.location.pathname);
     }
   }, []);
@@ -150,41 +202,138 @@ export default function Meters() {
     return map;
   }, [meters.data, contractsQ.data, entitiesQ.data]);
 
+  // ── ★ 区间读数（V5 §10：筛选含月份 + 「平台值 / 实际值」两列并排）──
+  // /meter-energy/monthly 不传 meterNo 即返回区间内【全部电表】读数（受账号大类范围约束），
+  // 一次请求就能把列表页需要的「平台值 / 实际值 / 来源」全部拿到。
+  const periodCompact = period ? period.replace("-", "") : "";
+  const fromCompact = periodFrom ? periodFrom.replace("-", "") : "";
+  const toCompact = periodTo ? periodTo.replace("-", "") : "";
+  const isSingleMonth = !!fromCompact && fromCompact === toCompact;
+  // 区间展示名：单月 → 2026-09；多月 → 2026-04 ~ 2026-09
+  const rangeLabel = !fromCompact
+    ? "—"
+    : isSingleMonth
+      ? toDisplay(fromCompact)
+      : `${toDisplay(fromCompact)} ~ ${toDisplay(toCompact)}`;
+  const monthReadings = useQuery({
+    queryKey: ["meterReadings", "month", fromCompact, toCompact],
+    queryFn: () => getMonthlyKwh({ startMonth: fromCompact, endMonth: toCompact }),
+    enabled: !!fromCompact && !!toCompact,
+  });
+  const readingsByNo = useMemo(() => {
+    const map = new Map<string, any[]>();
+    for (const r of (monthReadings.data ?? []) as any[]) {
+      if (!r?.address) continue;
+      const k = String(r.address);
+      const arr = map.get(k);
+      if (arr) arr.push(r); else map.set(k, [r]);
+    }
+    return map;
+  }, [monthReadings.data]);
+
+  // 每块表在【所选区间】内的读数：
+  //   平台值 = Σ(原始表码 × 互感器倍数)（接口返回的 raw_kwh 是第三方原始表码）
+  //   实际值 = Σ人工补录值（actual_kwh，不随第三方同步覆盖）
+  //   来源   = 人工修正 / 第三方 / 无读数（区间内任一月有人工值即视为「人工修正」）
+  // 单月时区间合计 = 该月数值，与改造前完全一致。
+  const readingInfoOf = useCallback((meter: any) => {
+    const rows = readingsByNo.get(String(meter.meterNo)) ?? [];
+    const empty = {
+      has: false, platform: null as number | null, actual: null as number | null,
+      raw: null as number | null, months: 0, manualMonths: 0, source: "none" as const,
+    };
+    if (rows.length === 0) return empty;
+    const round2 = (x: number) => Math.round(x * 100) / 100;
+    let platform: number | null = null, actual: number | null = null, raw: number | null = null;
+    let manualMonths = 0, months = 0;
+    for (const r of rows) {
+      const ratio = Number(r.transformer_ratio_snapshot ?? r.transformer_ratio ?? meter.transformerRatio ?? 1) || 1;
+      if (r.raw_kwh != null) { const v = Number(r.raw_kwh); raw = round2((raw ?? 0) + v); platform = round2((platform ?? 0) + v * ratio); }
+      if (r.actual_kwh != null) { actual = round2((actual ?? 0) + Number(r.actual_kwh)); manualMonths++; }
+      if (r.raw_kwh != null || r.actual_kwh != null) months++;
+    }
+    return {
+      has: platform != null || actual != null,
+      platform, actual, raw, months, manualMonths,
+      source: (manualMonths > 0 ? "manual" : platform != null ? "platform" : "none") as "manual" | "platform" | "none",
+    };
+  }, [readingsByNo]);
+
+  // ★ 柜数：普通表 = 该表下 cabinets 记录数；共用表 = 分摊行人工录入的品牌柜数合计
+  //   （原先主表读了一个不存在的字段，导致「柜数」列一直显示 —，这里补上）
+  const allCabinets = useQuery({ queryKey: ["cabinets"], queryFn: () => listCabinets() });
+  const sharedCabUsage = useQuery({
+    queryKey: ["sharedCabinetUsage", "all"],
+    queryFn: () => getSharedCabinetUsage(),
+    staleTime: 60_000,
+  });
+  const cabinetCountOf = useCallback((m: any): number | null => {
+    if (isSharedMeterRow(m)) {
+      const it = (sharedCabUsage.data?.meters ?? []).find((s: SharedCabinetUsageItem) => s.meterId === m.id);
+      if (!it) return null;
+      if (it.managedByAlloc) {
+        return Object.values(it.brandCabs ?? {}).reduce((s: number, v: number) => s + Number(v || 0), 0);
+      }
+      return Number(it.fallbackCabs || 0) || null;
+    }
+    if (!allCabinets.data) return null;
+    return (allCabinets.data as any[]).filter((c: any) => c.meterId === m.id).length;
+  }, [allCabinets.data, sharedCabUsage.data]);
+
   const del = useMutation({
     mutationFn: deleteMeter,
     onSuccess: () => { toast.success("已删除"); queryClient.invalidateQueries({ queryKey: ["meters"] }); },
   });
 
-  const rows = useMemo(() => {
-    let data = meters.data ?? [];
-    if (keyword) data = data.filter((m: any) =>
-      m.meterNo?.includes(keyword) || m.stationName?.includes(keyword) ||
-      m.meterName?.includes(keyword) || m.landlordName?.includes(keyword)
-    );
-    if (landlordId) data = data.filter((m: any) => m.landlordId === Number(landlordId));
-    if (brandId) data = brandId === "shared"
-      ? data.filter((m: any) => m.tag === "共享电表")
-      : data.filter((m: any) => m.brandId === Number(brandId));
-    if (tag) data = data.filter((m: any) => m.tag === tag);
-    return data;
-  }, [meters.data, keyword, landlordId, brandId, tag]);
-
-  // 按场地方分组
-  const groupedByLandlord = useMemo(() => {
-    const groups = new Map<number, any>();
-    for (const r of rows) {
-      const lid = r.landlordId || 0;
-      if (!groups.has(lid)) {
-        groups.set(lid, {
-          landlordId: lid,
-          landlordName: r.landlordName || "未设置场地方",
-          meters: [],
-        });
-      }
-      groups.get(lid).meters.push(r);
+  // ★ 柜子搜索索引：把每块表挂的柜子（编号 / 类型 / 备注）拼成一段文本 —— 关键词能搜到电柜
+  const cabinetTextByMeter = useMemo(() => {
+    const map = new Map<number, string>();
+    for (const c of (allCabinets.data ?? []) as any[]) {
+      if (c?.meterId == null) continue;
+      const t = `${c.cabinetNo ?? ""} ${c.cabinetType ?? ""} ${c.remark ?? ""}`.trim();
+      map.set(c.meterId, `${map.get(c.meterId) ?? ""} ${t}`.trim());
     }
-    return [...groups.values()];
-  }, [rows]);
+    return map;
+  }, [allCabinets.data]);
+
+  // 过滤链：先出「基础结果」，再据此算本月读数覆盖度（漏录），最后才按「只看未录」收窄
+  const baseRows = useMemo(() => {
+    let data = meters.data ?? [];
+    if (keyword) {
+      // 关键词：电表编号 / 名称 / 场地方 / 柜子（编号·类型·备注），大小写不敏感
+      const k = keyword.trim().toLowerCase();
+      if (k) data = data.filter((m: any) =>
+        `${m.meterNo ?? ""} ${m.stationName ?? ""} ${m.meterName ?? ""} ${m.landlordName ?? ""} ${cabinetTextByMeter.get(m.id) ?? ""}`
+          .toLowerCase().includes(k)
+      );
+    }
+    if (landlordId) data = data.filter((m: any) => m.landlordId === Number(landlordId));
+    if (brandId) data = data.filter((m: any) => m.brandId === Number(brandId));
+    if (catFilter) data = data.filter((m: any) => codeOf(m) === catFilter);
+    if (meterKind === "shared") data = data.filter(isSharedMeterRow);
+    if (meterKind === "normal") data = data.filter((m: any) => !isSharedMeterRow(m));
+    return data;
+  }, [meters.data, keyword, landlordId, brandId, catFilter, meterKind, cabinetTextByMeter]);
+
+  // 本月无读数的表（V5 §3.5：某表某月无读数 ⇒ 跳过 + 告警）
+  const missingRows = useMemo(
+    () => baseRows.filter((m: any) => !readingInfoOf(m).has),
+    [baseRows, readingInfoOf],
+  );
+  const rows = onlyMissing ? missingRows : baseRows;
+
+  // ★合同页「计费柜数 · 去修改」跳来：列表出来后自动展开目标表（优先共用表，柜数在它的「品牌分摊」里），
+  //   并滚到品牌分摊区块 —— 否则用户落在列表页还得自己找那块表
+  useEffect(() => {
+    if (!highlightCabinet || meters.isLoading || rows.length === 0) return;
+    const target = rows.find((m: any) => isSharedMeterRow(m)) ?? rows[0];
+    setExpandedMeterId(target.id);
+    setHighlightCabinet(false);
+    const timer = window.setTimeout(() => {
+      document.getElementById("shared-alloc-section")?.scrollIntoView({ block: "center", behavior: "smooth" });
+    }, 80);
+    return () => window.clearTimeout(timer);
+  }, [highlightCabinet, meters.isLoading, rows]);
 
   const openSyncConfirm = () => {
     // 节流：同步中、冷却中、达到上限都阻止
@@ -245,9 +394,10 @@ export default function Meters() {
     exportXlsx(`电表台账_${new Date().toISOString().slice(0, 10)}`, [{
       name: "电表台账",
       rows: rows.map((m: any) => ({
-        场地方: m.landlordName ?? "", 品牌方: m.brandName ?? (m.tag === "共享电表" ? "全品牌共享" : ""), 电表编号: m.meterNo,
-        电表名称: m.meterName ?? "", 标签: m.tag ?? "合作商电表", 采集器号: m.collectorId ?? "",
-        互感器倍数: fmtNum(m.transformerRatio), 状态: m.status,
+        场地方: m.landlordName ?? "", 品牌方: m.brandName ?? (isSharedOf(m) ? "全品牌共享" : ""), 电表编号: m.meterNo,
+        电表名称: m.meterName ?? "", 电表大类: categoryLabelOf(m),
+        所有品牌共用: isSharedOf(m) ? "是" : "否", 设备地址: m.deviceAddress ?? "", 采集器号: m.collectorId ?? "",
+        互感器倍数: fmtNum(m.transformerRatio),
       })),
     }]);
     toast.success("已导出 Excel");
@@ -283,7 +433,7 @@ export default function Meters() {
       <div className="flex flex-wrap items-center gap-2">
         <div className="relative">
           <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-slate-400" />
-          <input className={`${inputCls} w-56 pl-8`} placeholder="搜索电表编号 / 场地方…" value={keyword} onChange={(e) => setKeyword(e.target.value)} />
+          <input className={`${inputCls} w-64 pl-8`} placeholder="搜索 电表/电柜编号、场地、品牌…" value={keyword} onChange={(e) => setKeyword(e.target.value)} />
         </div>
         <div className="w-40">
           <SearchSelect value={landlordId} onChange={setLandlordId} placeholder="全部场地方"
@@ -291,23 +441,72 @@ export default function Meters() {
         </div>
         <div className="w-40">
           <SearchSelect value={brandId} onChange={setBrandId} placeholder="全部品牌方"
-            options={[
-              { value: "shared", label: "共享电表（全品牌）" },
-              ...(brands.data ?? []).map((b: any) => ({ value: String(b.id), label: b.name })),
-            ]} />
+            options={(brands.data ?? []).map((b: any) => ({ value: String(b.id), label: b.name }))} />
         </div>
+        {/* ★ 表类型：把「所有品牌共用」从品牌维度里拆出来（它是【表级属性】，不是品牌） */}
+        <select className={`${inputCls} w-32`} value={meterKind}
+          onChange={(e) => setMeterKind(e.target.value as any)}
+          title="表类型：这块表是不是「所有品牌共用一个电表」（与电表大类无关）">
+          <option value="">全部表类型</option>
+          <option value="shared">所有品牌共用</option>
+          <option value="normal">普通电表</option>
+        </select>
         {tagScope ? (
-          <select className={`${inputCls} w-36`} value={tagScope} disabled title="当前账号的数据范围">
-            <option value={tagScope}>{tagScope}</option>
+          <select className={`${inputCls} w-36`} value={catFilter || (TAG_TO_CODE[tagScope] || tagScope)} disabled
+            title="当前账号的数据范围（按电表大类限定）">
+            <option value={TAG_TO_CODE[tagScope] || tagScope}>{CATEGORY_LABEL[TAG_TO_CODE[tagScope] || tagScope] || tagScope}</option>
           </select>
         ) : (
-          <select className={`${inputCls} w-36`} value={tag} onChange={(e) => setTag(e.target.value)}>
-            <option value="">全部标签</option>
-            <option value="合作商电表">合作商电表</option>
-            <option value="民用电表">民用电表</option>
-            <option value="共享电表">共享电表</option>
+          <select className={`${inputCls} w-36`} value={catFilter} onChange={(e) => setCatFilter(e.target.value)}
+            title="电表大类 = 分给哪个财务管的职责分组（不参与任何算法）">
+            <option value="">全部大类</option>
+            {CATEGORY_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
           </select>
         )}
+        {/* ★ 月份区间：单月（默认本月）→ 展开行就只看这个月；选多个月 → 展开行显示这几个月的读数 */}
+        <div className="flex items-center gap-1">
+          <input type="month" className={`${inputCls} w-[118px]`} value={periodFrom}
+            max={periodTo}
+            onChange={(e) => {
+              const v = e.target.value;
+              setPeriodFrom(v);
+              if (v && periodTo && v > periodTo) setPeriodTo(v);   // 起始月超过结束月 ⇒ 顺延结束月
+            }}
+            title="起始月" />
+          <span className="text-xs text-slate-400">~</span>
+          <input type="month" className={`${inputCls} w-[118px]`} value={periodTo}
+            min={periodFrom}
+            onChange={(e) => {
+              const v = e.target.value;
+              setPeriodTo(v);
+              if (v && periodFrom && v < periodFrom) setPeriodFrom(v); // 结束月早于起始月 ⇒ 前移起始月
+            }}
+            title="结束月（与起始月相同 = 只看这一个月）" />
+        </div>
+        <div className="flex items-center gap-0.5 rounded-md border border-slate-200 bg-white p-0.5">
+          {([["本月", 1], ["近3月", 3], ["近6月", 6], ["本年", "year"]] as const).map(([label, n]) => (
+            <button key={label} type="button" onClick={() => applyPreset(n as any)}
+              className="rounded px-1.5 py-1 text-[11px] text-slate-600 transition-colors hover:bg-slate-100 hover:text-blue-600">
+              {label}
+            </button>
+          ))}
+        </div>
+        {/* ★ 区间读数覆盖度：一眼看出漏录，点一下只看未录的表 */}
+        <button
+          type="button"
+          onClick={() => setOnlyMissing((v) => !v)}
+          title={`所选区间（${rangeLabel}）内没有任何读数的电表会被跳过、不入台账。点击只看这些表。`}
+          className={`rounded-md border px-2.5 py-1.5 text-xs transition-colors ${
+            onlyMissing
+              ? "border-rose-300 bg-rose-50 text-rose-700"
+              : missingRows.length > 0
+                ? "border-amber-300 bg-amber-50 text-amber-800 hover:bg-amber-100"
+                : "border-slate-200 bg-white text-slate-500"
+          }`}
+        >
+          {rangeLabel} 读数 {baseRows.length - missingRows.length}/{baseRows.length}
+          {missingRows.length > 0 && <span className="ml-1 font-medium">缺 {missingRows.length}</span>}
+        </button>
         <div className="ml-auto flex gap-2">
           {/* 刷新按钮 */}
           <Button
@@ -336,52 +535,79 @@ export default function Meters() {
         </div>
       </div>
 
-      {/* 按场地方分组展示 */}
-      <div className="space-y-4">
-        {groupedByLandlord.map((group: any) => {
-          // 从 contracts 跳转过来时，自动展开第一个匹配的电表
-          const isTargetGroup = highlightCabinet && landlordId && group.landlordId === Number(landlordId);
-          if (isTargetGroup && expandedMeterId === null && group.meters.length > 0) {
-            // 延迟展开，避免 setState during render
-            setTimeout(() => setExpandedMeterId(group.meters[0].id), 100);
-          }
-
-          return (
-            <div key={group.landlordId} className="rounded-xl border bg-white shadow-sm">
-              <div className="border-b px-5 py-3 flex items-center gap-2">
-                <Gauge className="h-4 w-4 text-emerald-600" />
-                <span className="text-sm font-semibold text-slate-700">{group.landlordName}</span>
-                <span className="text-xs text-slate-400">（{group.meters.length} 个电表）</span>
-              </div>
-              <div className="p-3 space-y-2">
-                {group.meters.map((m: any) => (
-                  <MeterCard
-                    key={m.id}
-                    meter={m}
-                    isExpanded={expandedMeterId === m.id}
-                    onToggle={() => toggleExpand(m.id)}
-                    onEdit={() => { setEditRecord(m); setFormOpen(true); }}
-                    onDelete={() => window.confirm("删除该电表？") && del.mutate(m.id)}
-                    onReading={() => setReadingMeter(m)}
-                    highlightCabinet={!!(isTargetGroup && expandedMeterId === m.id)}
-                    entityMismatchHint={entityMismatchHint[m.id]}
-                  />
-                ))}
-              </div>
-            </div>
-          );
-        })}
-        {groupedByLandlord.length === 0 && (
-          <div className="rounded-xl border border-dashed py-16 text-center text-slate-400">
-            {meters.isLoading ? "加载中…" : "暂无电表数据"}
-          </div>
-        )}
+      {/* ★V5 结构重做（EXCEL_UI_SPEC §4.1）：一张主表，一行一块电表；点 ▶ 展开行内编辑（替代弹窗）
+          ★X 轴：表格按各列声明宽度排布（约 1.18k px），超出可视区域才出横向滚动条；
+            场地方/电表号两列冻结钉在左侧。minWidth 必须≈各列宽度之和，给大了会把窄列撑宽。 */}
+      <div className="xl-wrap xl-wrap-scroll rounded-xl shadow-sm">
+        <table className="xl-table" style={{ minWidth: 1180 }}>
+          <thead>
+            <tr>
+              <th className="xl-freeze xl-ctr" style={{ left: 0, width: 30 }}></th>
+              <th className="xl-freeze" style={{ left: 30, width: 92 }}>场地方</th>
+              <th className="xl-freeze" style={{ left: 122, width: 112 }}>电表号</th>
+              <th style={{ minWidth: 110 }}>名称</th>
+              <th style={{ minWidth: 88 }}>品牌方</th>
+              <th className="xl-ctr" style={{ width: 96 }} title="电表大类 = 分给哪个财务管的职责分组（不参与任何算法）">大类</th>
+              <th className="xl-ctr" style={{ width: 56 }} title="所有品牌共用一个电表（表级属性，与大类无关）">共用</th>
+              <th className="xl-num" style={{ width: 56 }}>倍数</th>
+              <th className="xl-num" style={{ width: 56 }}>柜数</th>
+              <th className="xl-num" style={{ width: 96 }} title={`${toDisplay(periodCompact)} 平台电量（第三方原始表码 × 倍数）`}>平台电量</th>
+              <th className="xl-num" style={{ width: 96 }} title={`${toDisplay(periodCompact)} 实际电量（人工修正优先；点击可改）`}>实际电量 ✏️</th>
+              <th className="xl-ctr" style={{ width: 70 }}>来源</th>
+              <th className="xl-ctr xl-freeze-r" style={{ width: 70 }}>操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.length === 0 && (
+              <tr><td colSpan={13} className="xl-ctr xl-muted" style={{ padding: "28px 8px" }}>
+                {meters.isLoading ? "加载中…" : "暂无电表数据"}
+              </td></tr>
+            )}
+            {rows.map((m: any) => (
+              <MeterRow
+                key={m.id}
+                meter={m}
+                isExpanded={expandedMeterId === m.id}
+                onToggle={() => toggleExpand(m.id)}
+                onEdit={() => { setEditRecord(m); setFormOpen(true); }}
+                onDelete={() => window.confirm("删除该电表？") && del.mutate(m.id)}
+                entityMismatchHint={entityMismatchHint[m.id]}
+                reading={readingInfoOf(m)}
+                periodLabel={rangeLabel}
+                period={periodCompact}
+                periodFrom={fromCompact}
+                periodTo={toCompact}
+                cabinetCount={cabinetCountOf(m)}
+              />
+            ))}
+          </tbody>
+          {/* ★ 吸底合计行（Excel 风）：柜数 / 平台电量 / 实际电量 */}
+          <tfoot>
+            <tr>
+              <td className="xl-freeze xl-ctr" style={{ left: 0 }}></td>
+              <td className="xl-freeze" style={{ left: 30 }} colSpan={8}>
+                合计 · {rows.length} 块电表
+              </td>
+              <td className="xl-num" title="柜数合计（共用表取品牌分摊录入值）">
+                {fmtNum(rows.reduce((s: number, m: any) => s + (cabinetCountOf(m) || 0), 0))}
+              </td>
+              <td className="xl-num" title={`${rangeLabel} 平台电量合计`}>
+                {fmtNum(Math.round(rows.reduce((s: number, m: any) => s + (readingInfoOf(m).platform || 0), 0) * 100) / 100)}
+              </td>
+              <td className="xl-num" title={`${rangeLabel} 实际电量合计（生效值：人工优先）`}>
+                {fmtNum(Math.round(rows.reduce((s: number, m: any) => {
+                  const r = readingInfoOf(m);
+                  return s + (r.actual != null ? r.actual : (r.platform || 0));
+                }, 0) * 100) / 100)}
+              </td>
+              <td className="xl-ctr"></td>
+              <td className="xl-freeze-r"></td>
+            </tr>
+          </tfoot>
+        </table>
       </div>
 
       <MeterForm open={formOpen} onClose={() => { setFormOpen(false); setEditRecord(null); }} record={editRecord} />
-
-      {/* 录入读数弹窗 */}
-      <ReadingForm open={!!readingMeter} onClose={() => setReadingMeter(null)} meter={readingMeter} />
 
       {/* 刷新确认弹窗 */}
       <Dialog open={syncConfirmOpen} onOpenChange={(o) => !o && setSyncConfirmOpen(false)}>
@@ -458,198 +684,690 @@ export default function Meters() {
   );
 }
 
-// ─── 电表卡片组件 ───
-function MeterCard({ meter, isExpanded, onToggle, onEdit, onDelete, onReading, highlightCabinet, entityMismatchHint }: {
-  meter: any; isExpanded: boolean; onToggle: () => void; onEdit: () => void; onDelete: () => void; onReading: () => void; highlightCabinet?: boolean; entityMismatchHint?: string;
+// ─── ★V5 主表行（EXCEL_UI_SPEC §4.1）：一行一块电表；大类/共用/倍数/实际电量 行内可改 ───
+function MeterRow({ meter, isExpanded, onToggle, onEdit, onDelete, entityMismatchHint, reading, periodLabel, period, periodFrom, periodTo, cabinetCount }: {
+  meter: any; isExpanded: boolean; onToggle: () => void; onEdit: () => void; onDelete: () => void; entityMismatchHint?: string;
+  reading?: { has: boolean; platform: number | null; actual: number | null; raw: number | null; months: number; manualMonths: number; source: "manual" | "platform" | "none" };
+  /** 区间展示名（单月 = 2026-09；多月 = 2026-04 ~ 2026-09） */
+  periodLabel?: string; period?: string;
+  /** 区间起止（YYYMM），下传给展开面板 */
+  periodFrom?: string; periodTo?: string;
+  /** 柜数：普通表 = 该表柜子数；共用表 = 品牌分摊录入的柜数合计（null = 未录） */
+  cabinetCount?: number | null;
 }) {
   const queryClient = useQueryClient();
+  const isShared = isSharedOf(meter);
+  const code = codeOf(meter);
+  // 单月时可行内改「实际电量」；多个月时列表显示的是区间合计，逐月录入请展开
+  const singleMonth = !!periodFrom && periodFrom === periodTo;
+  // 区间总月数（YYYYMM 之差）
+  const monthSpan = (periodFrom && periodTo)
+    ? Math.max(0, (Number(periodTo.slice(0, 4)) - Number(periodFrom.slice(0, 4))) * 12
+      + (Number(periodTo.slice(4, 6)) - Number(periodFrom.slice(4, 6))) + 1)
+    : 0;
+  const [editingCell, setEditingCell] = useState<"" | "ratio" | "actual">("");
+  const [cellVal, setCellVal] = useState("");
+
+  // 行内保存（大类 / 共用 / 倍数 / 实际电量）—— 失焦/回车触发
+  const patch = useMutation({
+    mutationFn: (data: any) => updateMeter(meter.id, data),
+    onSuccess: () => { queryClient.invalidateQueries({ queryKey: ["meters"] }); },
+    onError: (e: any) => toast.error(e?.response?.data?.detail || e.message || "保存失败"),
+  });
+
+  // 实际电量 → 写读数行（actual_kwh 人工值，同步不覆盖；保存后重算该月台账）
+  const saveActual = useMutation({
+    mutationFn: (v: number) => saveMeterReading({
+      address: meter.meterNo,
+      monthPeriod: period || "",
+      kwh: reading?.raw ?? undefined,          // 回传原始表码，避免把平台值冲掉
+      actualKwh: v,
+    }),
+    onSuccess: async () => {
+      toast.success(`实际电量已保存（${toDisplay(period || "")}），台账已重算`);
+      // ★ 顺序很重要：必须等台账重算【完成】再让界面失效重取。
+      //   反过来的话，失效触发的 refetch 会在重算完成前拿到旧台账，
+      //   页面上就表现为「保存后数字不动，要手动刷新浏览器才更新」。
+      try { await generateElectricity({ period: period || "" }); } catch {}
+      queryClient.invalidateQueries({ queryKey: ["meterReadings"] });
+      queryClient.invalidateQueries({ queryKey: ["electricity"] });
+      queryClient.invalidateQueries({ queryKey: ["electricity-monthly-ledger-range"] });
+    },
+    onError: (e: any) => toast.error(e?.response?.data?.detail || e.message || "保存失败"),
+  });
+
+  const commitCell = (kind: "ratio" | "actual") => {
+    const v = cellVal.trim();
+    setEditingCell("");
+    if (v === "") return;
+    const n = Number(v);
+    if (isNaN(n) || n < 0) { toast.error("请输入非负数字"); return; }
+    if (kind === "ratio") {
+      if (n === Number(meter.transformerRatio ?? 1)) return;
+      patch.mutate({ transformerRatio: n });
+    } else {
+      if (n === reading?.actual) return;
+      saveActual.mutate(n);
+    }
+  };
+
+  return (
+    <>
+      <tr className={isExpanded ? "xl-open" : undefined}>
+        <td className="xl-freeze xl-ctr" style={{ left: 0 }}>
+          <button className="text-slate-400 hover:text-slate-600" onClick={onToggle}>
+            {isExpanded ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
+          </button>
+        </td>
+        <td className="xl-freeze truncate" style={{ left: 30 }} title={`${meter.landlordName ?? "未关联场地"}${entityMismatchHint ? ` · ${entityMismatchHint}` : ""}`}>
+          {meter.landlordName ?? <span className="text-rose-500" title="未关联场地的电表不生成台账">未关联场地</span>}
+        </td>
+        <td className="xl-freeze font-mono text-[12px]" style={{ left: 122 }} title={meter.meterNo}>{meter.meterNo}</td>
+        <td className="truncate" title={meter.meterName}>{meter.meterName ?? "—"}</td>
+        <td className="truncate text-slate-600">
+          {meter.brandName ?? (isShared ? <span className="font-medium text-purple-600">全品牌共享</span> : <span className="text-slate-400">未设置</span>)}
+        </td>
+        {/* 大类：行内下拉（财务分工标签，不参与算法） */}
+        <td className="xl-ctr">
+          <select
+            className="rounded border border-transparent bg-transparent px-1 py-0.5 text-[11px] text-slate-600 hover:border-slate-300"
+            value={code}
+            title="电表大类（分给哪个财务管）——行内可直接改"
+            onChange={(e) => patch.mutate({ categoryCode: e.target.value })}
+          >
+            {CATEGORY_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+          </select>
+        </td>
+        {/* 共用：行内开关（表级属性，与大类无关） */}
+        <td className="xl-ctr">
+          <Switch checked={isShared} onCheckedChange={(on) => patch.mutate({ isShared: on, brandId: on ? null : meter.brandId })}
+            className="scale-90" title="所有品牌共用一个电表（人工勾选，与大类无关）" />
+        </td>
+        {/* 倍数：行内编辑 */}
+        <td className="xl-num">
+          {editingCell === "ratio" ? (
+            <input autoFocus type="number" step="0.01" min="0" className={`${inputCls} h-6 w-14 px-1 text-xs`}
+              value={cellVal} onChange={(e) => setCellVal(e.target.value)}
+              onBlur={() => commitCell("ratio")}
+              onKeyDown={(e) => e.key === "Enter" && commitCell("ratio")} />
+          ) : (
+            <span className="cursor-text rounded px-1 hover:bg-amber-50 tabular-nums"
+              title="互感器倍数（实际电量 = 表码 × 倍数）——点击修改；历史月份按读数时的快照倍数算"
+              onClick={() => { setEditingCell("ratio"); setCellVal(String(meter.transformerRatio ?? 1)); }}>
+              {fmtNum(meter.transformerRatio ?? 1)}
+            </span>
+          )}
+        </td>
+        <td className={cabinetCount == null ? "xl-num xl-muted" : "xl-num"}
+          title={isShared
+            ? "共用表：录了品牌分摊柜数就按分摊算；没录则按该表挂的「柜子档案」数量算（至少 1 柜）。展开可增删柜子"
+            : "该表下的柜子数（展开可增删）"}>
+          {cabinetCount == null ? "—" : fmtNum(cabinetCount)}
+        </td>
+        {/* 平台电量（只读，区间合计） */}
+        <td className="xl-num text-slate-600" title={`${periodLabel || ""} 第三方原始表码 × 倍数（区间合计）`}>
+          {reading?.platform != null ? fmtNum(reading.platform) : <span className="xl-muted">—</span>}
+        </td>
+        {/* 实际电量：单月可行内编辑（人工修正，永不被同步覆盖）；多月显示区间合计（逐月改请展开） */}
+        <td className="xl-num">
+          {editingCell === "actual" ? (
+            <input autoFocus type="number" step="0.01" min="0" className={`${inputCls} h-6 w-20 px-1 text-xs`}
+              value={cellVal} onChange={(e) => setCellVal(e.target.value)}
+              onBlur={() => commitCell("actual")}
+              onKeyDown={(e) => e.key === "Enter" && commitCell("actual")} />
+          ) : (
+            <span
+              className={`rounded px-1 tabular-nums ${singleMonth ? "cursor-text hover:bg-amber-50" : ""} ${reading?.actual != null ? "font-semibold text-emerald-700" : reading?.platform != null ? "text-slate-500" : "xl-muted"}`}
+              title={singleMonth
+                ? `${periodLabel || ""} 实际电量：填了优先用它（不会被同步覆盖）；留空按 平台电量 计。点击填写`
+                : `${periodLabel || ""} 实际电量合计（${reading?.manualMonths || 0} 个月有人工值）。多选月份时不能行内改，点左侧 ▶ 展开逐月录入`}
+              onClick={() => {
+                if (!singleMonth) { onToggle(); return; }
+                setEditingCell("actual"); setCellVal(reading?.actual != null ? String(reading.actual) : "");
+              }}>
+              {reading?.actual != null ? fmtNum(reading.actual)
+                : reading?.platform != null ? <span className="text-slate-400">=平台</span>
+                : "—"}
+            </span>
+          )}
+        </td>
+        <td className="xl-ctr">
+          {reading?.source === "manual" && <span className="rounded bg-emerald-100 px-1.5 py-0.5 text-[10px] text-emerald-700">人工</span>}
+          {reading?.source === "platform" && <span className="rounded bg-sky-100 px-1.5 py-0.5 text-[10px] text-sky-700">第三方</span>}
+          {(!reading || reading.source === "none") && <span className="rounded bg-rose-100 px-1.5 py-0.5 text-[10px] text-rose-600" title="所选区间内无读数 → 该表不入台账">缺</span>}
+          {!singleMonth && (reading?.months || 0) > 0 && (
+            <span className="ml-0.5 text-[10px] tabular-nums text-slate-400" title="所选区间内有读数的月份数 / 区间总月数">
+              {reading?.months}/{monthSpan}
+            </span>
+          )}
+        </td>
+        <td className="xl-ctr xl-freeze-r">
+          <div className="flex justify-center gap-0.5">
+            <button className="rounded p-1 text-slate-400 hover:text-blue-600" onClick={onEdit} title="编辑档案（名称/归属/主体/设备地址等）"><Pencil className="h-3 w-3" /></button>
+            <button className="rounded p-1 text-slate-400 hover:text-rose-500" onClick={onDelete} title="删除电表"><Trash2 className="h-3 w-3" /></button>
+          </div>
+        </td>
+      </tr>
+      {isExpanded && (
+        <tr className="xl-detail"><td colSpan={13} className="p-0">
+          <MeterExpandPanel meter={meter} period={period || ""} periodFrom={periodFrom} periodTo={periodTo} />
+        </td></tr>
+      )}
+    </>
+  );
+}
+
+// ─── ★V5 展开行（对齐原型 .detail/.dwrap）：迷你表格 + 单元格内联编辑，替代弹窗 ───
+// 形态：一条 26px 行高的迷你表（月度读数 × 工具栏所选月份区间），共用表再挂一条品牌分摊迷你表。
+// 交互：单元格本身就是输入框，失焦即存（存后自动重算该月台账）；已改未存的格子亮黄底。
+function MeterExpandPanel({ meter, period, periodFrom, periodTo }: {
+  meter: any;
+  /** 区间末月（YYYMM）：品牌分摊默认月份、行内编辑目标月 */
+  period: string;
+  /** 工具栏所选月份区间（YYYMM）；展开行只显示这个区间内的月份 */
+  periodFrom?: string; periodTo?: string;
+}) {
+  const queryClient = useQueryClient();
+  const isShared = isSharedOf(meter);
+
+  /* ══ 1. 月度读数迷你表（★只显示工具栏所选区间内的月份；单元格失焦即存）══ */
+  const readings = useQuery({
+    queryKey: ["meterReadings", meter?.meterNo],
+    queryFn: () => getMeterReadings(meter.meterNo),
+    enabled: !!meter?.meterNo,
+  });
+  // 区间内月份（降序，含「无读数」的月份）—— 与工具栏区间联动
+  const rangeMonths = useMemo(() => {
+    if (!periodFrom || !periodTo) return [] as string[];
+    const list: string[] = [];
+    let y = Number(periodFrom.slice(0, 4)), m = Number(periodFrom.slice(4, 6));
+    const ey = Number(periodTo.slice(0, 4)), em = Number(periodTo.slice(4, 6));
+    let guard = 0;
+    while ((y < ey || (y === ey && m <= em)) && guard++ < 600) {
+      list.push(`${y}${String(m).padStart(2, "0")}`);
+      m++; if (m > 12) { m = 1; y++; }
+    }
+    return list.reverse();
+  }, [periodFrom, periodTo]);
+  const allReadingRows = (readings.data ?? []) as any[];
+  // 区间外的月份不显示；区间内没有读数记录的月份补一条空行（直接填即可建档，存量表不用回到弹窗）
+  const readingRows = useMemo(() => {
+    if (rangeMonths.length === 0) return allReadingRows;
+    const byMonth = new Map<string, any>();
+    for (const r of allReadingRows) if (r?.monthPeriod) byMonth.set(String(r.monthPeriod), r);
+    return rangeMonths.map((mp) => byMonth.get(mp) ?? { monthPeriod: mp, empty: true });
+  }, [rangeMonths, allReadingRows]);
+  const rangeLabelText = periodFrom && periodTo
+    ? (periodFrom === periodTo
+      ? toDisplay(periodFrom)
+      : `${toDisplay(periodFrom)} ~ ${toDisplay(periodTo)}`)
+    : "";
+  // 品牌分摊的目标月份：区间内默认取【末月】，多个月时可用小标签切换
+  const [allocPeriod, setAllocPeriod] = useState(period);
+  useEffect(() => {
+    if (!periodFrom || !periodTo) { setAllocPeriod(period); return; }
+    setAllocPeriod((prev) => (prev && prev >= periodFrom && prev <= periodTo ? prev : period));
+  }, [periodFrom, periodTo, period]);
+  const allocMonths = rangeMonths;
+  const [rd, setRd] = useState<Record<string, any>>({}); // monthPeriod → 草稿
+  const savedOf = (r: any) => ({
+    actual: r.actualKwh != null ? String(r.actualKwh) : "",
+    prev: r.prevReading != null ? String(r.prevReading) : "",
+    curr: r.currReading != null ? String(r.currReading) : "",
+    prevA: r.prevActualReading != null ? String(r.prevActualReading) : "",
+    currA: r.currActualReading != null ? String(r.currActualReading) : "",
+    prevD: r.prevReadingDate || "",
+    currD: r.currReadingDate || "",
+  });
+  const draftOf = (r: any) => rd[r.monthPeriod] ?? savedOf(r);
+  const setCell = (r: any, k: string, v: string) =>
+    setRd((p) => ({ ...p, [r.monthPeriod]: { ...draftOf(r), [k]: v } }));
+  const dirtyCell = (r: any, k: string) =>
+    !!rd[r.monthPeriod] && (rd[r.monthPeriod][k] ?? "") !== (savedOf(r)[k] ?? "");
+
+  const saveReading = useMutation({
+    mutationFn: (r: any) => {
+      const d = draftOf(r);
+      const kwh = d.prev !== "" && d.curr !== "" && !isNaN(Number(d.curr) - Number(d.prev))
+        ? Math.round((Number(d.curr) - Number(d.prev)) * 100) / 100
+        : (r.rawKwh != null ? Number(r.rawKwh) : undefined);
+      return saveMeterReading({
+        address: meter.meterNo, monthPeriod: r.monthPeriod, kwh,
+        actualKwh: d.actual !== "" ? Number(d.actual) : undefined,
+        prevActualReading: d.prevA !== "" ? Number(d.prevA) : undefined,
+        currActualReading: d.currA !== "" ? Number(d.currA) : undefined,
+        prevReadingDate: d.prevD || undefined,
+        prevReading: d.prev !== "" ? Number(d.prev) : undefined,
+        currReadingDate: d.currD || undefined,
+        currReading: d.curr !== "" ? Number(d.curr) : undefined,
+      });
+    },
+    onSuccess: async (_d: any, r: any) => {
+      toast.success(`${toDisplay(r.monthPeriod)} 读数已保存，台账已重算`);
+      setRd((p) => { const n = { ...p }; delete n[r.monthPeriod]; return n; });
+      // ★ 顺序很重要：先等台账重算完成，再让界面失效重取（否则拿到重算前的旧值，
+      //   表现为「改完要手动刷新浏览器数字才变」）。与上方 saveActual 同一处理。
+      try { await generateElectricity({ period: r.monthPeriod }); } catch {}
+      queryClient.invalidateQueries({ queryKey: ["meterReadings"] });
+      queryClient.invalidateQueries({ queryKey: ["electricity"] });
+      queryClient.invalidateQueries({ queryKey: ["electricity-monthly-ledger-range"] });
+    },
+    onError: (e: any) => toast.error(e?.response?.data?.detail || e.message || "保存失败"),
+  });
+  const commitRow = (r: any) => {
+    const d = rd[r.monthPeriod];
+    if (!d) return;
+    const s = savedOf(r);
+    if (Object.keys(s).every((k) => (d[k] ?? "") === (s[k] ?? ""))) {
+      setRd((p) => { const n = { ...p }; delete n[r.monthPeriod]; return n; });
+      return;
+    }
+    saveReading.mutate(r);
+  };
+  const cellInput = (r: any, k: string, extra: any = {}) => (
+    <input
+      {...extra}
+      value={draftOf(r)[k] ?? ""}
+      onChange={(e) => setCell(r, k, e.target.value)}
+      onBlur={() => commitRow(r)}
+      className={`xl-input ${extra.num ? "num" : ""}`}
+    />
+  );
+
+  // ★ 抄表日期的合法边界（账期 = 自然月）：
+  //   起始日期（上次抄表）∈ [上月末号, 当月月末] —— 上次抄表不会早于上月最后一天
+  //   截止日期（本次抄表）∈ [起始日期, 次月1号]  —— 抄表偶尔会拖到次月 1 号
+  const dateEdgesOf = (mp: string) => {
+    const y = Number(String(mp).slice(0, 4)), m = Number(String(mp).slice(4, 6));
+    const pad = (n: number) => String(n).padStart(2, "0");
+    const py = m === 1 ? y - 1 : y, pm = m === 1 ? 12 : m - 1;
+    const ny = m === 12 ? y + 1 : y, nm = m === 12 ? 1 : m + 1;
+    return {
+      prevMonthEnd: `${py}-${pad(pm)}-${pad(new Date(py, pm, 0).getDate())}`,
+      monthEnd: `${y}-${pad(m)}-${pad(new Date(y, m, 0).getDate())}`,
+      nextMonthFirst: `${ny}-${pad(nm)}-01`,
+    };
+  };
+
+  /* ══ 2. 品牌分摊迷你表（共用表；整体保存）—— 单月口径，月份默认取区间末月，可用小标签切换 ══ */
+  const allocForm = useQuery({
+    queryKey: ["shared-allocations", meter?.meterNo, allocPeriod],
+    queryFn: () => getSharedAllocationForm({ meterNo: meter.meterNo, monthPeriod: allocPeriod }),
+    enabled: isShared && !!meter?.meterNo && !!allocPeriod,
+  });
+  type AllocRow = { brandId: string; collectAmount: string; unitPrice: string; cabinetCount: string; entityId: string };
+  const [allocRows, setAllocRows] = useState<AllocRow[]>([]);
+  const bindings = (allocForm.data?.bindings ?? []) as any[];
+  const missingBrands = (allocForm.data?.missingBrands ?? []) as any[];
+  useEffect(() => {
+    const d = allocForm.data;
+    if (!isShared || !d || d.monthPeriod !== allocPeriod) return;
+    const cabDefault = (bid: string) => {
+      const x = d.cabinetDefaults?.[bid];
+      return x && x.count != null ? String(x.count) : "";
+    };
+    if ((d.allocations ?? []).length > 0) {
+      setAllocRows(d.allocations.map((a: any) => ({
+        brandId: String(a.brandId),
+        collectAmount: a.collectAmount != null ? String(a.collectAmount) : "",
+        unitPrice: a.unitPrice != null ? String(a.unitPrice) : "",
+        cabinetCount: a.cabinetCount != null ? String(a.cabinetCount) : "",
+        entityId: a.entityId != null ? String(a.entityId) : "",
+      })));
+    } else {
+      const src = (bindings.length > 0 ? bindings : (d.brands ?? [])) as any[];
+      setAllocRows(src.map((b: any) => ({
+        brandId: String(b.brandId), collectAmount: "", unitPrice: "",
+        cabinetCount: cabDefault(String(b.brandId)), entityId: "",
+      })));
+    }
+  }, [allocForm.data, allocPeriod, isShared]);
+  const setAllocRow = (i: number, patch: Partial<AllocRow>) =>
+    setAllocRows((prev) => prev.map((r, idx) => (idx === i ? { ...r, ...patch } : r)));
+  const contractPriceOf = (bid: string) => {
+    const b = ((allocForm.data?.brands ?? []) as any[]).find((x) => String(x.brandId) === bid);
+    return b?.unitPrice != null ? Number(b.unitPrice) : null;
+  };
+  const priceOf = (r: AllocRow) => (r.unitPrice.trim() !== "" ? (parseFloat(r.unitPrice) || null) : contractPriceOf(r.brandId));
+  const kwhOf = (r: AllocRow) => {
+    const a = parseFloat(r.collectAmount); const pr = priceOf(r);
+    return !isNaN(a) && pr ? Math.round((a / pr) * 100) / 100 : null;
+  };
+  // ★参与保存的行 = 填了「应收电费」/「柜数」/「报税主体」任一项
+  //   （共享表的柜数独立于电费：财务常只录柜数，此前只认金额 → 只填柜数的品牌行被静默丢弃，
+  //    导致合同页该品牌「计费柜数」一直是 0）
+  const allocFilled = allocRows.filter((r) => r.brandId && (
+    r.collectAmount.trim() !== "" || r.cabinetCount.trim() !== "" || r.entityId.trim() !== ""
+  ));
+  const allocTotals = (() => {
+    let amount = 0, kwh = 0, missPrice = 0, cabs = 0;
+    for (const r of allocFilled) {
+      amount += parseFloat(r.collectAmount) || 0;
+      const k = kwhOf(r); if (k == null) missPrice++; else kwh += k;
+      const c = parseInt(r.cabinetCount, 10); if (!isNaN(c) && c > 0) cabs += c;
+    }
+    return { amount: Math.round(amount * 100) / 100, kwh: Math.round(kwh * 100) / 100, missPrice, cabs };
+  })();
+  const curRow = readingRows.find((r) => r.monthPeriod === allocPeriod);
+  const tableKwh = curRow?.kwh != null ? Number(curRow.kwh) : null;
+  const unAllocated = tableKwh != null && allocTotals.amount > 0 ? Math.round((tableKwh - allocTotals.kwh) * 100) / 100 : null;
+  // 比较键：金额/柜数/主体统一规范化（空 = ""；金额保留 2 位），保证「只录柜数」的行也能判为已改动
+  const allocKeyOf = (brandId: any, amount: any, cabinet: any, entity: any) => {
+    const amt = amount == null || String(amount).trim() === "" || isNaN(Number(amount)) ? "" : Number(amount).toFixed(2);
+    const cab = cabinet == null || String(cabinet).trim() === "" ? "" : String(parseInt(String(cabinet), 10));
+    const ent = entity == null || String(entity).trim() === "" ? "" : String(parseInt(String(entity), 10));
+    return `${brandId}:${amt}:${cab}:${ent}`;
+  };
+  const savedAllocKey = ((allocForm.data?.allocations ?? []) as any[])
+    .map((a) => allocKeyOf(a.brandId, a.collectAmount, a.cabinetCount, a.entityId)).sort().join("|");
+  const allocDirty = allocFilled
+    .map((r) => allocKeyOf(r.brandId, r.collectAmount, r.cabinetCount, r.entityId)).sort().join("|") !== savedAllocKey;
+  const saveAlloc = useMutation({
+    mutationFn: () => saveSharedAllocations({
+      address: meter.meterNo, monthPeriod: allocPeriod,
+      rows: allocFilled.map((r) => ({
+        brandId: Number(r.brandId),
+        // 金额留空 → 传 null（后端存 NULL = 本月不计电费，只保留柜数/主体）
+        collectAmount: r.collectAmount.trim() === "" ? null : parseFloat(r.collectAmount),
+        unitPrice: r.unitPrice.trim() === "" ? null : parseFloat(r.unitPrice),
+        cabinetCount: r.cabinetCount.trim() === "" ? null : parseInt(r.cabinetCount, 10),
+        entityId: r.entityId.trim() === "" ? null : parseInt(r.entityId, 10),
+      })),
+    }),
+    onSuccess: () => {
+      toast.success("品牌分摊已保存，台账已重算");
+      queryClient.invalidateQueries({ queryKey: ["shared-allocations"] });
+      queryClient.invalidateQueries({ queryKey: ["electricity"] });
+      queryClient.invalidateQueries({ queryKey: ["electricity-monthly-ledger-range"] });
+    },
+    onError: (e: any) => toast.error(e?.response?.data?.detail || e.message || "保存失败"),
+  });
+  const entityOptions = ((allocForm.data?.allEntities ?? []) as any[]).map((e) => ({
+    value: String(e.entityId), label: e.entityName || e.entityFullName || `主体${e.entityId}`,
+  }));
+  const brandOptions = useMemo(() => {
+    const withC = ((allocForm.data?.brands ?? []) as any[]).map((b) => ({
+      value: String(b.brandId), label: b.unitPrice != null ? `${b.brandName}（${b.unitPrice}）` : b.brandName,
+    }));
+    const used = new Set(withC.map((o) => o.value));
+    const rest = ((allocForm.data?.allBrands ?? []) as any[])
+      .filter((b) => !used.has(String(b.brandId)))
+      .map((b) => ({ value: String(b.brandId), label: b.brandName }));
+    return [...withC, ...rest];
+  }, [allocForm.data]);
+
+  /* ══ 3. 柜子档案（普通表 / 共用表都可用）：单行胶囊 ══ */
   const cabinets = useQuery({
     queryKey: ["cabinets", meter.id],
     queryFn: () => listCabinets({ meterId: meter.id }),
-    enabled: isExpanded,
+    enabled: !!meter?.id,
   });
-
-  // ── 共享电表柜数：brand_id 为空，各品牌在该表下没有自己的电表，「数 cabinets」永远数不到 ──
-  // 柜数只能取「品牌分摊（各品牌应收电费）」按品牌逐月录入的 cabinet_count。
-  // 与后端 shared_allocation_repo.shared_meter_cabinets / 合同页 / 看板同一口径：
-  //   managedByAlloc=true  → 合计各品牌录入柜数（此时后端会排除该表的整表计数，避免双算）
-  //   managedByAlloc=false → 完全没录过，退回整表口径 max(1, cabinets 记录数)
-  const isSharedMeter = meter.tag === "共享电表";
-  const sharedCabUsage = useQuery({
-    queryKey: ["sharedCabinetUsage", "all"],
-    queryFn: () => getSharedCabinetUsage(),
-    enabled: isSharedMeter,
-    staleTime: 60_000,
-  });
-  const sharedCabItem = (isSharedMeter
-    ? (sharedCabUsage.data?.meters ?? []).find((s: SharedCabinetUsageItem) => s.meterId === meter.id)
-    : undefined) as SharedCabinetUsageItem | undefined;
-  const allocCabCount: number | null = sharedCabItem?.managedByAlloc
-    ? Object.values(sharedCabItem.brandCabs ?? {}).reduce((s: number, v: number) => s + Number(v || 0), 0)
-    : null;
-  // 未按品牌录入柜数时的整表口径：展开了就用本表 cabinets 记录数（实时），
-  // 收起时共享表用后端算好的 fallbackCabs（= GREATEST(1, 柜子记录数)），避免固定显示 1。
-  const localCabCount: number = cabinets.data
-    ? Math.max(1, cabinets.data.length)
-    : (sharedCabItem ? (Number(sharedCabItem.fallbackCabs || 0) || 1) : 1);
-  // 头部与展开区统一用这个值
-  const cabinetCount: number = allocCabCount ?? localCabCount;
-  // 悬浮提示用：各品牌柜数明细
-  const allocCabDetail = Object.entries((sharedCabItem?.brandCabs ?? {}) as Record<string, number>)
-    .map(([b, c]) => `品牌${b} ${c}`)
-    .join("、");
-
-  // 共享表柜数明细里展示品牌名（与列表页共用 ["brands"] 缓存，不额外发请求）
-  const brandsQ = useQuery({
-    queryKey: ["brands"],
-    queryFn: listBrands,
-    enabled: isSharedMeter && isExpanded,
-    staleTime: 5 * 60_000,
-  });
-  const brandNameOf = (bid: number) =>
-    (brandsQ.data ?? []).find((b: any) => b.id === bid)?.name ?? `品牌${bid}`;
-
   const [cabinetFormOpen, setCabinetFormOpen] = useState(false);
   const [editCabinet, setEditCabinet] = useState<any>(null);
-
   const delCabinet = useMutation({
     mutationFn: deleteCabinet,
     onSuccess: () => { toast.success("已删除"); queryClient.invalidateQueries({ queryKey: ["cabinets"] }); },
   });
 
   return (
-    <div className="rounded-lg border bg-slate-50/50">
-      {/* 电表头部 */}
-      <div
-        className="flex items-center justify-between px-4 py-2.5 cursor-pointer hover:bg-slate-100/50"
-        onClick={onToggle}
-      >
-        <div className="flex items-center gap-3">
-          {isExpanded ? <ChevronDown className="h-4 w-4 text-slate-400" /> : <ChevronRight className="h-4 w-4 text-slate-300" />}
-          <div>
-            <div className="flex items-center gap-2">
-              <span className="font-mono text-sm font-medium">{meter.meterNo}</span>
-              <span className={`text-xs ${!meter.brandName && meter.tag === "共享电表" ? "font-medium text-purple-600" : "text-slate-500"}`}>
-                {meter.brandName ?? (meter.tag === "共享电表" ? "全品牌共享" : "未设置品牌")}
-              </span>
-              <span className={`rounded-full px-2 py-0.5 text-[10px] ${meter.tag === "民用电表" ? "bg-amber-100 text-amber-700" : meter.tag === "共享电表" ? "bg-purple-100 text-purple-700" : "bg-blue-100 text-blue-700"}`}>
-                {meter.tag ?? "合作商电表"}
-              </span>
-              {meter.source === "synced" && (
-                <span className="rounded-full bg-teal-100 px-2 py-0.5 text-[10px] text-teal-700" title="已接入第三方电表平台（天雀）同步读数">第三方</span>
-              )}
-              <StatusBadge status={meter.status} />
-            </div>
-            <div className="text-[11px] text-slate-400">{meter.meterName ?? ""}</div>
-            {entityMismatchHint && (
-              <div className="text-[11px] text-amber-600">{entityMismatchHint}</div>
+    <div>
+      {/* ── 月度读数（★只显示工具栏所选月份区间，一行一月）── */}
+      <div className="xl-dtitle">
+        {meter.meterNo} · 月度读数
+        <span className="rounded border border-slate-300 bg-white px-1.5 py-0.5 text-[10px] font-normal text-slate-600">
+          仅显示工具栏所选月份：{rangeLabelText}（{readingRows.length} 个月）
+        </span>
+        <span className="sub">单元格直接改，失焦即存并重算台账 · 黄底 = 已改未存 · 绿底 = 品牌分摊对应月份</span>
+      </div>
+      <div className="xl-dwrap">
+        <table>
+          <thead>
+            <tr>
+              <th style={{ width: 64 }}>月份</th>
+              <th style={{ width: 104 }}>平台电量</th>
+              <th style={{ width: 104 }}>实际电量</th>
+              <th style={{ width: 92 }}>起始度数</th>
+              <th style={{ width: 92 }}>抄表度数</th>
+              <th style={{ width: 100 }}>上月实际读数</th>
+              <th style={{ width: 100 }}>本月实际读数</th>
+              <th style={{ width: 118 }} title="上次抄表日期：不早于上月末号（账期为自然月）">起始日期</th>
+              <th style={{ width: 118 }} title="本次抄表日期：不早于起始日期、不晚于次月1号（默认月底）">截止日期</th>
+              <th style={{ width: 60 }}>来源</th>
+            </tr>
+          </thead>
+          <tbody>
+            {readingRows.map((r) => (
+              <tr key={r.monthPeriod} className={r.monthPeriod === allocPeriod ? "bg-[#eef7f1]" : undefined}>
+                <td className="ctr">{toDisplay(r.monthPeriod)}</td>
+                <td className="num" title={r.rawKwh != null ? `原始表码 ${fmtNum(r.rawKwh)} × 倍数` : "未同步"}>
+                  {r.kwh != null ? fmtNum(r.kwh) : <span className="text-slate-400">—</span>}
+                </td>
+                <td className={dirtyCell(r, "actual") ? "num xl-edited" : "num"}>
+                  {cellInput(r, "actual", { type: "number", step: "0.01", num: true, placeholder: r.kwh != null ? String(r.kwh) : "" })}
+                </td>
+                <td className={dirtyCell(r, "prev") ? "num xl-edited" : "num"}>{cellInput(r, "prev", { type: "number", step: "0.01", num: true })}</td>
+                <td className={dirtyCell(r, "curr") ? "num xl-edited" : "num"}>{cellInput(r, "curr", { type: "number", step: "0.01", num: true })}</td>
+                <td className={dirtyCell(r, "prevA") ? "num xl-edited" : "num"}>{cellInput(r, "prevA", { type: "number", step: "0.01", num: true })}</td>
+                <td className={dirtyCell(r, "currA") ? "num xl-edited" : "num"}>{cellInput(r, "currA", { type: "number", step: "0.01", num: true })}</td>
+                <td className={dirtyCell(r, "prevD") ? "ctr xl-edited" : "ctr"}
+                  title={`上次抄表日期（≥ 上月末号 ${dateEdgesOf(r.monthPeriod).prevMonthEnd}）`}>
+                  {cellInput(r, "prevD", {
+                    type: "date",
+                    min: dateEdgesOf(r.monthPeriod).prevMonthEnd,
+                    max: dateEdgesOf(r.monthPeriod).monthEnd,
+                  })}
+                </td>
+                <td className={dirtyCell(r, "currD") ? "ctr xl-edited" : "ctr"}
+                  title={`本次抄表日期（≥ 起始日期，≤ 次月1号 ${dateEdgesOf(r.monthPeriod).nextMonthFirst}；默认月底）`}>
+                  {cellInput(r, "currD", {
+                    type: "date",
+                    min: draftOf(r).prevD || dateEdgesOf(r.monthPeriod).prevMonthEnd,
+                    max: dateEdgesOf(r.monthPeriod).nextMonthFirst,
+                  })}
+                </td>
+                <td className="ctr">
+                  {r.actualKwh != null ? <span className="text-emerald-600">人工</span>
+                    : r.kwh != null ? <span className="text-sky-600">第三方</span>
+                    : <span className="text-rose-500">缺</span>}
+                </td>
+              </tr>
+            ))}
+            {readingRows.length === 0 && (
+              <tr><td colSpan={10} className="ctr" style={{ color: "#94a3b8", padding: 10 }}>该表暂无月度读数</td></tr>
             )}
-          </div>
-        </div>
-        <div className="flex items-center gap-2">
-          <span className="text-xs text-slate-400">互感器倍数：{fmtNum(meter.transformerRatio)}</span>
-          <span className="text-xs text-slate-400"
-            title={allocCabCount != null
-              ? `共享电表：合计「品牌分摊（各品牌应收电费）」里各品牌录入的柜数（${allocCabDetail}）`
-              : undefined}>
-            柜数：{cabinetCount}
-          </span>
-          <button className="rounded p-1 text-slate-400 hover:text-blue-600" onClick={(e) => { e.stopPropagation(); onReading(); }} title="录入读数"><BookOpen className="h-3.5 w-3.5" /></button>
-          <button className="rounded p-1 text-slate-400 hover:text-emerald-600" onClick={(e) => { e.stopPropagation(); onEdit(); }}><Pencil className="h-3.5 w-3.5" /></button>
-          <button className="rounded p-1 text-slate-400 hover:text-rose-500" onClick={(e) => { e.stopPropagation(); onDelete(); }}><Trash2 className="h-3.5 w-3.5" /></button>
-        </div>
+          </tbody>
+        </table>
       </div>
 
-      {/* 展开内容：柜子列表 */}
-      {isExpanded && (
-        <div className="border-t px-4 py-3">
-          <div className="flex items-center justify-between mb-2">
-            <span className="text-xs font-semibold text-slate-600">
-              {allocCabCount != null ? `品牌分摊柜数（合计 ${allocCabCount} 个）` : `柜子列表（${localCabCount} 个）`}
-            </span>
-            {allocCabCount == null && (
-              <Button
-                size="sm"
-                variant="outline"
-                className={highlightCabinet ? "ring-2 ring-rose-400 border-rose-400 text-rose-600 animate-breath" : ""}
-                onClick={() => { setEditCabinet(null); setCabinetFormOpen(true); }}
-              >
-                <Plus className="mr-1 h-3 w-3" />添加柜子
-              </Button>
-            )}
-          </div>
-          {allocCabCount != null ? (
-            <div className="space-y-2">
-              <p className="text-xs leading-relaxed text-slate-500">
-                共享电表（全品牌共用）下各品牌<b>没有自己的电表</b>，柜数只能在
-                <b>「品牌分摊（各品牌应收电费）」</b>模块按品牌逐月录入，计费以品牌录入值为准；
-                因此本表下不再单独维护柜子记录（此处记录不计入柜数）。
-              </p>
-              <div className="flex flex-wrap items-center gap-1.5">
-                {Object.entries((sharedCabItem?.brandCabs ?? {}) as Record<string, number>).map(([bid, c]) => (
-                  <span key={bid} className="rounded-full border border-purple-200 bg-purple-50 px-2 py-0.5 text-[11px] text-purple-700">
-                    {brandNameOf(Number(bid))}：{c} 柜
-                  </span>
+      {/* ── 品牌分摊（共用表；按月录入 —— 默认区间末月，多个月时用下面的小标签切换）── */}
+      {isShared && (
+        <>
+          <div className="xl-dtitle" id="shared-alloc-section" style={{ marginTop: 10 }}>
+            {meter.meterNo} · 品牌分摊 · {toDisplay(allocPeriod)}
+            {/* 选了多个月：分摊是【单月口径】，给月份小标签切换 */}
+            {allocMonths.length > 1 && (
+              <span className="flex flex-wrap items-center gap-0.5 font-normal">
+                {allocMonths.map((mp) => (
+                  <button key={mp} type="button" onClick={() => setAllocPeriod(mp)}
+                    title={`编辑 ${toDisplay(mp)} 的品牌分摊`}
+                    className={`rounded border px-1.5 py-0.5 text-[10px] transition-colors ${
+                      mp === allocPeriod
+                        ? "border-purple-400 bg-purple-50 font-medium text-purple-700"
+                        : "border-slate-200 bg-white text-slate-500 hover:bg-slate-50"
+                    }`}>
+                    {toDisplay(mp)}
+                  </button>
                 ))}
-                <span className="rounded-full border border-amber-300 bg-amber-50 px-2 py-0.5 text-[11px] font-medium text-amber-800">
-                  合计 {allocCabCount} 柜
-                </span>
-              </div>
-            </div>
-          ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full text-xs">
+              </span>
+            )}
+            {missingBrands.length > 0 && (
+              <span className="rounded border border-rose-300 bg-rose-50 px-1.5 py-0.5 text-[10px] font-normal text-rose-700">
+                漏录：{missingBrands.map((b) => b.brandName).join("、")}
+              </span>
+            )}
+            <span className="ml-auto flex items-center gap-2">
+              <button className="text-[11px] font-normal text-purple-600 hover:underline"
+                onClick={() => setAllocRows((prev) => [...prev, { brandId: "", collectAmount: "", unitPrice: "", cabinetCount: "", entityId: "" }])}>
+                + 添加品牌
+              </button>
+              {allocDirty && (
+                <button className="rounded bg-purple-600 px-2 py-0.5 text-[11px] font-normal text-white hover:bg-purple-700"
+                  disabled={saveAlloc.isPending} onClick={() => saveAlloc.mutate()}>
+                  {saveAlloc.isPending ? "保存中…" : "保存分摊"}
+                </button>
+              )}
+            </span>
+          </div>
+          <div className="xl-dwrap">
+            <table>
               <thead>
-                <tr className="border-b bg-white">
-                  <th className="px-2.5 py-1.5 text-left font-medium text-slate-500">柜子编号</th>
-                  <th className="px-2.5 py-1.5 text-left font-medium text-slate-500">柜子类型</th>
-                  <th className="px-2.5 py-1.5 text-left font-medium text-slate-500">备注</th>
-                  <th className="px-2.5 py-1.5 text-center font-medium text-slate-500">操作</th>
+                <tr>
+                  <th style={{ width: 150 }}>品牌</th>
+                  <th style={{ width: 110 }}>应收电费</th>
+                  <th style={{ width: 96 }}>单价</th>
+                  <th style={{ width: 96 }}>应收电量</th>
+                  <th style={{ width: 60 }}>柜数</th>
+                  <th style={{ width: 130 }}>报税主体</th>
+                  <th style={{ width: 32 }}></th>
                 </tr>
               </thead>
               <tbody>
-                {(cabinets.data ?? []).map((c: any) => (
-                  <tr key={c.id} className="border-b last:border-0 hover:bg-white/50">
-                    <td className="px-2.5 py-1.5 font-medium">{c.cabinetNo}</td>
-                    <td className="px-2.5 py-1.5">
-                      <span className={`rounded-full px-2 py-0.5 text-[10px] ${c.cabinetType === "储电柜" ? "bg-blue-100 text-blue-700" : "bg-emerald-100 text-emerald-700"}`}>
-                        {c.cabinetType}
-                      </span>
-                    </td>
-                    <td className="px-2.5 py-1.5 text-slate-500">{c.remark ?? "-"}</td>
-                    <td className="px-2.5 py-1.5">
-                      <div className="flex justify-center gap-0.5">
-                        <button className="rounded p-1 text-slate-400 hover:text-emerald-600" onClick={() => { setEditCabinet(c); setCabinetFormOpen(true); }}><Pencil className="h-3 w-3" /></button>
-                        <button className="rounded p-1 text-slate-400 hover:text-rose-500" onClick={() => window.confirm("删除？") && delCabinet.mutate(c.id)}><Trash2 className="h-3 w-3" /></button>
-                      </div>
-                    </td>
+                {allocRows.map((r, i) => {
+                  const k = kwhOf(r);
+                  const cp = contractPriceOf(r.brandId);
+                  return (
+                    <tr key={`${r.brandId}-${i}`}>
+                      <td>
+                        <select value={r.brandId}
+                          onChange={(e) => {
+                            const bid = e.target.value;
+                            const d = allocForm.data?.cabinetDefaults?.[bid];
+                            setAllocRow(i, { brandId: bid, unitPrice: "", cabinetCount: d && d.count != null ? String(d.count) : "", entityId: "" });
+                          }}>
+                          <option value="">选择品牌</option>
+                          {brandOptions
+                            .filter((o) => o.value === r.brandId || !allocRows.some((r2, j) => j !== i && r2.brandId === o.value))
+                            .map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+                        </select>
+                      </td>
+                      <td className="num">
+                        <input type="number" step="0.01" min="0" className="xl-input num"
+                          value={r.collectAmount} onChange={(e) => setAllocRow(i, { collectAmount: e.target.value })} />
+                      </td>
+                      <td className="num">
+                        <input type="number" step="0.0001" min="0" className="xl-input num"
+                          placeholder={cp != null ? String(cp) : "无合同价"} title="留空 = 品牌方合同单价"
+                          value={r.unitPrice} onChange={(e) => setAllocRow(i, { unitPrice: e.target.value })} />
+                      </td>
+                      <td className="num">
+                        {k != null ? <span className="xl-derived">{fmtNum(k)}</span>
+                          : r.collectAmount ? <span className="text-rose-500">缺单价</span>
+                          : <span className="text-slate-400">—</span>}
+                      </td>
+                      <td className="num">
+                        <input type="number" step="1" min="1" className="xl-input num"
+                          value={r.cabinetCount} onChange={(e) => setAllocRow(i, { cabinetCount: e.target.value })} />
+                      </td>
+                      <td>
+                        <select value={r.entityId} title="留空 = 默认（电表自身主体）"
+                          onChange={(e) => setAllocRow(i, { entityId: e.target.value })}>
+                          <option value="">默认</option>
+                          {entityOptions.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+                        </select>
+                      </td>
+                      <td className="ctr">
+                        <button className="text-slate-300 hover:text-rose-500" title="删除该行"
+                          onClick={() => setAllocRows((prev) => prev.filter((_, idx) => idx !== i))}>
+                          <Trash2 className="h-3 w-3" />
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+                {allocRows.length === 0 && (
+                  <tr><td colSpan={7} className="ctr" style={{ color: "#94a3b8", padding: 10 }}>
+                    暂无品牌分摊 —— 点右上「+ 添加品牌」录入（保存后自动更新品牌绑定）
+                  </td></tr>
+                )}
+                <tr className="xl-dtotal">
+                  <td>合计</td>
+                  <td className="num">{fmtNum(allocTotals.amount)}</td>
+                  <td></td>
+                  <td className="num">{fmtNum(allocTotals.kwh)}</td>
+                  <td className="num">{allocTotals.cabs || ""}</td>
+                  <td colSpan={2}></td>
+                </tr>
+                {unAllocated != null && unAllocated !== 0 && (
+                  <tr>
+                    <td className="ctr" style={{ color: "#4f7a63" }}>表内未摊差额</td>
+                    <td colSpan={2} className="ctr" style={{ color: "#94a3b8" }}>整表 {fmtNum(tableKwh!)} − 品牌合计 {fmtNum(allocTotals.kwh)}</td>
+                    <td className="num xl-derived">{fmtNum(unAllocated)}</td>
+                    <td colSpan={3} className="ctr" style={{ color: "#94a3b8" }}>我方承担，不摊给品牌</td>
                   </tr>
-                ))}
-                {(cabinets.data ?? []).length === 0 && (
-                  <tr><td colSpan={4} className="py-4 text-center text-slate-400">暂无柜子，点击"添加柜子"添加</td></tr>
                 )}
               </tbody>
             </table>
           </div>
-          )}
-        </div>
+        </>
       )}
 
-      <CabinetForm
-        open={cabinetFormOpen}
-        onClose={() => { setCabinetFormOpen(false); setEditCabinet(null); }}
-        meterId={meter.id}
-        record={editCabinet}
-      />
+      {/* ── 柜子档案：普通表 / 共用表【都】可以录 ──
+           · 普通表：这里的柜子数就是该表柜数
+           · 共用表：没按品牌录分摊柜数时，系统就用这里的柜子数（后端按 cabinets 计数兜底，至少 1 柜）；
+             按品牌录过分摊柜数的话，场地费平摊以分摊为准（避免双算） */}
+      <div className="mt-2 flex flex-wrap items-center gap-1 text-[11px]">
+        <span className="font-semibold text-slate-600">柜子（{(cabinets.data ?? []).length}）</span>
+        {isShared ? (
+          allocTotals.cabs > 0 ? (
+            <span className="rounded border border-purple-200 bg-purple-50 px-1.5 py-0.5 text-[10px] text-purple-700"
+              title="该共用表本月品牌分摊里录了柜数 → 场地费/分红按分摊柜数算；下面的柜子档案作为台账明细保留">
+              按品牌分摊已录 {allocTotals.cabs} 柜（场地费平摊以它为准）
+            </span>
+          ) : (
+            <span className="rounded border border-amber-200 bg-amber-50 px-1.5 py-0.5 text-[10px] text-amber-700"
+              title="共用表未按品牌录分摊柜数时，系统按这里挂的柜子数计费（至少 1 柜）">
+              未按品牌录分摊柜数 → 以这里的柜子数为准
+            </span>
+          )
+        ) : (
+          <span className="text-slate-400">柜数只影响场地费平摊成本</span>
+        )}
+        {(cabinets.data ?? []).map((c: any) => (
+          <span key={c.id} className="group flex items-center gap-1 rounded border border-slate-200 bg-white px-1.5 py-0.5 text-[10px] text-slate-600">
+            {c.cabinetNo}
+            <span className={c.cabinetType === "储电柜" ? "text-blue-500" : "text-emerald-500"}>{c.cabinetType}</span>
+            <button className="text-slate-300 hover:text-emerald-600" title="编辑"
+              onClick={() => { setEditCabinet(c); setCabinetFormOpen(true); }}><Pencil className="h-2.5 w-2.5" /></button>
+            <button className="text-slate-300 hover:text-rose-500" title="删除"
+              onClick={() => window.confirm("删除该柜子？") && delCabinet.mutate(c.id)}><Trash2 className="h-2.5 w-2.5" /></button>
+          </span>
+        ))}
+        {(cabinets.data ?? []).length === 0 && <span className="text-slate-400">暂无柜子</span>}
+        <button className="rounded border border-dashed border-slate-300 px-1.5 py-0.5 text-[10px] text-slate-500 hover:border-emerald-400 hover:text-emerald-600"
+          onClick={() => { setEditCabinet(null); setCabinetFormOpen(true); }}>+ 添加柜子</button>
+        <CabinetForm
+          open={cabinetFormOpen}
+          onClose={() => { setCabinetFormOpen(false); setEditCabinet(null); }}
+          meterId={meter.id}
+          record={editCabinet}
+        />
+      </div>
     </div>
   );
 }
-
-// ─── 电表表单 ───
 function MeterForm({ open, onClose, record }: { open: boolean; onClose: () => void; record?: any }) {
   const { user } = useAuth();
   const tagScope = user?.meterTagScope || "";
-  const blank = { brandId: "", landlordId: "", entityId: "", meterNo: "", meterName: "", collectorId: "", transformerRatio: "", tag: tagScope || "合作商电表", remark: "" };
+  // ★V5：表单同时持有「大类（码值）」与「是否共用（布尔）」两个**互相独立**的字段
+  const scopeCode = tagScope ? (TAG_TO_CODE[tagScope] || tagScope) : "";
+  const blank = {
+    brandId: "", landlordId: "", entityId: "", meterNo: "", meterName: "",
+    collectorId: "", transformerRatio: "",
+    categoryCode: scopeCode || "partner",   // 大类（码值）
+    isShared: false,                        // 是不是"所有品牌共用一个表"
+    deviceAddress: "", initialReading: "",
+    remark: "",
+  };
   const [f, setF] = useState(blank);
   const queryClient = useQueryClient();
   const landlords = useQuery({ queryKey: ["landlords"], queryFn: listLandlords, enabled: open });
@@ -682,7 +1400,11 @@ function MeterForm({ open, onClose, record }: { open: boolean; onClose: () => vo
         entityId: record.entityId ? String(record.entityId) : "",
         meterNo: record.meterNo ?? "", meterName: record.meterName ?? "",
         collectorId: record.collectorId ?? "", transformerRatio: String(record.transformerRatio ?? ""),
-        tag: record.tag ?? (tagScope || "合作商电表"), remark: record.remark ?? "",
+        categoryCode: codeOf(record),
+        isShared: isSharedOf(record),
+        deviceAddress: record.deviceAddress ?? "",
+        initialReading: record.initialReading != null ? String(record.initialReading) : "",
+        remark: record.remark ?? "",
       });
       setRegenScope("all");
     } else setF(blank);
@@ -690,17 +1412,11 @@ function MeterForm({ open, onClose, record }: { open: boolean; onClose: () => vo
 
   const set = (k: string) => (v: string) => setF((p) => ({ ...p, [k]: v }));
 
-  // 全品牌共享：标签=共享电表 即视为共享，开关与「标签」下拉双向联动。
-  // 数据范围限定为「共享电表」时开关锁定为开；限定其他类型时不可开启（无法建共享表）。
-  const isShared = f.tag === "共享电表";
-  const sharedLockedOn = tagScope === "共享电表";
-  const sharedHidden = !!tagScope && tagScope !== "共享电表";
+  // ★V5：「是否所有品牌共用一个表」= **表级属性**，与「电表大类」彻底解耦（不再联动）。
+  // 由人工勾选，系统不做任何推导 —— 这正是「滇池两块被写错」的根治。
+  const isShared = f.isShared;
   const toggleShared = (on: boolean) => {
-    setF((p) => ({
-      ...p,
-      tag: on ? "共享电表" : (p.tag === "共享电表" ? (tagScope || "合作商电表") : p.tag),
-      brandId: on ? "" : p.brandId,
-    }));
+    setF((p) => ({ ...p, isShared: on, brandId: on ? "" : p.brandId }));
   };
 
   const save = useMutation({
@@ -740,51 +1456,64 @@ function MeterForm({ open, onClose, record }: { open: boolean; onClose: () => vo
       meterName: f.meterName.trim() || null,
       collectorId: f.collectorId.trim() || null,
       transformerRatio: f.transformerRatio ? Number(f.transformerRatio) : 1,
-      tag: f.tag || "合作商电表",
+      // ★V5：大类走 categoryCode（码值）；「是否共用」是独立表级字段
+      categoryCode: f.categoryCode || "partner",
+      isShared: f.isShared,
+      deviceAddress: f.deviceAddress.trim() || null,
+      initialReading: f.initialReading.trim() === "" ? null : Number(f.initialReading),
       remark: f.remark.trim() || null,
     });
   };
 
   return (
     <Dialog open={open} onOpenChange={(o) => !o && onClose()}>
-      <DialogContent className="max-w-lg">
+      <DialogContent className="!max-w-4xl">
         <DialogHeader><DialogTitle>{record ? "编辑电表" : "新增电表"}</DialogTitle></DialogHeader>
         <div className="space-y-3">
-          <Field label="场地方 *">
-            <SearchSelect value={f.landlordId} onChange={set("landlordId")} placeholder="请选择或搜索场地方"
-              options={(landlords.data ?? []).map((l: any) => ({ value: String(l.id), label: l.name }))} />
-          </Field>
-          <div className="-mt-2 text-[11px] text-slate-400">
-            v3：电表直接归属场地方 + 品牌方（不再经站点）。
-          </div>
-          {/* 全品牌共享开关：场地内所有品牌共用一块电表时开启，无需选择品牌方 */}
-          {!sharedHidden && (
-            <div className="flex items-center gap-3 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5">
-              <Switch checked={isShared} onCheckedChange={toggleShared} disabled={sharedLockedOn} />
-              <div>
-                <div className="text-sm text-slate-700">所有品牌共用此电表</div>
-                <div className="text-[11px] text-slate-400">
-                  {sharedLockedOn
-                    ? "当前账号的数据范围限定为「共享电表」，此开关保持开启"
-                    : "开启后无需选择品牌方（标签自动记为「共享电表」），适用于场地内各品牌共用的总表"}
+          {/* ── 第 1 行：归属（场地方 / 品牌 / 主体 / 大类）── */}
+          <div className="grid grid-cols-4 gap-x-4 gap-y-3">
+            <Field label="场地方 *">
+              <SearchSelect value={f.landlordId} onChange={set("landlordId")} placeholder="选择 / 搜索场地方"
+                options={(landlords.data ?? []).map((l: any) => ({ value: String(l.id), label: l.name }))} />
+            </Field>
+            <Field label="品牌方">
+              {isShared ? (
+                <div className="rounded-md border border-purple-200 bg-purple-50 px-2.5 py-1.5 text-[13px] text-purple-700">
+                  全部品牌方共用（无需选择）
                 </div>
-              </div>
-            </div>
-          )}
-          <Field label="品牌方">
-            {isShared ? (
-              <div className="rounded-md border border-purple-200 bg-purple-50 px-2.5 py-1.5 text-sm text-purple-700">
-                全部品牌方共用（无需选择）
-              </div>
-            ) : (
-              <SearchSelect value={f.brandId} onChange={set("brandId")} placeholder="未指定（可搜索品牌方）"
-                options={(brands.data ?? []).map((b: any) => ({ value: String(b.id), label: b.name }))} />
-            )}
-          </Field>
-          <Field label="报税公司主体">
-            <SearchSelect value={f.entityId} onChange={set("entityId")} placeholder="未指定（可搜索公司主体）"
-              options={(entities.data ?? []).map((e: any) => ({ value: String(e.id), label: e.name }))} />
-          </Field>
+              ) : (
+                <SearchSelect value={f.brandId} onChange={set("brandId")} placeholder="未指定（可搜索）"
+                  options={(brands.data ?? []).map((b: any) => ({ value: String(b.id), label: b.name }))} />
+              )}
+            </Field>
+            <Field label="报税公司主体">
+              <SearchSelect value={f.entityId} onChange={set("entityId")} placeholder="未指定（可搜索）"
+                options={(entities.data ?? []).map((e: any) => ({ value: String(e.id), label: e.name }))} />
+            </Field>
+            <Field label="电表大类">
+              {tagScope ? (
+                <div className="rounded-md border border-violet-200 bg-violet-50 px-2.5 py-1.5 text-[13px] text-violet-700">
+                  {CATEGORY_LABEL[scopeCode] || tagScope}（账号范围）
+                </div>
+              ) : (
+                <SelectInput value={f.categoryCode} onChange={set("categoryCode")}
+                  options={CATEGORY_OPTIONS} />
+              )}
+            </Field>
+          </div>
+
+          {/* ── 共用开关（整行，紧凑单行）── */}
+          <div className="flex items-center gap-3 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+            <Switch checked={isShared} onCheckedChange={toggleShared} />
+            <span className="text-[13px] font-medium text-slate-700">所有品牌共用此电表</span>
+            <span className="text-[11px] text-slate-400">
+              {isShared
+                ? "「由哪几个品牌共享」在列表展开行 → 品牌分摊里录入"
+                : "多个品牌共用同一块表（读数只有合计）时开启 · 与「电表大类」无关"}
+            </span>
+          </div>
+
+          {/* ── 换主体提示（整行，仅在主体变化时出现）── */}
           {entityChanged && (
             <div className="space-y-1.5 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] text-amber-700">
               <div className="font-semibold">更换公司主体将影响电费台账归属</div>
@@ -818,26 +1547,29 @@ function MeterForm({ open, onClose, record }: { open: boolean; onClose: () => vo
               </div>
             </div>
           )}
-          <Field label="电表编号 *"><TextInput value={f.meterNo} onChange={set("meterNo")} /></Field>
-          <Field label="电表名称"><TextInput value={f.meterName} onChange={set("meterName")} /></Field>
-          <Field label="标签">
-            {tagScope ? (
-              <div className="rounded-md border border-violet-200 bg-violet-50 px-2.5 py-1.5 text-sm text-violet-700">
-                {tagScope}（当前账号数据范围）
-              </div>
-            ) : (
-              <SelectInput value={f.tag} onChange={set("tag")}
-                options={[
-                  { value: "合作商电表", label: "合作商电表" },
-                  { value: "民用电表", label: "民用电表" },
-                  { value: "共享电表", label: "共享电表" },
-                ]} />
-            )}
-          </Field>
-          <Field label="采集器号"><TextInput value={f.collectorId} onChange={set("collectorId")} /></Field>
-          <Field label="互感器倍数"><NumInput value={f.transformerRatio} onChange={set("transformerRatio")} placeholder="1" /></Field>
-          <Field label="备注"><TextInput value={f.remark} onChange={set("remark")} /></Field>
-          <div className="flex justify-end gap-2">
+
+          {/* ── 第 2 行：编号 / 名称 / 采集器 / 设备地址 ── */}
+          <div className="grid grid-cols-4 gap-x-4 gap-y-3">
+            <Field label="电表编号 *"><TextInput value={f.meterNo} onChange={set("meterNo")} /></Field>
+            <Field label="电表名称"><TextInput value={f.meterName} onChange={set("meterName")} /></Field>
+            <Field label="采集器号"><TextInput value={f.collectorId} onChange={set("collectorId")} /></Field>
+            <Field label="设备地址（第三方）">
+              <TextInput value={f.deviceAddress} onChange={set("deviceAddress")} placeholder="留空 = 自建无设备" />
+            </Field>
+            <Field label="投运起始表码">
+              <NumInput value={f.initialReading} onChange={set("initialReading")} placeholder="换表时新表起始读数" />
+            </Field>
+            <Field label="互感器倍数"><NumInput value={f.transformerRatio} onChange={set("transformerRatio")} placeholder="1" /></Field>
+            <Field label="备注"><TextInput value={f.remark} onChange={set("remark")} /></Field>
+          </div>
+
+          <div className="-mt-1 text-[11px] leading-relaxed text-slate-400">
+            读数同步按「设备地址」对上电表 —— <b>改电表编号不会丢读数</b>（编号是给人看的）；
+            「大类」= 分给哪个财务管的职责分组，不参与任何计算；
+            实际电量 = 表码 × 互感器倍数（历史月份按读数时的快照倍数算）。
+          </div>
+
+          <div className="flex justify-end gap-2 pt-1">
             <Button variant="outline" onClick={onClose}>取消</Button>
             <Button className="bg-emerald-600 hover:bg-emerald-700" disabled={save.isPending} onClick={submit}>保存</Button>
           </div>
@@ -847,925 +1579,6 @@ function MeterForm({ open, onClose, record }: { open: boolean; onClose: () => vo
   );
 }
 
-// ─── 录入读数表单 ───
-// 共享电表（「所有品牌共用此电表」）额外支持按品牌录入「应收电费」：
-//   录入值 = 品牌方付给我方的电费（收款/收入，含税）；用电量 = 金额 ÷ 单价 倒推。
-//   该表某月录了品牌分摊后，台账不再按「整表读数 × 合同单价」出一行，而是按品牌拆行。
-function ReadingForm({ open, onClose, meter }: { open: boolean; onClose: () => void; meter: any }) {
-  const now = new Date();
-  const defaultPeriod = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, "0")}`;
-  const [monthPeriod, setMonthPeriod] = useState(defaultPeriod);
-  const [kwh, setKwh] = useState("");
-  const [actualKwh, setActualKwh] = useState(""); // 实际值（可选，填了优先用）
-  const [prevActualReading, setPrevActualReading] = useState(""); // 上月实际电表读数（人工填，同步不覆盖）
-  const [currActualReading, setCurrActualReading] = useState(""); // 本月实际电表读数（人工填，同步不覆盖）
-  const [prevReadingDate, setPrevReadingDate] = useState("");
-  const [prevReading, setPrevReading] = useState("");
-  const [currReadingDate, setCurrReadingDate] = useState("");
-  const [currReading, setCurrReading] = useState("");
-  const [calcKwh, setCalcKwh] = useState(true); // 是否自动计算区间度数
-  const queryClient = useQueryClient();
-
-  // 共享电表：标签为「共享电表」且未指定品牌方（=「所有品牌共用此电表」开关打开的状态）
-  const isShared = !!meter && meter.tag === "共享电表" && !meter.brandId;
-  // 品牌分摊行（unitPrice 留空 = 用该品牌方合同单价；cabinetCount 留空 = 本月未填柜数；
-  // entityId 留空 = 默认报税主体，即整场地口径的共享电表自身主体）
-  const [allocRows, setAllocRows] = useState<
-    { brandId: string; collectAmount: string; unitPrice: string; cabinetCount: string; entityId: string }[]
-  >([]);
-  // 整表度数手动补录（共享电表：第三方未同步，或需人工修正物理读数时用）
-  const [editingTableKwh, setEditingTableKwh] = useState(false);
-  const [manualKwh, setManualKwh] = useState("");
-
-  // 加载该电表已有的读数
-  const readings = useQuery({
-    queryKey: ["meterReadings", meter?.meterNo],
-    queryFn: () => getMeterReadings(meter.meterNo),
-    // 共享电表也加载读数：用于回填下方「整表抄表记录」输入区，并核对「整表度数 vs 分摊倒推合计」
-    enabled: open && !!meter?.meterNo,
-  });
-
-  // 共享电表：加载品牌分摊表单数据（候选品牌 + 合同单价 + 已录入分摊）
-  const allocForm = useQuery({
-    queryKey: ["shared-allocations", meter?.meterNo, monthPeriod],
-    queryFn: () => getSharedAllocationForm({ meterNo: meter.meterNo, monthPeriod }),
-    enabled: open && isShared && !!meter?.meterNo && !!monthPeriod,
-  });
-
-  // 电柜数量默认值：该品牌最近一次填写值（柜数逐月可动态调整）
-  // 仅在某月「尚无分摊记录」时用于预填；已录入月份严格回填已存值（清空就是清空）
-  const cabinetDefaultOf = (brandId: string): { count: number; monthPeriod: string } | null => {
-    const d = allocForm.data?.cabinetDefaults?.[String(brandId)];
-    return d && d.count != null ? { count: Number(d.count), monthPeriod: d.monthPeriod } : null;
-  };
-
-  // 分摊数据回填：切换到已有分摊的月份 → 填已录入值；没有则预填该场地已签合同的品牌（金额留空）
-  // 电柜数量：没有分摊记录的月份，用该品牌最近一次填写值预填（本月改了 → 下月默认就是新值）
-  // 报税主体：只回填「人工指定过」的值；留空 = 默认（整场地主体，界面显示为默认项）
-  useEffect(() => {
-    const d = allocForm.data;
-    if (!open || !isShared || !d || d.monthPeriod !== monthPeriod) return;
-    if ((d.allocations ?? []).length > 0) {
-      setAllocRows(d.allocations.map((a: any) => ({
-        brandId: String(a.brandId),
-        collectAmount: a.collectAmount != null ? String(a.collectAmount) : "",
-        // 只有「人工覆盖价」才回填输入框；合同价留在 placeholder 里动态取
-        unitPrice: a.unitPrice != null ? String(a.unitPrice) : "",
-        cabinetCount: a.cabinetCount != null ? String(a.cabinetCount) : "",
-        entityId: a.entityId != null ? String(a.entityId) : "",
-      })));
-    } else {
-      setAllocRows(((d.brands ?? []) as any[]).map((b) => {
-        const def = cabinetDefaultOf(String(b.brandId));
-        return {
-          brandId: String(b.brandId), collectAmount: "", unitPrice: "",
-          cabinetCount: def ? String(def.count) : "",
-          entityId: "",
-        };
-      }));
-    }
-  }, [allocForm.data, monthPeriod, open, isShared]);
-
-  // 切换月份时自动填充已有数据
-  useEffect(() => {
-    if (!readings.data || !monthPeriod) {
-      setKwh("");
-      setActualKwh("");
-      setPrevActualReading("");
-      setCurrActualReading("");
-      setPrevReadingDate("");
-      setPrevReading("");
-      setCurrReadingDate("");
-      setCurrReading("");
-      return;
-    }
-    const existing = readings.data.find((r: any) => r.monthPeriod === monthPeriod);
-    if (existing) {
-      // 回填原始表码度数（kwh 已是实际度数 = 表码 × 倍数，编辑用 rawKwh 避免二次相乘）
-      setKwh(existing.rawKwh != null ? String(existing.rawKwh) : existing.kwh ? String(existing.kwh) : "");
-      setActualKwh(existing.actualKwh != null ? String(existing.actualKwh) : "");
-      setPrevActualReading(existing.prevActualReading != null ? String(existing.prevActualReading) : "");
-      setCurrActualReading(existing.currActualReading != null ? String(existing.currActualReading) : "");
-      setPrevReadingDate(existing.prevReadingDate || "");
-      setPrevReading(existing.prevReading ? String(existing.prevReading) : "");
-      setCurrReadingDate(existing.currReadingDate || "");
-      setCurrReading(existing.currReading ? String(existing.currReading) : "");
-    } else {
-      setKwh("");
-      setActualKwh("");
-      setPrevActualReading("");
-      setCurrActualReading("");
-      setPrevReadingDate("");
-      setPrevReading("");
-      setCurrReadingDate("");
-      setCurrReading("");
-    }
-  }, [readings.data, monthPeriod]);
-
-  useEffect(() => {
-    if (open) {
-      setMonthPeriod(defaultPeriod);
-      setEditingTableKwh(false);
-      setManualKwh("");
-    }
-  }, [open]);
-
-  // 自动计算区间度数
-  useEffect(() => {
-    if (calcKwh && prevReading && currReading) {
-      const diff = parseFloat(currReading) - parseFloat(prevReading);
-      if (!isNaN(diff) && diff >= 0) {
-        setKwh(String(diff));
-      }
-    }
-  }, [prevReading, currReading, calcKwh]);
-
-  // ── 品牌分摊辅助计算 ──
-  const contractPriceOf = (brandId: string): number | null => {
-    const b = (allocForm.data?.brands ?? []).find((x: any) => String(x.brandId) === String(brandId));
-    return b?.unitPrice != null ? Number(b.unitPrice) : null;
-  };
-  const effectivePriceOf = (row: { brandId: string; unitPrice: string }): number | null => {
-    if (row.unitPrice.trim() !== "") {
-      const p = parseFloat(row.unitPrice);
-      return !isNaN(p) && p > 0 ? p : null;
-    }
-    return contractPriceOf(row.brandId);
-  };
-  const kwhOfRow = (row: { brandId: string; collectAmount: string; unitPrice: string }): number | null => {
-    const amount = parseFloat(row.collectAmount);
-    const price = effectivePriceOf(row);
-    if (isNaN(amount) || !price) return null;
-    return Math.round((amount / price) * 100) / 100;
-  };
-  // 候选品牌：该场地已签品牌方合同的品牌在前，其余品牌可手动添加
-  const brandOptions = useMemo(() => {
-    const withContract = (allocForm.data?.brands ?? []).map((b: any) => ({
-      value: String(b.brandId), label: b.unitPrice != null ? `${b.brandName}（合同价 ${b.unitPrice}）` : b.brandName,
-    }));
-    const used = new Set(withContract.map((o: { value: string }) => o.value));
-    const rest = (allocForm.data?.allBrands ?? [])
-      .filter((b: any) => !used.has(String(b.brandId)))
-      .map((b: any) => ({ value: String(b.brandId), label: b.brandName }));
-    return [...withContract, ...rest];
-  }, [allocForm.data]);
-  // 报税主体候选：留空 = 默认（整场地口径 = 该共享电表自身主体）
-  const entityOptions = useMemo(
-    () => ((allocForm.data?.allEntities ?? []) as any[]).map((e) => ({
-      value: String(e.entityId),
-      label: e.entityName || e.entityFullName || `主体${e.entityId}`,
-    })),
-    [allocForm.data],
-  );
-  const defaultEntityId = allocForm.data?.defaultEntityId != null ? String(allocForm.data.defaultEntityId) : "";
-  const defaultEntityName = entityOptions.find((o) => o.value === defaultEntityId)?.label
-    || (defaultEntityId ? `主体${defaultEntityId}` : "未设置场地主体");
-  const entityLabelOf = (row: { entityId: string }): string =>
-    row.entityId === "" ? `默认（${defaultEntityName}）`
-      : (entityOptions.find((o) => o.value === row.entityId)?.label || `主体${row.entityId}`);
-  // 合计（行数很少，直接算，不走 memo）
-  const allocTotals = (() => {
-    let amount = 0, kwhSum = 0, missingPrice = 0, cabinets = 0, cabinetsFilled = 0;
-    for (const r of allocRows) {
-      const a = parseFloat(r.collectAmount);
-      if (isNaN(a) || String(r.collectAmount).trim() === "") continue;
-      amount += a;
-      const k = kwhOfRow(r);
-      if (k == null) missingPrice += 1;
-      else kwhSum += k;
-      const cc = parseInt(r.cabinetCount, 10);
-      if (!isNaN(cc) && cc > 0) { cabinets += cc; cabinetsFilled += 1; }
-    }
-    return {
-      amount: Math.round(amount * 100) / 100,
-      kwh: Math.round(kwhSum * 100) / 100,
-      missingPrice,
-      cabinets,
-      cabinetsFilled,
-    };
-  })();
-
-  // ── 共享电表核对：第三方同步的整表月度实际度数 vs 品牌分摊倒推合计 ──
-  // 台账按「倒推电量 × 场地单价」付场地方，若与物理整表读数不一致，
-  // 差额（线损 / 公摊 / 漏报品牌）在账上无人承担，这里把它显性化。
-  const tableRow = (isShared && monthPeriod)
-    ? (readings.data ?? []).find((r: any) => r.monthPeriod === monthPeriod)
-    : undefined;
-  const tableKwhValue = tableRow?.kwh != null ? Number(tableRow.kwh) : null;
-  const tableKwh = tableKwhValue != null && !isNaN(tableKwhValue) && tableKwhValue > 0 ? tableKwhValue : null;
-  // actual_kwh 非空 = 人工补录/修正（该字段不随第三方同步覆盖）
-  const tableKwhIsManual = tableRow?.actualKwh != null;
-
-  // ── 场地方电费：付给场地方的电量 = 整表读数（可人工覆盖/补录）× 场地单价 ──
-  // 品牌方合计（倒推）小于付场地方电量时，差额即电表亏空/线损，由我方自负。
-  const venuePayPrice = allocForm.data?.payPrice != null ? Number(allocForm.data.payPrice) : null;
-  const venueBill = (() => {
-    const venuePayKwh = tableKwh;
-    const lossKwh = (venuePayKwh != null && allocTotals.amount > 0)
-      ? Math.round((venuePayKwh - allocTotals.kwh) * 100) / 100
-      : null;
-    const r2 = (x: number) => Math.round(x * 100) / 100;
-    return {
-      payKwh: venuePayKwh,
-      brandKwh: allocTotals.kwh,
-      lossKwh,
-      lossRate: lossKwh != null && venuePayKwh ? lossKwh / venuePayKwh : null,
-      payAmount: venuePayKwh != null && venuePayPrice != null ? r2(venuePayKwh * venuePayPrice) : null,
-      brandAmount: allocTotals.amount,
-      lossAmount: lossKwh != null && venuePayPrice != null ? r2(lossKwh * venuePayPrice) : null,
-    };
-  })();
-
-  // 切换月份：同时退出「整表读数补录」编辑态，避免残留上个月的输入
-  const changeMonth = (p: string) => {
-    setMonthPeriod(p);
-    setEditingTableKwh(false);
-    setManualKwh("");
-  };
-
-  const setAllocRow = (
-    i: number,
-    patch: Partial<{ brandId: string; collectAmount: string; unitPrice: string; cabinetCount: string; entityId: string }>,
-  ) => setAllocRows((prev) => prev.map((r, idx) => (idx === i ? { ...r, ...patch } : r)));
-  const addAllocRow = () => setAllocRows((prev) => [
-    ...prev, { brandId: "", collectAmount: "", unitPrice: "", cabinetCount: "", entityId: "" },
-  ]);
-  const removeAllocRow = (i: number) => setAllocRows((prev) => prev.filter((_, idx) => idx !== i));
-
-  // 是否有填了金额的分摊行（用于决定保存按钮可用性 / 是否需要调分摊接口）
-  const allocAmountRows = allocRows.filter((r) => r.brandId && String(r.collectAmount).trim() !== "");
-  // 读数是否相对「已保存值」有改动（含只改抄表日期）。
-  // 用与回填同源的比对而非「有没有内容」—— 否则共享表一旦回填了整表读数，
-  // 什么都没改也会被判定为可保存，白白触发一次台账重算。
-  const readingSavedRow = (readings.data ?? []).find((r: any) => r.monthPeriod === monthPeriod);
-  const readingValues = [kwh, actualKwh, prevActualReading, currActualReading,
-    prevReadingDate, prevReading, currReadingDate, currReading].join("|");
-  const readingBaseline = readingSavedRow
-    ? [
-      readingSavedRow.rawKwh != null ? String(readingSavedRow.rawKwh) : (readingSavedRow.kwh ? String(readingSavedRow.kwh) : ""),
-      readingSavedRow.actualKwh != null ? String(readingSavedRow.actualKwh) : "",
-      readingSavedRow.prevActualReading != null ? String(readingSavedRow.prevActualReading) : "",
-      readingSavedRow.currActualReading != null ? String(readingSavedRow.currActualReading) : "",
-      readingSavedRow.prevReadingDate || "",
-      readingSavedRow.prevReading ? String(readingSavedRow.prevReading) : "",
-      readingSavedRow.currReadingDate || "",
-      readingSavedRow.currReading ? String(readingSavedRow.currReading) : "",
-    ].join("|")
-    : "|||||||";
-  const hasReadingInput = readingValues !== readingBaseline;
-  // 共享电表：分摊改动 或 抄表信息改动 都可保存（含「清空全部金额」这种取消分摊的改动）
-  const savedAllocKey = ((allocForm.data?.allocations ?? []) as any[])
-    .map((a) => `${a.brandId}:${Number(a.collectAmount ?? 0).toFixed(2)}:`
-      + `${a.cabinetCount != null ? Number(a.cabinetCount) : ""}:`
-      + `${a.entityId != null ? Number(a.entityId) : ""}`)
-    .sort().join("|");
-  const currentAllocKey = allocAmountRows
-    .map((r) => `${r.brandId}:${parseFloat(r.collectAmount).toFixed(2)}:`
-      + `${r.cabinetCount.trim() === "" ? "" : parseInt(r.cabinetCount, 10)}:`
-      + `${r.entityId.trim() === "" ? "" : parseInt(r.entityId, 10)}`)
-    .sort().join("|");
-  const allocDirty = currentAllocKey !== savedAllocKey;
-  const canSave = isShared ? (allocDirty || hasReadingInput) : hasReadingInput;
-
-  // 共享电表月份快捷入口 = 已录分摊的月份 ∪ 有读数的月份（只有读数没分摊的月份也能直接跳过去补录）
-  const sharedPeriodOptions = useMemo(() => {
-    if (!isShared) return [] as string[];
-    const s = new Set<string>(allocForm.data?.periods ?? []);
-    for (const r of (readings.data ?? []) as any[]) {
-      if (r?.monthPeriod && (r.kwh || r.actualKwh)) s.add(r.monthPeriod);
-    }
-    return Array.from(s).sort().reverse();
-  }, [isShared, allocForm.data, readings.data]);
-
-  const save = useMutation({
-    mutationFn: async () => {
-      if (isShared) {
-        // 单价校验：填了金额但取不到单价 → 无法倒推用电量
-        const bad = allocAmountRows.find((r) => effectivePriceOf(r) == null);
-        if (bad) {
-          const name = brandOptions.find((o) => o.value === bad.brandId)?.label || "某品牌";
-          throw new Error(`${name} 缺少单价，无法倒推用电量：请填写单价或先维护该品牌方合同的电费单价`);
-        }
-        // 电柜数量校验：留空 = 本月未填；填了必须是正整数
-        const badCabinet = allocAmountRows.find((r) => {
-          const t = r.cabinetCount.trim();
-          if (t === "") return false;
-          const n = Number(t);
-          return !Number.isInteger(n) || n <= 0;
-        });
-        if (badCabinet) {
-          const name = brandOptions.find((o) => o.value === badCabinet.brandId)?.label || "某品牌";
-          throw new Error(`${name} 的电柜数量需为大于 0 的整数（留空表示本月未填）`);
-        }
-      }
-      // 1) 读数：普通电表按读数计费；共享电表同样记录整表抄表信息（留档 + 核对）
-      //    ⚠️ 后端是 ON CONFLICT DO UPDATE **全字段覆盖** → 共享表必须回传现有的
-      //    kwh（第三方同步的原始表码）与 actual_kwh（= 付场地方电量），否则会被冲成 0 / NULL
-      if (hasReadingInput) {
-        const existingRawKwh = tableRow?.rawKwh != null ? Number(tableRow.rawKwh) : undefined;
-        await saveMeterReading({
-          address: meter.meterNo,
-          monthPeriod,
-          kwh: isShared
-            ? (kwh ? parseFloat(kwh) : existingRawKwh)
-            : (kwh ? parseFloat(kwh) : undefined),
-          actualKwh: isShared
-            // 共享表的「本月实际用电量」= 上方「付场地方电量」。
-            // ⚠️ 必须回传 DB 里的 actual_kwh **原值**，不能用加工后的 tableKwh
-            //    （tableKwh = actual_kwh ?? kwh × 倍数）—— 否则只改抄表时间也会把
-            //    「未人工补录」的月份固化成人工值，并把界面标记变成「人工补录」。
-            ? (tableRow?.actualKwh != null ? Number(tableRow.actualKwh) : undefined)
-            : (actualKwh ? parseFloat(actualKwh) : undefined),
-          prevActualReading: prevActualReading ? parseFloat(prevActualReading) : undefined,
-          currActualReading: currActualReading ? parseFloat(currActualReading) : undefined,
-          prevReadingDate: prevReadingDate || undefined,
-          prevReading: prevReading ? parseFloat(prevReading) : undefined,
-          currReadingDate: currReadingDate || undefined,
-          currReading: currReading ? parseFloat(currReading) : undefined,
-        });
-      }
-      // 2) 共享电表：整体替换该月品牌分摊（含空 = 清空），后端保存后自动重算该月台账
-      //    仅在分摊确有改动时才调，避免「只改抄表信息」也触发一次多余重算
-      if (isShared && allocDirty) {
-        await saveSharedAllocations({
-          address: meter.meterNo,
-          monthPeriod,
-          rows: allocAmountRows.map((r) => ({
-            brandId: Number(r.brandId),
-            collectAmount: parseFloat(r.collectAmount),
-            unitPrice: r.unitPrice.trim() === "" ? null : parseFloat(r.unitPrice),
-            cabinetCount: r.cabinetCount.trim() === "" ? null : parseInt(r.cabinetCount, 10),
-            entityId: r.entityId.trim() === "" ? null : parseInt(r.entityId, 10),
-          })),
-        });
-      }
-    },
-    onSuccess: async () => {
-      const savedParts: string[] = [];
-      if (isShared && allocDirty) savedParts.push("品牌分摊已保存，台账已按分摊重算");
-      if (hasReadingInput) savedParts.push(isShared ? "整表抄表记录已保存" : "读数已保存");
-      toast.success(savedParts.length ? savedParts.join("；") : "已保存");
-      try {
-        // 读数变了 → 重算该月台账。
-        // 共享表：分摊同时改动时后端在保存分摊时已重算，这里跳过避免重复重算。
-        if (hasReadingInput && (!isShared || !allocDirty)) {
-          // v3：台账按场地×品牌全量重算该月
-          await generateElectricity({ period: monthPeriod, landlordId: meter.landlordId || undefined });
-        }
-        queryClient.invalidateQueries({ queryKey: ["electricity"] });
-        queryClient.invalidateQueries({ queryKey: ["electricity-monthly-ledger-range"] });
-        queryClient.invalidateQueries({ queryKey: ["shared-allocations"] });
-        queryClient.invalidateQueries({ queryKey: ["meterReadings"] });
-      } catch {}
-      onClose();
-    },
-    onError: (e: any) => toast.error(e?.response?.data?.detail || e.message || "保存失败"),
-  });
-
-  // 整表度数手动补录：写 meter_monthly.actual_kwh（该字段不随第三方同步覆盖）
-  // 共享电表未录分摊的月份，台账会用这个度数；录了分摊的月份它只作核对基准
-  const saveTableKwh = useMutation({
-    mutationFn: async () => {
-      const v = parseFloat(manualKwh);
-      if (isNaN(v) || v <= 0) throw new Error("请填写大于 0 的整表实际度数");
-      // 回传现有原始表码：后端 kwh 必填且 ON CONFLICT 覆盖，不传会把第三方原始读数冲成 0
-      const rawKwh = tableRow?.rawKwh != null ? Number(tableRow.rawKwh) : undefined;
-      await saveMeterReading({ address: meter.meterNo, monthPeriod, kwh: rawKwh, actualKwh: v });
-    },
-    onSuccess: async () => {
-      setEditingTableKwh(false);
-      setManualKwh("");
-      queryClient.invalidateQueries({ queryKey: ["meterReadings"] });
-      // 读数变了 → 重算该月台账（未录分摊的月份完全依赖它）
-      try {
-        await generateElectricity({ period: monthPeriod, landlordId: meter.landlordId || undefined });
-      } catch {
-        // 重算失败不影响读数已保存，用户可稍后在电费台账页手动重跑
-      }
-      queryClient.invalidateQueries({ queryKey: ["electricity"] });
-      queryClient.invalidateQueries({ queryKey: ["electricity-monthly-ledger-range"] });
-      toast.success("整表读数已保存");
-    },
-    onError: (e: any) => toast.error(e?.response?.data?.detail || e.message || "保存失败"),
-  });
-
-  return (
-    <Dialog open={open} onOpenChange={(o) => !o && onClose()}>
-      <DialogContent className={`${isShared ? "!max-w-3xl" : "max-w-md"} max-h-[90vh] overflow-y-auto`}>
-        <DialogHeader>
-          <DialogTitle className="flex items-center gap-2">
-            <BookOpen className="h-5 w-5 text-blue-600" />
-            {isShared ? "共享电表 · 品牌分摊（按应收电费倒推）" : "录入电表读数"}
-          </DialogTitle>
-        </DialogHeader>
-        <div className="space-y-3">
-          <div className="rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-600">
-            <div>表号：<span className="font-mono font-medium">{meter?.meterNo}</span></div>
-            <div>名称：{meter?.meterName ?? "-"}</div>
-            {isShared && (
-              <div className="mt-1 text-purple-600">所有品牌共用此电表（场地总表）</div>
-            )}
-          </div>
-
-          <Field label="月份">
-            <input type="month" className="w-full rounded-md border border-slate-200 px-2.5 py-1.5 text-sm"
-              value={monthPeriod ? toDisplay(monthPeriod) : ""}
-              onChange={(e) => changeMonth(e.target.value ? toCompact(e.target.value) : "")} />
-          </Field>
-
-          {/* 月份快捷切换：共享电表看「已录分摊的月份」，普通电表看「已有读数的月份」 */}
-          {isShared ? (
-            sharedPeriodOptions.length > 0 && (
-              <div className="flex flex-wrap items-center gap-1">
-                <span className="text-[11px] text-purple-600">已有记录的月份</span>
-                {sharedPeriodOptions.map((p) => (
-                  <button key={p}
-                    className={`rounded-full px-2 py-0.5 text-[10px] ${p === monthPeriod ? "bg-purple-100 font-medium text-purple-700" : "bg-slate-100 text-slate-500 hover:bg-slate-200"}`}
-                    onClick={() => changeMonth(p)}>
-                    {toDisplay(p)}
-                  </button>
-                ))}
-              </div>
-            )
-          ) : readings.data && readings.data.length > 0 && (
-            <div className="flex flex-wrap gap-1">
-              {readings.data.map((r: any) => (
-                <button key={r.monthPeriod}
-                  className={`rounded-full px-2 py-0.5 text-[10px] ${r.monthPeriod === monthPeriod ? "bg-blue-100 text-blue-700 font-medium" : "bg-slate-100 text-slate-500 hover:bg-slate-200"}`}
-                  onClick={() => changeMonth(r.monthPeriod)}>
-                  {toDisplay(r.monthPeriod)} ({r.kwh}){r.actualKwh != null ? " ★" : ""}
-                </button>
-              ))}
-            </div>
-          )}
-
-          {/* ── 共享电表：品牌分摊录入（应收电费 → 倒推用电量）── */}
-          {isShared && (
-            <div className="rounded-lg border border-purple-200 bg-purple-50/40 p-3">
-              <div className="mb-1 flex items-center justify-between">
-                <div>
-                  <div className="text-sm font-semibold text-purple-800">品牌分摊（各品牌应收电费）</div>
-                  <div className="text-[11px] text-purple-600">
-                    录入各品牌该月应收电费 + 电柜数量 → 用电量 = 金额 ÷ 单价 自动倒推；付款给场地方 = 倒推电量 × 场地单价
-                  </div>
-                </div>
-                <Button size="sm" variant="outline" className="shrink-0 border-purple-300 text-purple-700 hover:bg-purple-50"
-                  onClick={addAllocRow} disabled={allocForm.isLoading}>
-                  <Plus className="mr-1 h-3 w-3" />添加品牌
-                </Button>
-              </div>
-
-              {allocForm.isLoading ? (
-                <div className="py-3 text-center text-xs text-slate-400">加载品牌单价…</div>
-              ) : (
-                <>
-                  <div className="overflow-x-auto">
-                    <table className="w-full text-xs">
-                      <thead>
-                        <tr className="text-left text-[10px] text-purple-700">
-                          <th className="py-1 pr-2 font-medium">品牌方</th>
-                          <th className="py-1 pr-2 font-medium">电柜数量</th>
-                          <th className="py-1 pr-2 font-medium">报税主体</th>
-                          <th className="py-1 pr-2 font-medium">应收电费（元）</th>
-                          <th className="py-1 pr-2 font-medium">单价（元/度）</th>
-                          <th className="py-1 pr-2 font-medium">用电量（度）</th>
-                          <th className="py-1 font-medium"></th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {allocRows.map((row, i) => {
-                          const contractPrice = contractPriceOf(row.brandId);
-                          const k = kwhOfRow(row);
-                          const hasAmount = String(row.collectAmount).trim() !== "";
-                          const defCabinet = cabinetDefaultOf(row.brandId);
-                          // 该行柜数 = 该品牌最近一次填写值，且来源不是本月 → 说明是「沿用」来的
-                          const cabinetInherited = defCabinet != null
-                            && String(defCabinet.count) === row.cabinetCount.trim()
-                            && defCabinet.monthPeriod !== monthPeriod;
-                          return (
-                            <tr key={`${row.brandId}-${i}`} className="border-t border-purple-100">
-                              <td className="py-1 pr-2">
-                                <select className={`${inputCls} h-8 w-36 text-xs`} value={row.brandId}
-                                  onChange={(e) => {
-                                    const bid = e.target.value;
-                                    const def = cabinetDefaultOf(bid);
-                                    // 换品牌时带出该品牌最近一次的电柜数量（无记录则清空）；
-                                    // 报税主体回到默认（整场地主体），需要单独指定时再选
-                                    setAllocRow(i, {
-                                      brandId: bid, unitPrice: "",
-                                      cabinetCount: def ? String(def.count) : "",
-                                      entityId: "",
-                                    });
-                                  }}>
-                                  <option value="">请选择品牌</option>
-                                  {/* 已被其他行选中的品牌不再列出，避免同表同月重复（后端也会拦） */}
-                                  {brandOptions
-                                    .filter((o) => o.value === row.brandId
-                                      || !allocRows.some((r2, j) => j !== i && r2.brandId === o.value))
-                                    .map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
-                                </select>
-                              </td>
-                              <td className="py-1 pr-2">
-                                <div className="flex items-center gap-1">
-                                  <input type="number" step="1" min="1"
-                                    className={`${inputCls} h-8 w-16 text-xs`}
-                                    placeholder="台"
-                                    title={defCabinet
-                                      ? `该品牌最近一次填写：${defCabinet.count} 台（${toDisplay(defCabinet.monthPeriod)}）`
-                                      : "该品牌尚未填写过电柜数量"}
-                                    value={row.cabinetCount}
-                                    onChange={(e) => setAllocRow(i, { cabinetCount: e.target.value })} />
-                                  <span className="text-[10px] text-purple-500">台</span>
-                                  {cabinetInherited && defCabinet && (
-                                    <span className="cursor-help text-[10px] text-purple-400"
-                                      title={`沿用 ${toDisplay(defCabinet.monthPeriod)} 的填写值；本月调整后，下月默认即为新值`}>
-                                      沿用
-                                    </span>
-                                  )}
-                                </div>
-                              </td>
-                              <td className="py-1 pr-2">
-                                <select className={`${inputCls} h-8 w-32 text-xs`}
-                                  value={row.entityId}
-                                  title={row.entityId === ""
-                                    ? `默认报税主体：${defaultEntityName}（整场地口径，其他品牌不受影响）`
-                                    : `该品牌电柜报税主体：${entityLabelOf(row)}（只改这个品牌）`}
-                                  onChange={(e) => setAllocRow(i, { entityId: e.target.value })}>
-                                  <option value="">默认（{defaultEntityName}）</option>
-                                  {entityOptions.map((o) => (
-                                    <option key={o.value} value={o.value}>{o.label}</option>
-                                  ))}
-                                </select>
-                              </td>
-                              <td className="py-1 pr-2">
-                                <input type="number" step="0.01" min="0"
-                                  className={`${inputCls} h-8 w-24 text-xs`} placeholder="0.00"
-                                  value={row.collectAmount}
-                                  onChange={(e) => setAllocRow(i, { collectAmount: e.target.value })} />
-                              </td>
-                              <td className="py-1 pr-2">
-                                <input type="number" step="0.0001" min="0"
-                                  className={`${inputCls} h-8 w-24 text-xs`}
-                                  placeholder={contractPrice != null ? String(contractPrice) : "无合同价"}
-                                  value={row.unitPrice}
-                                  onChange={(e) => setAllocRow(i, { unitPrice: e.target.value })} />
-                              </td>
-                              <td className="py-1 pr-2 tabular-nums text-slate-600">
-                                {k != null ? k : (hasAmount ? <span className="text-rose-500">缺单价</span> : "—")}
-                              </td>
-                              <td className="py-1 text-right">
-                                <button className="rounded p-1 text-slate-400 hover:text-rose-500" onClick={() => removeAllocRow(i)} title="删除该品牌分摊">
-                                  <Trash2 className="h-3 w-3" />
-                                </button>
-                              </td>
-                            </tr>
-                          );
-                        })}
-                        {allocRows.length === 0 && (
-                          <tr><td colSpan={7} className="py-3 text-center text-slate-400">
-                            暂无品牌分摊，点击「添加品牌」录入
-                          </td></tr>
-                        )}
-                      </tbody>
-                    </table>
-                  </div>
-
-                  <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 border-t border-purple-100 pt-2 text-[11px] text-purple-700">
-                    <span>合计应收电费：<b className="tabular-nums">{fmtNum(allocTotals.amount)}</b> 元</span>
-                    <span>合计用电量：<b className="tabular-nums">{fmtNum(allocTotals.kwh)}</b> 度</span>
-                    {allocTotals.cabinetsFilled > 0 && (
-                      <span>合计电柜：<b className="tabular-nums">{allocTotals.cabinets}</b> 台</span>
-                    )}
-                    {allocTotals.missingPrice > 0 && (
-                      <span className="text-rose-600">{allocTotals.missingPrice} 行缺单价，无法倒推用电量</span>
-                    )}
-                  </div>
-
-                  <p className="mt-2 border-t border-purple-100 pt-2 text-[11px] text-purple-700">
-                    「付给场地方的电量 / 亏空自负金额」见下方<b className="mx-0.5">场地方电费</b>模块；
-                    整表抄表时间与起止读数见最下方<b className="mx-0.5">整表抄表记录</b>。
-                  </p>
-                  {allocAmountRows.length === 0 && savedAllocKey !== "" && (
-                    <p className="mt-1 text-[11px] text-rose-600">
-                      当前未填任何金额 → 保存后将清空该月品牌分摊，台账退回「整表读数 × 合同单价」。
-                    </p>
-                  )}
-                  <p className="mt-1 text-[11px] text-purple-600">
-                    单价留空 = 自动取该品牌方合同单价；填了则以填写值为准（用于倒推用电量）。
-                    电柜数量逐月可调，首次录入后下月自动沿用该品牌最近一次填写值（本月改了，下月默认即为新值）；
-                    柜数留空表示本月未填。
-                  </p>
-                  <p className="mt-1 text-[11px] text-purple-600">
-                    金额留空的行不会保存。清空全部金额 = 取消分摊，台账退回「整表读数 × 合同单价」。
-                  </p>
-                  <p className="mt-1 text-[11px] text-purple-500">
-                    品牌分摊只决定「向品牌方收多少」；「向场地方付多少」按整表读数计，见下方「场地方电费」模块。
-                    未录分摊的月份，台账按「第三方同步读数 × 合同单价」生成。
-                  </p>
-                </>
-              )}
-            </div>
-          )}
-
-          {/* ── 场地方电费：付给场地方的电量（整表读数）× 场地单价，差额（亏空）我方自负 ── */}
-          {isShared && (
-            <div className="rounded-lg border border-amber-200 bg-amber-50/40 p-3">
-              <div className="mb-1">
-                <div className="text-sm font-semibold text-amber-800">场地方电费（付给场地方）</div>
-                <div className="text-[11px] text-amber-700">
-                  付场地方按<b>整表读数</b>结算；品牌方合计电量与之的差额（电表亏空 / 线损）由我方承担，
-                  并按各品牌用电量比例摊入各品牌付款金额（收款金额不变）
-                </div>
-              </div>
-
-              {/* 付场地方电量 = 整表读数；人工可覆盖/补录（写 actual_kwh，不随第三方同步覆盖）
-                  ⚠️ 关键数值：加底色 + 放大字号，便于一眼识别（付场地方结算的唯一依据） */}
-              <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 rounded-md border border-amber-300 bg-amber-100 px-3 py-2">
-                <span className="text-[11px] font-medium text-amber-900">付场地方电量</span>
-                {editingTableKwh ? (
-                  <>
-                    <input type="number" step="0.01" min="0" autoFocus
-                      className={`${inputCls} h-8 w-32 text-xs`}
-                      placeholder="含互感器倍数"
-                      value={manualKwh}
-                      onChange={(e) => setManualKwh(e.target.value)} />
-                    <span className="text-xs text-amber-800">度</span>
-                    <Button size="sm" variant="outline"
-                      className="h-8 border-amber-400 bg-white text-amber-700 hover:bg-amber-50"
-                      disabled={!manualKwh.trim() || saveTableKwh.isPending}
-                      onClick={() => saveTableKwh.mutate()}>
-                      {saveTableKwh.isPending ? "保存中…" : "保存"}
-                    </Button>
-                    <button className="text-xs text-slate-500 hover:text-slate-700"
-                      onClick={() => { setEditingTableKwh(false); setManualKwh(""); }}>
-                      取消
-                    </button>
-                  </>
-                ) : (
-                  <>
-                    {tableKwh != null ? (
-                      <>
-                        <span className="text-2xl font-bold leading-none tabular-nums text-amber-900">
-                          {fmtNum(tableKwh)}
-                        </span>
-                        <span className="text-sm font-semibold text-amber-900">度</span>
-                        <span className={`rounded border px-1.5 py-0.5 text-[10px] font-medium ${
-                          tableKwhIsManual
-                            ? "border-sky-300 bg-sky-100 text-sky-700"
-                            : "border-slate-300 bg-white text-slate-500"
-                        }`}>
-                          {tableKwhIsManual ? "人工补录" : "第三方同步"}
-                        </span>
-                      </>
-                    ) : (
-                      <span className="text-xs text-slate-400">未同步</span>
-                    )}
-                    <button className="text-xs text-amber-700 underline decoration-dotted hover:text-amber-900"
-                      onClick={() => { setEditingTableKwh(true); setManualKwh(tableKwh != null ? String(tableKwh) : ""); }}>
-                      {tableKwh != null ? "修改" : "手动补录"}
-                    </button>
-                  </>
-                )}
-              </div>
-              {editingTableKwh && (
-                <p className="mt-1 text-[11px] text-slate-400">
-                  填整表实际用电量（已含互感器倍数），即实际付给场地方的电量。该值不随第三方同步覆盖。
-                </p>
-              )}
-
-              <div className="mt-2 space-y-1 border-t border-amber-200 pt-2 text-[11px]">
-                <div className="flex flex-wrap items-baseline gap-x-2">
-                  <span className="w-24 shrink-0 text-slate-500">场地单价</span>
-                  {venuePayPrice != null
-                    ? <span className="tabular-nums text-slate-700">{venuePayPrice} 元/度</span>
-                    : <span className="text-rose-500">场地合同未填电费单价，无法计算金额</span>}
-                </div>
-                <div className="flex flex-wrap items-baseline gap-x-2">
-                  <span className="w-24 shrink-0 text-slate-500">应付场地方</span>
-                  <span className="font-semibold tabular-nums text-amber-700">
-                    {venueBill.payAmount != null ? fmtMoney(venueBill.payAmount) : "—"}
-                  </span>
-                  <span className="text-slate-400">
-                    = {venueBill.payKwh != null ? fmtNum(venueBill.payKwh) : "—"} 度 × {venuePayPrice ?? "—"} 元/度
-                  </span>
-                </div>
-                <div className="flex flex-wrap items-baseline gap-x-2">
-                  <span className="w-24 shrink-0 text-slate-500">品牌方合计</span>
-                  <span className="tabular-nums text-slate-700">{fmtNum(venueBill.brandKwh)} 度</span>
-                  <span className="text-slate-400">应收 {fmtMoney(venueBill.brandAmount)}</span>
-                </div>
-                <div className="flex flex-wrap items-baseline gap-x-2 border-t border-amber-200 pt-1">
-                  <span className="w-24 shrink-0 font-medium text-slate-600">亏空（自负）</span>
-                  {venueBill.lossKwh == null ? (
-                    <span className="text-slate-400">
-                      需同时有「整表读数」与「品牌分摊金额」才能计算
-                    </span>
-                  ) : venueBill.lossKwh > 0 ? (
-                    <>
-                      <span className="font-semibold tabular-nums text-amber-700">{fmtNum(venueBill.lossKwh)} 度</span>
-                      {venueBill.lossAmount != null && (
-                        <span className="font-semibold tabular-nums text-amber-700">≈ {fmtMoney(venueBill.lossAmount)}</span>
-                      )}
-                      {venueBill.lossRate != null && (
-                        <span className="text-slate-500">占总电量 {(venueBill.lossRate * 100).toFixed(2)}%</span>
-                      )}
-                    </>
-                  ) : venueBill.lossKwh < 0 ? (
-                    <>
-                      <span className="font-semibold tabular-nums text-rose-600">
-                        品牌合计超出整表 {fmtNum(Math.abs(venueBill.lossKwh))} 度
-                      </span>
-                      <span className="text-slate-500">请核对品牌单价或应收电费金额是否偏高</span>
-                    </>
-                  ) : (
-                    <span className="text-emerald-600">0 度，品牌合计与整表读数已对齐</span>
-                  )}
-                </div>
-                {venueBill.payKwh != null && allocTotals.amount === 0 && (
-                  <p className="text-slate-400">该月未录品牌分摊 → 台账按「整表读数 × 合同单价」整场地出一行。</p>
-                )}
-                {venueBill.payKwh == null && (
-                  <p className="text-slate-400">该月无整表读数，无法计算应付场地方金额；可点「手动补录」填入。</p>
-                )}
-              </div>
-            </div>
-          )}
-
-          {/* 读数区（普通电表）：按「区间度数 × 互感器倍数」计费；共享电表见下方独立的整表抄表记录 */}
-          {!isShared && (<>
-          {/* 上月抄表信息 */}
-          <div className="grid grid-cols-2 gap-3">
-            <Field label="上月抄表时间">
-              <input type="date" className="w-full rounded-md border border-slate-200 px-2.5 py-1.5 text-sm"
-                value={prevReadingDate}
-                onChange={(e) => setPrevReadingDate(e.target.value)} />
-            </Field>
-            <Field label="起始度数">
-              <NumInput value={prevReading} onChange={setPrevReading} placeholder="上月读数" />
-            </Field>
-          </div>
-
-          {/* 本月抄表信息 */}
-          <div className="grid grid-cols-2 gap-3">
-            <Field label="本月抄表时间">
-              <input type="date" className="w-full rounded-md border border-slate-200 px-2.5 py-1.5 text-sm"
-                value={currReadingDate}
-                onChange={(e) => setCurrReadingDate(e.target.value)} />
-            </Field>
-            <Field label="抄表度数">
-              <NumInput value={currReading} onChange={setCurrReading} placeholder="本月读数" />
-            </Field>
-          </div>
-
-          {/* 区间度数 */}
-          <Field label={
-            <div className="flex items-center gap-2">
-              <span>区间度数（kWh）</span>
-              <label className="flex items-center gap-1 text-[10px] text-slate-400 cursor-pointer">
-                <input type="checkbox" className="rounded" checked={calcKwh}
-                  onChange={(e) => setCalcKwh(e.target.checked)} />
-                自动计算
-              </label>
-            </div>
-          }>
-            <NumInput value={kwh} onChange={setKwh} placeholder="抄表度数 - 起始度数" disabled={calcKwh} />
-          </Field>
-
-          {/* 实际值（可选，填了优先用） */}
-          <Field label="本月实际用电量（kWh）">
-            <NumInput value={actualKwh} onChange={setActualKwh} placeholder="留空则按 区间度数×倍数 计算" />
-          </Field>
-          <p className="-mt-1 text-[11px] text-slate-400">
-            填了实际值则各页面优先使用它（已含互感器倍数）；留空用「区间度数 × 互感器倍数」。
-          </p>
-
-          {/* 人工实际读数（第三方数据错漏时填写；不随同步覆盖） */}
-          <div className="grid grid-cols-2 gap-3">
-            <Field label="上月实际读数">
-              <NumInput value={prevActualReading} onChange={setPrevActualReading} placeholder="人工填真实读数" />
-            </Field>
-            <Field label="本月实际读数">
-              <NumInput value={currActualReading} onChange={setCurrActualReading} placeholder="人工填真实读数" />
-            </Field>
-          </div>
-          <p className="-mt-1 text-[11px] text-slate-400">
-            第三方数据错漏时填真实电表读数（不随同步覆盖）；填了它且未填实际用电量时，自动按「本月−上月」计算。
-          </p>
-
-          {/* 提示信息 */}
-          {calcKwh && prevReading && !currReading && (
-            <p className="text-xs text-amber-500">请填写抄表度数，否则区间度数将为 0</p>
-          )}
-          {calcKwh && !prevReading && currReading && (
-            <p className="text-xs text-amber-500">请填写起始度数，否则区间度数将为 0</p>
-          )}
-
-          {/* 显示计算结果 */}
-          {calcKwh && prevReading && currReading && (
-            <div className="rounded-lg bg-emerald-50 px-3 py-2 text-xs text-emerald-700">
-              区间度数 = {currReading} - {prevReading} = <span className="font-semibold">{parseFloat(currReading) - parseFloat(prevReading)}</span> kWh
-            </div>
-          )}
-
-          </>)}
-
-          {/* 共享电表读数区：字段与普通电表一致（抄表时间 / 起止读数 / 区间度数 / 人工实际读数），
-              便于像普通电表一样留档与核对；「本月实际用电量」= 上方「付场地方电量」，不在此重复录入 */}
-          {isShared && (<>
-            <div className="rounded-lg border border-slate-200 bg-slate-50/70 p-3">
-              <div className="mb-2">
-                <div className="text-xs font-semibold text-slate-700">整表抄表记录</div>
-                <div className="text-[11px] text-slate-500">
-                  共享电表按<b>整表读数</b>与场地方结算，这里的抄表信息与普通电表同字段，用于留档和核对；
-                  「本月实际用电量」即上方的<b>付场地方电量</b>，在那一处录入。
-                </div>
-                <div className="mt-1.5 rounded border border-amber-200 bg-amber-50 px-2 py-1 text-[11px] leading-relaxed text-amber-700">
-                  ⚠️「起始度数 / 抄表度数 / 区间度数」与第三方同步<b>共用同一字段，下次同步会覆盖人工填写值</b>；
-                  需要长期留档的真实读数，请填下方的
-                  <b>「上月实际读数 / 本月实际读数」</b>（该字段不随同步覆盖）。
-                </div>
-              </div>
-
-              {/* 上月抄表信息 */}
-              <div className="grid grid-cols-2 gap-3">
-                <Field label="上月抄表时间">
-                  <input type="date" className="w-full rounded-md border border-slate-200 px-2.5 py-1.5 text-sm"
-                    value={prevReadingDate}
-                    onChange={(e) => setPrevReadingDate(e.target.value)} />
-                </Field>
-                <Field label="起始度数">
-                  <NumInput value={prevReading} onChange={setPrevReading} placeholder="上月读数" />
-                </Field>
-              </div>
-
-              {/* 本月抄表信息 */}
-              <div className="grid grid-cols-2 gap-3">
-                <Field label="本月抄表时间">
-                  <input type="date" className="w-full rounded-md border border-slate-200 px-2.5 py-1.5 text-sm"
-                    value={currReadingDate}
-                    onChange={(e) => setCurrReadingDate(e.target.value)} />
-                </Field>
-                <Field label="抄表度数">
-                  <NumInput value={currReading} onChange={setCurrReading} placeholder="本月读数" />
-                </Field>
-              </div>
-
-              {/* 区间度数 */}
-              <Field label={
-                <div className="flex items-center gap-2">
-                  <span>区间度数（kWh）</span>
-                  <label className="flex items-center gap-1 text-[10px] text-slate-400 cursor-pointer">
-                    <input type="checkbox" className="rounded" checked={calcKwh}
-                      onChange={(e) => setCalcKwh(e.target.checked)} />
-                    自动计算
-                  </label>
-                </div>
-              }>
-                <NumInput value={kwh} onChange={setKwh} placeholder="抄表度数 - 起始度数" disabled={calcKwh} />
-              </Field>
-
-              {calcKwh && prevReading && currReading && (
-                <div className="rounded-lg bg-emerald-50 px-3 py-2 text-xs text-emerald-700">
-                  区间度数 = {currReading} - {prevReading} = <span className="font-semibold">{parseFloat(currReading) - parseFloat(prevReading)}</span> kWh
-                </div>
-              )}
-              {calcKwh && prevReading && !currReading && (
-                <p className="text-xs text-amber-500">请填写抄表度数，否则区间度数将为 0</p>
-              )}
-              {calcKwh && !prevReading && currReading && (
-                <p className="text-xs text-amber-500">请填写起始度数，否则区间度数将为 0</p>
-              )}
-
-              {/* 人工实际读数（第三方数据错漏时填写；不随同步覆盖） */}
-              <div className="mt-2 grid grid-cols-2 gap-3">
-                <Field label="上月实际读数">
-                  <NumInput value={prevActualReading} onChange={setPrevActualReading} placeholder="人工填真实读数" />
-                </Field>
-                <Field label="本月实际读数">
-                  <NumInput value={currActualReading} onChange={setCurrActualReading} placeholder="人工填真实读数" />
-                </Field>
-              </div>
-              <p className="mt-1 text-[11px] text-slate-400">
-                第三方数据错漏时填真实电表读数（不随同步覆盖）；填了这两个读数且该月尚无付场地方电量时，会按「本月 − 上月」自动得出实际用电量。
-              </p>
-            </div>
-          </>)}
-
-          <div className="flex justify-end gap-2 pt-1">
-            <Button variant="outline" onClick={onClose}>取消</Button>
-            <Button className="bg-blue-600 hover:bg-blue-700"
-              disabled={save.isPending || !canSave || (isShared && allocForm.isLoading)}
-              onClick={() => save.mutate()}>
-              {save.isPending ? "保存中…" : "保存"}
-            </Button>
-          </div>
-        </div>
-      </DialogContent>
-    </Dialog>
-  );
-}
-
-// ─── 柜子表单 ───
 function CabinetForm({ open, onClose, meterId, record }: { open: boolean; onClose: () => void; meterId: number; record?: any }) {
   const blank = { cabinetNo: "", cabinetType: "充电柜", count: "1", remark: "" };
   const [f, setF] = useState(blank);

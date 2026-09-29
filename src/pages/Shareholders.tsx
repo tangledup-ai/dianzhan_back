@@ -339,7 +339,20 @@ function DividendDetailDialog({ open, onClose, landlordName, personName, months,
     return list.filter((x: any) => x[personKey] === personId);
   }, [monthDatas, personKey, personId]);
 
-  // 逐月行（品牌股东用品牌 P&L，全场股东用整场地）
+  // 该人配置覆盖的参与范围：含「全场」配置 → 全部明细；只绑品牌 → 只列这些品牌
+  const scopeBrand = useMemo(() => {
+    const ids = new Set<number>();
+    let all = configs.length === 0;
+    for (const c of configs) {
+      if (c.brandId == null) all = true;
+      else ids.add(Number(c.brandId));
+    }
+    return { all, ids };
+  }, [configs]);
+
+  // 逐月 × 逐配置行（品牌配置用品牌 P&L，全场配置用整场地）
+  // ★ 一人可能有多条配置（全场 + 品牌…）：必须按配置拆行，让每行的基数与金额一一对应。
+  //   原实现取 mine[0] 的基数、金额却是全部之和 ⇒ 用户按「基数 × 比例」复核必然对不上。
   const rows = useMemo(() => {
     const out: any[] = [];
     months.forEach((m, i) => {
@@ -347,35 +360,45 @@ function DividendDetailDialog({ open, onClose, landlordName, personName, months,
       if (!est) return;
       const list = personKey === "shareholderId" ? est.shareholderDividends ?? [] : est.bizDividends ?? [];
       const mine = list.filter((x: any) => x[personKey] === personId);
-      if (mine.length === 0) return;
-      const cfg = mine[0];
-      const isBrand = cfg?.brandId != null;
-      const b = isBrand ? (est.brandBreakdown ?? []).find((x: any) => x.brandId === cfg.brandId) : null;
-      out.push({
-        month: m,
-        scope: isBrand ? (cfg.brandName || `品牌#${cfg.brandId}`) : "全场",
-        mode: cfg.mode,
-        ratio: cfg.ratio,
-        fixedAmount: cfg.fixedAmount,
-        settlementPeriod: cfg.settlementPeriod,
-        isSettlement: mine.some((x: any) => x.isSettlementMonth),
-        elecIncome: isBrand ? (b?.elecIncome ?? 0) : (est.income?.elecIncome?.total ?? 0),
-        rentIncome: isBrand ? (b?.rentIncome ?? 0) : (est.income?.rentIncome?.total ?? 0),
-        elecCost: isBrand ? (b?.elecCost ?? 0) : (est.cost?.elecCost ?? 0),
-        venueCost: isBrand ? (b?.venueCost ?? 0) : (est.cost?.rentCost ?? 0),
-        opExpense: isBrand ? (b?.opExpense ?? 0) : (est.cost?.opExpense ?? 0),
-        elecTax: isBrand ? (b?.elecTax ?? 0) : (est.cost?.elecTax ?? 0),
-        rentTax: isBrand ? (b?.rentTax ?? 0) : (est.cost?.rentTax ?? 0),
-        profit: isBrand ? (b?.profit ?? 0) : (est.profit ?? 0),
-        amount: r2(mine.reduce((s: number, x: any) => s + Number(x.amount || 0), 0)),
-      });
+      for (const cfg of mine) {
+        const isBrand = cfg?.brandId != null;
+        const b = isBrand ? (est.brandBreakdown ?? []).find((x: any) => x.brandId === cfg.brandId) : null;
+        out.push({
+          month: m,
+          scope: isBrand ? (cfg.brandName || `品牌#${cfg.brandId}`) : "全场",
+          mode: cfg.mode,
+          ratio: cfg.ratio,
+          fixedAmount: cfg.fixedAmount,
+          settlementPeriod: cfg.settlementPeriod,
+          isSettlement: !!cfg.isSettlementMonth,
+          elecIncome: isBrand ? (b?.elecIncome ?? 0) : (est.income?.elecIncome?.total ?? 0),
+          rentIncome: isBrand ? (b?.rentIncome ?? 0) : (est.income?.rentIncome?.total ?? 0),
+          elecCost: isBrand ? (b?.elecCost ?? 0) : (est.cost?.elecCost ?? 0),
+          venueCost: isBrand ? (b?.venueCost ?? 0) : (est.cost?.rentCost ?? 0),
+          opExpense: isBrand ? (b?.opExpense ?? 0) : (est.cost?.opExpense ?? 0),
+          elecTax: isBrand ? (b?.elecTax ?? 0) : (est.cost?.elecTax ?? 0),
+          rentTax: isBrand ? (b?.rentTax ?? 0) : (est.cost?.rentTax ?? 0),
+          profit: isBrand ? (b?.profit ?? 0) : (est.profit ?? 0),
+          amount: r2(Number(cfg.amount || 0)),
+        });
+      }
     });
     return out;
   }, [months, monthDatas, personKey, personId, r2]);
 
+  // 基数类（收入/成本/税/利润）多配置时【不叠加】：同一场地的「全场行」已包含「品牌行」，
+  // 全加会把收入/成本/利润各算两遍。故每月只取一条「口径最大」的基数行（全场优先），
+  // 分红金额则按各配置行全额累加。
   const totals = useMemo(() => {
     const t: any = { elecIncome: 0, rentIncome: 0, elecCost: 0, venueCost: 0, opExpense: 0, elecTax: 0, rentTax: 0, profit: 0, amount: 0 };
-    for (const r of rows) for (const k of Object.keys(t)) t[k] += r[k] || 0;
+    const baseKeys = ["elecIncome", "rentIncome", "elecCost", "venueCost", "opExpense", "elecTax", "rentTax", "profit"];
+    const baseRows = new Map<string, any>();
+    for (const r of rows) {
+      const cur = baseRows.get(r.month);
+      if (!cur || (cur.scope !== "全场" && r.scope === "全场")) baseRows.set(r.month, r);
+    }
+    for (const r of baseRows.values()) for (const k of baseKeys) t[k] += r[k] || 0;
+    for (const r of rows) t.amount += r.amount || 0;
     for (const k of Object.keys(t)) t[k] = r2(t[k]);
     return t;
   }, [rows, r2]);
@@ -386,19 +409,17 @@ function DividendDetailDialog({ open, onClose, landlordName, personName, months,
     months.forEach((m, i) => {
       const est = monthDatas[i];
       if (!est) return;
-      const list = personKey === "shareholderId" ? est.shareholderDividends ?? [] : est.bizDividends ?? [];
-      const cfg = list.find((x: any) => x[personKey] === personId);
-      const isBrand = cfg?.brandId != null;
       const taxMap = new Map<string, any>((est.cost?.details?.elecTax?.details ?? []).map((t: any) => [t.meterNo, t] as [string, any]));
       for (const d of est.income?.elecIncome?.details ?? []) {
-        if (isBrand && d.brandName !== cfg.brandName) continue;
+        // ★ 按 brandId 过滤（用品牌名会把同名/空名的行串在一起）；范围 = 该人全部配置的并集，逐表只列一次
+        if (!scopeBrand.all && !scopeBrand.ids.has(Number(d.brandId))) continue;
         const gross = r2((d.kwh || 0) * (d.unitPrice || 0));
         const tax = r2(taxMap.get(d.meterNo)?.amount ?? 0);
         out.push({ month: m, meterNo: d.meterNo, brandName: d.brandName || "", kwh: d.kwh || 0, unitPrice: d.unitPrice || 0, gross, tax, net: r2(gross - tax) });
       }
     });
     return out;
-  }, [months, monthDatas, personKey, personId, r2]);
+  }, [months, monthDatas, scopeBrand, r2]);
 
   // 租金收入明细（品牌级，逐月）
   const rentIncomeRows = useMemo(() => {
@@ -406,16 +427,13 @@ function DividendDetailDialog({ open, onClose, landlordName, personName, months,
     months.forEach((m, i) => {
       const est = monthDatas[i];
       if (!est) return;
-      const list = personKey === "shareholderId" ? est.shareholderDividends ?? [] : est.bizDividends ?? [];
-      const cfg = list.find((x: any) => x[personKey] === personId);
-      const isBrand = cfg?.brandId != null;
       for (const d of est.income?.rentIncome?.details ?? []) {
-        if (isBrand && d.brandId !== cfg?.brandId) continue;
+        if (!scopeBrand.all && !scopeBrand.ids.has(Number(d.brandId))) continue;
         out.push({ month: m, brandName: d.brandName || "未指定", cabinets: d.cabinets || 0, preTax: d.preTaxRent ?? 0, postTax: d.postTaxRent ?? d.amount ?? 0, amount: d.amount ?? 0 });
       }
     });
     return out;
-  }, [months, monthDatas, personKey, personId]);
+  }, [months, monthDatas, scopeBrand]);
 
   // 电费成本明细（表级，逐月；品牌模式按表号反查归属）
   const elecCostRows = useMemo(() => {
@@ -423,19 +441,14 @@ function DividendDetailDialog({ open, onClose, landlordName, personName, months,
     months.forEach((m, i) => {
       const est = monthDatas[i];
       if (!est) return;
-      const list = personKey === "shareholderId" ? est.shareholderDividends ?? [] : est.bizDividends ?? [];
-      const cfg = list.find((x: any) => x[personKey] === personId);
-      const isBrand = cfg?.brandId != null;
       for (const d of est.cost?.details?.electricity ?? []) {
-        if (isBrand) {
-          const inc = (est.income?.elecIncome?.details ?? []).find((x: any) => x.meterNo === d.meterNo);
-          if (!inc || inc.brandName !== cfg.brandName) continue;
-        }
+        // ★ 成本明细现在自带 brandId（后端已补字段），直接按 id 过滤，不必回查收入明细
+        if (!scopeBrand.all && !scopeBrand.ids.has(Number(d.brandId))) continue;
         out.push({ month: m, meterNo: d.meterNo, kwh: d.kwh || 0, unitPrice: d.unitPrice || 0, amount: d.amount || 0 });
       }
     });
     return out;
-  }, [months, monthDatas, personKey, personId]);
+  }, [months, monthDatas, scopeBrand]);
 
   // 场地成本（合同级）+ 运营费用（逐月）
   const venueRows = useMemo(() => {
@@ -471,8 +484,11 @@ function DividendDetailDialog({ open, onClose, landlordName, personName, months,
     L.push("【分红核算明细】");
     L.push(`场地：${landlordName || "-"}    分红人：${personName || "-"}    区间：${toDisplay(months[0])} ~ ${toDisplay(months[months.length - 1])}`);
     if (configs.length) {
-      const c = configs[0];
-      L.push(`参与范围：${c.brandName ? `仅 ${c.brandName}` : "全场"}    模式：${c.mode === "固定金额" ? `固定金额 ${fmtMoney(c.fixedAmount)}/月` : `${c.mode} ${((c.ratio || 0) * 100).toFixed(2)}%`}    周期：${c.settlementPeriod}分红`);
+      // ★ 多条配置全部列出（原来只列第一条，多配置时看不出其余口径）
+      L.push("参与配置：");
+      for (const c of configs) {
+        L.push(`  · ${c.brandName ? `仅 ${c.brandName}` : "全场"}    ${c.mode === "固定金额" ? `固定金额 ${fmtMoney(c.fixedAmount)}/月` : `${c.mode} ${((c.ratio || 0) * 100).toFixed(2)}%`}    ${c.settlementPeriod}分红`);
+      }
     }
     L.push("");
     L.push("【区间合计】");
@@ -534,11 +550,16 @@ function DividendDetailDialog({ open, onClose, landlordName, personName, months,
           <span className="rounded-lg bg-emerald-50 px-2 py-1 font-medium text-emerald-700">{personName || "-"}</span>
           {configs.length > 0 && (
             <>
-              <span className={`rounded-full px-2 py-0.5 font-medium ${configs[0].brandName ? "bg-amber-100 text-amber-700" : "bg-slate-100 text-slate-600"}`}>
-                {configs[0].brandName ? `仅参与 ${configs[0].brandName}` : "参与全场"}
-              </span>
-              <span className="text-slate-500">{configs[0].mode === "固定金额" ? `固定 ${fmtMoney(configs[0].fixedAmount)}/月` : `${configs[0].mode} ${((configs[0].ratio || 0) * 100).toFixed(2)}%`}</span>
-              <span className="text-slate-500">{configs[0].settlementPeriod}分红</span>
+              {configs.map((c: any, i: number) => (
+                <span key={`cfg-${i}`} className="flex items-center gap-1.5">
+                  <span className={`rounded-full px-2 py-0.5 font-medium ${c.brandName ? "bg-amber-100 text-amber-700" : "bg-slate-100 text-slate-600"}`}>
+                    {c.brandName ? `仅参与 ${c.brandName}` : "参与全场"}
+                  </span>
+                  <span className="text-slate-500">{c.mode === "固定金额" ? `固定 ${fmtMoney(c.fixedAmount)}/月` : `${c.mode} ${((c.ratio || 0) * 100).toFixed(2)}%`}</span>
+                  <span className="text-slate-500">{c.settlementPeriod}分红</span>
+                  {i < configs.length - 1 && <span className="text-slate-300">｜</span>}
+                </span>
+              ))}
               {rows.some((r: any) => r.isSettlement) && <span className="rounded-full bg-emerald-100 px-2 py-0.5 font-medium text-emerald-700">区间内含结算月</span>}
             </>
           )}

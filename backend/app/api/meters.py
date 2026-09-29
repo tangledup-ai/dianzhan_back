@@ -78,7 +78,7 @@ async def import_meters(request: Request, file: UploadFile = File(...)):
 
     规则：
     - 场地方列是合并单元格：为空时继承上一行的场地方（同一场地块内多行电表）。
-    - 已关联场地的电表：只更新当月实际用电量/读数（meter_monthly），其他信息不修改。
+    - 已关联场地的电表：只更新当月实际用电量/读数（meter_readings），其他信息不修改。
     - 未关联场地的电表：自动关联场地方(+品牌/报税公司主体/电表名称/互感器倍数) 并保存读数。
     """
     if not file.filename.endswith(('.xlsx', '.xls')):
@@ -188,7 +188,7 @@ async def import_meters(request: Request, file: UploadFile = File(...)):
                 cur = get_dict_cursor(conn)
                 try:
                     cur.execute("""
-                        SELECT id FROM meter_monthly
+                        SELECT id FROM meter_readings
                         WHERE address = %s AND month_period = %s
                     """, (meter_no, month_key))
                     existing = cur.fetchone()
@@ -202,10 +202,10 @@ async def import_meters(request: Request, file: UploadFile = File(...)):
                             set_sql.append("prev_actual_reading = %s"); vals.append(prev_reading)
                         if set_sql:
                             vals.append(existing["id"])
-                            cur.execute(f"UPDATE meter_monthly SET {', '.join(set_sql)} WHERE id = %s", vals)
+                            cur.execute(f"UPDATE meter_readings SET {', '.join(set_sql)} WHERE id = %s", vals)
                     else:
                         cur.execute("""
-                            INSERT INTO meter_monthly (address, month_period, actual_kwh, prev_actual_reading, curr_actual_reading)
+                            INSERT INTO meter_readings (address, month_period, actual_kwh, prev_actual_reading, curr_actual_reading)
                             VALUES (%s, %s, %s, %s, %s)
                         """, (meter_no, month_key, actual_kwh, prev_reading, curr_reading))
                 finally:
@@ -248,7 +248,7 @@ async def get_meter(meter_id: int, request: Request = None):
     # 获取实时状态（从新数据库的 meter_status_cache 表读取）
     status = meter_repo.get_meter_status(meter["meter_no"])
 
-    # 获取月度用电量（从新数据库的 meter_monthly 表读取）
+    # 获取月度用电量（从新数据库的 meter_readings 表读取）
     monthly = meter_repo.get_meter_monthly_usage(meter["meter_no"])
 
     realtime = None
@@ -281,7 +281,11 @@ async def get_meter(meter_id: int, request: Request = None):
 @router.post("", status_code=201)
 async def create_meter(request: Request, data: dict):
     # 电表类型范围校验：受限账号创建的电表必须落在自己范围内
-    ensure_meter_in_scope(request, data.get("tag") or "合作商电表", data.get("landlordId"))
+    # ★V5：大类入参可能是码值（categoryCode），也可能还是中文（tag）—— 先归一再用（旧范围校验读中文）
+    _new_tag = meter_repo.CATEGORY_CODE_TO_TAG[
+        meter_repo.normalize_category(data.get("categoryCode"), data.get("tag"))
+    ]
+    ensure_meter_in_scope(request, _new_tag, data.get("landlordId"))
     try:
         result = meter_repo.create_meter(data)
     except Exception as e:
@@ -311,8 +315,12 @@ async def update_meter(meter_id: int, request: Request, data: dict):
         raise HTTPException(404, "电表不存在")
     # 电表类型范围：原电表须在范围内；改类型/改场地后的落点也须在范围内
     ensure_meter_in_scope(request, old_meter.get("tag"), old_meter.get("landlord_id"), hide=True)
-    ensure_meter_in_scope(request,
-                          data.get("tag") or old_meter.get("tag"),
+    # ★V5：改了大类才用新值校验（入参可能是码值）；没改就沿用原大类
+    if "categoryCode" in data or "tag" in data:
+        _new_code = meter_repo.normalize_category(data.get("categoryCode"), data.get("tag"))
+    else:
+        _new_code = old_meter.get("category_code") or "partner"
+    ensure_meter_in_scope(request, meter_repo.CATEGORY_CODE_TO_TAG[_new_code],
                           data.get("landlordId") if data.get("landlordId") is not None else old_meter.get("landlord_id"))
     # 换主体审计的操作人（repo 内写 meter_entity_changes 用；额外键不影响字段更新）
     operator = (getattr(request.state, "current_user", None) or {}).get("name")
@@ -333,10 +341,11 @@ async def update_meter(meter_id: int, request: Request, data: dict):
         conn = get_connection()
         cur = get_dict_cursor(conn)
         try:
+            # ★V5：按 meter_id + period 取（关联键已从字符串 address 改为电表 id）
             cur.execute("""
-                SELECT DISTINCT month_period AS p FROM meter_monthly
-                WHERE address = %s ORDER BY p
-            """, (result.get("meter_no"),))
+                SELECT DISTINCT period AS p FROM meter_readings
+                WHERE meter_id = %s ORDER BY p
+            """, (meter_id,))
             affected_months = [r["p"] for r in cur.fetchall()]
         finally:
             cur.close()

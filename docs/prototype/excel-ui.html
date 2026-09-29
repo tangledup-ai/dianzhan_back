@@ -1,0 +1,540 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>【设计原型·Mock】三个页面改 Excel 风（不是真实系统）</title>
+<style>
+  /* ══════════════════════════════════════════════════════════════
+     ① 布局部分：完全复刻现有 src/components/Layout.tsx
+        （slate-900 侧栏 w-56 / emerald 高亮 / h-14 白顶栏 / slate-100 内容区）
+        —— 这部分【不改】，只作为背景，说明"布局没动"
+     ══════════════════════════════════════════════════════════════ */
+  *{box-sizing:border-box;margin:0;padding:0;}
+  body{font:14px/1.5 "Microsoft YaHei","PingFang SC",-apple-system,"Segoe UI",sans-serif;background:#f1f5f9;color:#0f172a;}
+  .app{display:flex;min-height:100vh;}
+
+  .sidebar{position:fixed;top:0;bottom:0;left:0;z-index:20;width:224px;display:flex;flex-direction:column;background:#0f172a;color:#cbd5e1;}
+  .logo{display:flex;align-items:center;gap:10px;padding:20px;}
+  .logo .ico{width:36px;height:36px;border-radius:8px;background:#10b981;color:#fff;display:flex;align-items:center;justify-content:center;font-size:18px;}
+  .logo .t1{font-size:14px;font-weight:700;color:#fff;}
+  .logo .t2{font-size:11px;color:#94a3b8;}
+  .nav{margin-top:8px;flex:1;overflow-y:auto;padding:0 12px 16px;}
+  .nav a{display:flex;align-items:center;gap:12px;padding:10px 12px;border-radius:8px;font-size:14px;color:#cbd5e1;cursor:pointer;text-decoration:none;}
+  .nav a:hover{background:#1e293b;color:#fff;}
+  .nav a.active{background:rgba(16,185,129,.15);color:#34d399;font-weight:500;}
+  .nav a .i{width:16px;text-align:center;flex:0 0 16px;opacity:.9;}
+  .nav a .out{margin-left:auto;font-size:10px;color:#64748b;}
+  .sidefoot{padding:16px 20px;font-size:11px;color:#64748b;}
+
+  .wrap{margin-left:224px;display:flex;min-width:0;flex:1;flex-direction:column;}
+  .topbar{position:sticky;top:0;z-index:10;display:flex;height:56px;align-items:center;justify-content:space-between;border-bottom:1px solid #e2e8f0;background:#fff;padding:0 24px;}
+  .topbar h1{font-size:16px;font-weight:600;color:#1e293b;}
+  .userbox{display:flex;align-items:center;gap:12px;}
+  .uname{font-size:12px;font-weight:500;color:#334155;}
+  .roleb{background:#ecfdf5;color:#047857;border-radius:999px;padding:2px 8px;font-size:10px;font-weight:500;}
+  .logout{display:flex;align-items:center;gap:4px;border:1px solid #e2e8f0;border-radius:6px;padding:4px 8px;font-size:12px;color:#64748b;background:#fff;cursor:pointer;}
+  main{min-width:0;flex:1;padding:24px;}
+
+  /* ══════════════════════════════════════════════════════════════
+     ② 以下才是【本次要改的】—— 三个页面的内容区，类 Excel 风
+     ══════════════════════════════════════════════════════════════ */
+  /* 紧凑汇总条（替代原来的 4~6 个 StatCard，省一屏高度） */
+  .summary{display:flex;flex-wrap:wrap;gap:0;border:1px solid #d0d0d0;background:#fff;margin-bottom:10px;}
+  .summary .cell{padding:6px 14px;border-right:1px solid #e5e7eb;min-width:120px;}
+  .summary .cell:last-child{border-right:none;}
+  .summary .lbl{font-size:11px;color:#64748b;}
+  .summary .val{font-size:15px;font-weight:700;font-variant-numeric:tabular-nums;}
+  .summary .val.green{color:#059669;} .summary .val.red{color:#e11d48;} .summary .val.amber{color:#d97706;} .summary .val.blue{color:#0284c7;}
+
+  /* 筛选条 */
+  .filters{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:8px 10px;background:#fff;border:1px solid #d0d0d0;border-bottom:none;}
+  .filters label{font-size:12px;color:#64748b;}
+  select,input[type=text],input[type=number]{font:inherit;font-size:12.5px;color:#0f172a;border:1px solid #cbd5e1;background:#fff;height:28px;padding:0 6px;border-radius:4px;}
+  select:focus,input:focus{outline:2px solid #10b981;outline-offset:-1px;}
+  .btn{font:inherit;font-size:12.5px;height:28px;padding:0 12px;border:1px solid #cbd5e1;background:#fff;border-radius:4px;cursor:pointer;white-space:nowrap;}
+  .btn:hover{background:#f8fafc;}
+  .btn.primary{background:#10b981;border-color:#10b981;color:#fff;}
+  .btn.primary:hover{background:#059669;}
+  .spacer{flex:1;}
+
+  /* Excel 表格本体 */
+  .grid-wrap{border:1px solid #d0d0d0;background:#fff;overflow:auto;max-height:calc(100vh - 260px);}
+  table{border-collapse:separate;border-spacing:0;table-layout:fixed;width:100%;}
+  thead th{position:sticky;top:0;z-index:3;background:#f3f3f3;border-right:1px solid #d0d0d0;border-bottom:1px solid #9a9a9a;
+           font-weight:600;text-align:center;font-size:12.5px;padding:0 6px;height:30px;white-space:nowrap;}
+  tbody td{border-right:1px solid #d0d0d0;border-bottom:1px solid #d0d0d0;padding:0 6px;height:30px;font-size:12.5px;white-space:nowrap;overflow:hidden;}
+  tbody tr:hover td{background:#f7fbf8;}
+  td.num,th.num{text-align:right;font-variant-numeric:tabular-nums;}
+  td.ctr{text-align:center;}
+  td.muted{color:#9ca3af;}
+  td.neg{color:#e11d48;}
+  td.edited{background:#fff3cd!important;}
+  td.derived{color:#4f7a63;font-style:italic;}
+  .freeze{position:sticky;left:0;z-index:4;background:#fff;}
+  thead th.freeze{z-index:6;background:#f3f3f3;}
+  tbody tr:hover td.freeze{background:#f7fbf8;}
+  tbody tr.open td{background:#eef7f1;}
+  tfoot td{position:sticky;bottom:0;z-index:3;background:#f7f7f7;border-top:2px solid #9a9a9a;border-right:1px solid #d0d0d0;
+           font-weight:700;font-size:12.5px;padding:0 6px;height:30px;}
+  tfoot td.num{text-align:right;font-variant-numeric:tabular-nums;}
+  td input{width:100%;height:28px;border:none;background:transparent;font:inherit;font-size:12.5px;padding:0;}
+  td.num input{text-align:right;}
+  td input:focus{outline:2px solid #10b981;outline-offset:-2px;background:#fff;}
+  td select{border:none;background:transparent;height:28px;width:100%;font:inherit;font-size:12.5px;padding:0;}
+
+  /* 展开行（替代弹窗）：主表下面挂一条可编辑明细 */
+  tr.detail>td{background:#fbfdfc;border-bottom:2px solid #9a9a9a;height:auto;padding:8px 10px;white-space:normal;}
+  .dtitle{font-size:12px;font-weight:700;color:#047857;margin-bottom:6px;}
+  .dwrap{border:1px solid #d0d0d0;background:#fff;overflow:auto;}
+  .dwrap table{width:auto;min-width:100%;}
+  .dwrap th{background:#f3f3f3;font-size:12px;height:26px;border-right:1px solid #d0d0d0;border-bottom:1px solid #9a9a9a;text-align:center;padding:0 6px;font-weight:600;}
+  .dwrap td{font-size:12px;height:26px;border-right:1px solid #d0d0d0;border-bottom:1px solid #e5e7eb;padding:0 6px;white-space:nowrap;}
+  .dwrap td.num{text-align:right;font-variant-numeric:tabular-nums;}
+  .arrow{display:inline-block;width:14px;color:#64748b;cursor:pointer;user-select:none;font-size:11px;}
+
+  .statusbar{display:flex;align-items:center;gap:14px;padding:6px 10px;background:#fafafa;border:1px solid #d0d0d0;border-top:none;font-size:12px;color:#64748b;}
+  .statusbar b{color:#0f172a;}
+  .hintline{margin:0 0 8px;font-size:12px;color:#64748b;}
+  .pill{border:1px solid #cbd5e1;background:#fff;border-radius:4px;padding:1px 7px;color:#0f172a;}
+  .notchanged{border:1px dashed #cbd5e1;background:#fff;border-radius:12px;padding:40px;text-align:center;color:#94a3b8;}
+  .notchanged b{display:block;font-size:15px;color:#64748b;margin-bottom:6px;}
+</style>
+</head>
+<body>
+<!-- ⚠️ 醒目水印：这是一个独立的设计原型（Mock），完全不参与真实系统 -->
+<div style="position:sticky;top:0;z-index:999;background:#b91c1c;color:#fff;font:13px/1.6 'Microsoft YaHei',sans-serif;padding:6px 14px;text-align:center;">
+  ⚠️ <b>这是设计原型（Mock），不是你的真实系统</b> ——
+  页面里的「不改」标签、占位页都是<b>我加的范围标注</b>，真实系统（React）里没有这些东西。
+  真实系统只有 <b>智慧电表 / 场租台账 / 电费台账</b> 三个页面的表格样式被改了，其余页面<b>零改动</b>。
+  <br>看真实效果请跑前端容器：<code>docker compose up -d --build frontend</code> → http://localhost:8085
+</div>
+<div class="app">
+  <!-- 侧栏：复刻现有 Layout.tsx（本次不改） -->
+  <aside class="sidebar">
+    <div class="logo">
+      <div class="ico">🔋</div>
+      <div>
+        <div class="t1">换电站经营管理平台</div>
+        <div class="t2">收支 · 盈利 · 分红一体化</div>
+      </div>
+    </div>
+    <nav class="nav" id="nav"></nav>
+    <div class="sidefoot">内部管理专用 · 数据实时保存</div>
+  </aside>
+
+  <div class="wrap">
+    <header class="topbar">
+      <h1 id="pageTitle">智慧电表</h1>
+      <div class="userbox">
+        <span class="uname">管理员</span>
+        <span class="roleb">财务</span>
+        <button class="logout">⏻ 退出</button>
+      </div>
+    </header>
+    <main id="content"></main>
+  </div>
+</div>
+
+<script>
+/* ══ 导航（照抄 Layout.tsx 的 NAV）══ */
+const NAV = [
+  {to:'/',label:'经营总览'},{to:'/stations',label:'场地数据'},
+  {to:'/electricity',label:'电费台账'},{to:'/rent',label:'场租台账'},
+  {to:'/brands',label:'品牌方'},{to:'/entities',label:'公司主体'},
+  {to:'/landlords',label:'场地方'},{to:'/shareholders',label:'股东分红'},
+  {to:'/contracts',label:'合同管理'},{to:'/approvals',label:'审批中心'},
+  {to:'/meters',label:'智慧电表'},{to:'/alerts',label:'异常预警'},
+  {to:'/directory',label:'基础档案'},{to:'/settings',label:'系统设置'},
+];
+/* ★ 本次只改这三个页面 */
+const TARGETS = {'/meters':'智慧电表','/rent':'场租台账','/electricity':'电费台账'};
+const ICONS = {'/':'▦','/stations':'🏢','/electricity':'⚡','/rent':'🏠','/brands':'🏷','/entities':'🏛','/landlords':'📍',
+               '/shareholders':'👥','/contracts':'📄','/approvals':'✅','/meters':'⏱','/alerts':'⚠','/directory':'🗂','/settings':'⚙'};
+
+const state = {route:'/meters', open:new Set(), dirty:new Set(), filters:{}};
+
+/* ══════════ 数据（取自真实迁移库 huandian_v5 的样本） ══════════ */
+const CATS = {partner:'合作商电表', civil:'民用电表', shared:'共享电表'};
+const num = v => (v===''||v==null)?0:Number(v)||0;
+const fmt = (v,d=2) => (v===''||v==null)?'':Number(v).toLocaleString('zh-CN',{minimumFractionDigits:d,maximumFractionDigits:d});
+const editVal = (v,d=2) => (v===''||v==null)?'':String(Number(Number(v).toFixed(d)));
+
+const DATA = {
+  /* ── 智慧电表：一行一块电表，展开看月度读数 / 品牌分摊（替代 2 个弹窗） ── */
+  meters: {
+    cols:[
+      {k:'landlord',t:'场地方',w:118,freeze:true},
+      {k:'meter_no',t:'电表号',w:126,freeze:true},
+      {k:'name',t:'名称',w:150,edit:true},
+      {k:'brand',t:'品牌',w:82},
+      {k:'cat',t:'大类',w:90,type:'cat',edit:true},
+      {k:'shared',t:'全品牌共用',w:78,type:'bool',edit:true},
+      {k:'status',t:'状态',w:60,type:'status'},
+      {k:'ratio',t:'倍数',w:52,type:'num',dec:0,edit:true},
+      {k:'cabinets',t:'柜数',w:56,type:'num',dec:0,sum:true},
+      {k:'plat',t:'本月平台电量',w:104,type:'num',dec:2},
+      {k:'actual',t:'本月实际电量',w:104,type:'num',dec:2,edit:true,sum:true},
+      {k:'src',t:'来源',w:64,type:'src'}
+    ],
+    rows:[
+      {landlord:'龙泉路108',meter_no:'260319554778',name:'龙泉路场地共用表',brand:'',cat:'shared',shared:true,status:'正常',ratio:40,cabinets:8,plat:162624.00,actual:15780.00,src:'api',
+       readings:[{period:'202607',plat:5428.00,actual:null,range:'07-01 ~ 07-31'},{period:'202608',plat:183280.00,actual:11000.00,range:'08-01 ~ 08-31'},{period:'202609',plat:162624.00,actual:15780.00,range:'09-01 ~ 09-30'}],
+       allocs:[{brand:'云驰换电',mode:'amount',amount:1620.00,kwh:null,price:0.55,cabs:2},{brand:'永群出行',mode:'kwh',amount:null,kwh:3000,price:0.55,cabs:2},{brand:'电皇后',mode:'amount',amount:6000.00,kwh:null,price:0.55,cabs:4}]},
+      {landlord:'大观体育公园',meter_no:'251206550085',name:'大观共用表',brand:'',cat:'shared',shared:true,status:'正常',ratio:1,cabinets:4,plat:812.40,actual:null,src:'api',
+       readings:[{period:'202609',plat:812.40,actual:null,range:'09-01 ~ 09-30'}],allocs:[]},
+      {landlord:'学府路68',meter_no:'学府路001',name:'学府路共用表',brand:'',cat:'shared',shared:true,status:'正常',ratio:50,cabinets:6,plat:0.00,actual:2360.00,src:'manual',
+       readings:[{period:'202609',plat:0.00,actual:2360.00,range:'手工录入'}],allocs:[]},
+      {landlord:'滇池会展中心',meter_no:'260319550072',name:'台铃-滇池会展中心站',brand:'台铃',cat:'partner',shared:false,status:'正常',ratio:40,cabinets:6,plat:7448.00,actual:null,src:'api',
+       readings:[{period:'202608',plat:7200.00,actual:null,range:'08-01 ~ 08-31'},{period:'202609',plat:7448.00,actual:null,range:'09-01 ~ 09-30'}],allocs:[]},
+      {landlord:'滇池会展中心',meter_no:'260319550057',name:'八维通-滇池会展中心',brand:'八维通',cat:'partner',shared:false,status:'正常',ratio:40,cabinets:6,plat:8140.00,actual:null,src:'api',readings:[],allocs:[]},
+      {landlord:'龙润路',meter_no:'青桔-龙润路',name:'青桔-龙润路',brand:'青桔',cat:'partner',shared:false,status:'正常',ratio:1,cabinets:3,plat:20019.00,actual:20019.00,src:'api',readings:[],allocs:[]},
+      {landlord:'钓场35',meter_no:'401086095832',name:'钓场35分布式点位',brand:'青桔',cat:'partner',shared:false,status:'正常',ratio:40,cabinets:5,plat:21600.00,actual:21600.00,src:'api',readings:[],allocs:[]},
+      {landlord:'六甲',meter_no:'六甲青桔',name:'六甲青桔',brand:'青桔',cat:'partner',shared:false,status:'正常',ratio:1,cabinets:2,plat:0.00,actual:null,src:'manual',readings:[],allocs:[]},
+      {landlord:'',meter_no:'250705032756',name:'（未建档）',brand:'',cat:'civil',shared:false,status:'待归位',ratio:1,cabinets:0,plat:0.00,actual:null,src:'api',readings:[],allocs:[]}
+    ]
+  },
+
+  /* ── 场租台账：一行 = 场地 × 月份，展开看各品牌应收 ── */
+  rent: {
+    cols:[
+      {k:'landlord',t:'场地方',w:130,freeze:true},
+      {k:'period',t:'月份',w:70,freeze:true},
+      {k:'method',t:'计租方式',w:84},
+      {k:'rent',t:'场地合同月租',w:100,type:'num',dec:2},
+      {k:'cabs',t:'柜数',w:56,type:'num',dec:0,sum:true},
+      {k:'days',t:'计费天数',w:70,type:'num',dec:0},
+      {k:'payable',t:'应付场租',w:100,type:'num',dec:2,edit:true,sum:true},
+      {k:'pay_status',t:'付款状态',w:84,type:'pstatus',edit:true},
+      {k:'receivable',t:'应收场租',w:100,type:'num',dec:2,sum:true},
+      {k:'recv_status',t:'收款状态',w:84,type:'cstatus'},
+      {k:'diff',t:'场租差价',w:100,type:'num',dec:2,neg:true,sum:true,calc:r=>num(r.receivable)-num(r.payable)}
+    ],
+    rows:[
+      {landlord:'龙泉路108',period:'202609',method:'按柜数',rent:2400.00,cabs:8,days:30,payable:2400.00,pay_status:'未付款',receivable:4600.00,recv_status:'部分到账'},
+      {landlord:'龙泉路108',period:'202608',method:'按柜数',rent:2400.00,cabs:3,days:30,payable:2400.00,pay_status:'已付款',receivable:2700.00,recv_status:'已到账'},
+      {landlord:'滇池会展中心',period:'202609',method:'固定价格',rent:3120.00,cabs:12,days:30,payable:3120.00,pay_status:'已付款',receivable:1800.00,recv_status:'未到账'},
+      {landlord:'归十西路家园',period:'202608',method:'按柜数',rent:200.00,cabs:5,days:16,payable:533.33,pay_status:'未付款',receivable:320.00,recv_status:'未到账'},
+      {landlord:'龙润路',period:'202609',method:'按柜数',rent:300.00,cabs:3,days:30,payable:900.00,pay_status:'未付款',receivable:1200.00,recv_status:'已到账'}
+    ],
+    detail:{  // 展开：该场地该月的品牌明细
+      '龙泉路108|202609':{title:'龙泉路108 · 202609 品牌明细（应收场租）',cols:[
+          {k:'brand',t:'品牌',w:110},{k:'entity',t:'报税主体',w:90},{k:'cabs',t:'柜数',w:60},
+          {k:'days',t:'计费天数',w:80},{k:'price',t:'单柜月租',w:90},{k:'amount',t:'应收场租',w:100,type:'num'},
+          {k:'status',t:'收款状态',w:90,type:'cstatus'}],
+        rows:[{brand:'云驰换电',entity:'主体A',cabs:2,days:30,price:300,amount:1200.00,status:'已到账'},
+              {brand:'永群出行',entity:'主体A',cabs:2,days:30,price:300,amount:1000.00,status:'部分到账'},
+              {brand:'电皇后',entity:'主体B',cabs:4,days:30,price:300,amount:2400.00,status:'未到账'}]},
+      '滇池会展中心|202609':{title:'滇池会展中心 · 202609 品牌明细（应收场租）',cols:[
+          {k:'brand',t:'品牌',w:110},{k:'entity',t:'报税主体',w:90},{k:'cabs',t:'柜数',w:60},
+          {k:'days',t:'计费天数',w:80},{k:'price',t:'单柜月租',w:90},{k:'amount',t:'应收场租',w:100,type:'num'},
+          {k:'status',t:'收款状态',w:90,type:'cstatus'}],
+        rows:[{brand:'台铃',entity:'主体A',cabs:6,days:30,price:300,amount:1800.00,status:'未到账'},
+              {brand:'八维通',entity:'主体A',cabs:6,days:30,price:300,amount:0.00,status:'未到账'}]}
+    }
+  },
+
+  /* ── 电费台账：一行 = 场地 × 月份，展开看分表明细（替代"抄表核对"弹窗） ── */
+  elec: {
+    cols:[
+      {k:'landlord',t:'场地方',w:130,freeze:true},
+      {k:'period',t:'月份',w:70,freeze:true},
+      {k:'pay_kwh',t:'支出电量',w:96,type:'num',dec:2,sum:true},
+      {k:'pay_price',t:'支出单价',w:80,type:'num',dec:4},
+      {k:'pay_amt',t:'支出金额',w:104,type:'num',dec:2,sum:true},
+      {k:'col_kwh',t:'收入电量',w:96,type:'num',dec:2,sum:true},
+      {k:'col_amt',t:'收入金额',w:104,type:'num',dec:2,sum:true},
+      {k:'tax',t:'税费',w:84,type:'num',dec:2,sum:true},
+      {k:'net',t:'收入净额',w:104,type:'num',dec:2,sum:true},
+      {k:'profit',t:'利润',w:104,type:'num',dec:2,neg:true,sum:true,calc:r=>num(r.net)-num(r.pay_amt)},
+      {k:'loss',t:'损耗电量',w:88,type:'num',dec:2,sum:true},
+      {k:'pay_status',t:'付款状态',w:84,type:'pstatus',edit:true},
+      {k:'recv_status',t:'收款状态',w:84,type:'cstatus',edit:true}
+    ],
+    rows:[
+      {landlord:'龙泉路108',period:'202609',pay_kwh:17063.64,pay_price:0.55,pay_amt:9385.00,col_kwh:19309.09,col_amt:12120.00,tax:121.20,net:11998.80,loss:1283.64,pay_status:'未付款',recv_status:'部分到账'},
+      {landlord:'龙泉路108',period:'202608',pay_kwh:11000.00,pay_price:0.60,pay_amt:6600.00,col_kwh:3000.00,col_amt:2700.00,tax:27.00,net:2673.00,loss:8000.00,pay_status:'已付款',recv_status:'已到账'},
+      {landlord:'滇池会展中心',period:'202609',pay_kwh:15588.00,pay_price:0.60,pay_amt:9352.80,col_kwh:15588.00,col_amt:17146.80,tax:171.47,net:16975.33,loss:0.00,pay_status:'已付款',recv_status:'未到账'},
+      {landlord:'归十西路家园',period:'202608',pay_kwh:699.63,pay_price:0.62,pay_amt:433.77,col_kwh:699.63,col_amt:699.63,tax:6.99,net:692.64,loss:0.00,pay_status:'未付款',recv_status:'未到账'},
+      {landlord:'大观体育公园',period:'202609',pay_kwh:872.73,pay_price:1.10,pay_amt:960.00,col_kwh:0.00,col_amt:0.00,tax:0.00,net:0.00,loss:60.33,pay_status:'未付款',recv_status:'—'}
+    ],
+    detail:{
+      '龙泉路108|202609':{title:'龙泉路108 · 202609 分表明细（支出 / 收入）',cols:[
+          {k:'meter_no',t:'电表号',w:126},{k:'brand',t:'品牌',w:96},{k:'kwh',t:'电量',w:96,type:'num'},
+          {k:'p_price',t:'支出单价',w:84,type:'num'},{k:'p_amt',t:'支出金额',w:100,type:'num'},
+          {k:'c_price',t:'收入单价',w:84,type:'num'},{k:'c_amt',t:'收入金额',w:100,type:'num'},
+          {k:'net',t:'净额',w:100,type:'num'}],
+        rows:[{meter_no:'260319554778',brand:'云驰换电',kwh:2945.45,p_price:0.55,p_amt:1620.00,c_price:0.55,c_amt:1620.00,net:1603.80},
+              {meter_no:'260319554778',brand:'永群出行',kwh:5454.55,p_price:0.55,p_amt:3000.00,c_price:0.55,c_amt:4500.00,net:4455.00},
+              {meter_no:'260319554778',brand:'电皇后',kwh:10909.09,p_price:0.55,p_amt:6000.00,c_price:0.55,c_amt:6000.00,net:5940.00},
+              {meter_no:'260319554778',brand:'（损耗·我方承担）',kwh:1283.64,p_price:0.55,p_amt:706.00,c_price:null,c_amt:0.00,net:0.00}]}
+    }
+  }
+};
+
+/* ══════════ 渲染 ══════════ */
+function renderNav(){
+  document.getElementById('nav').innerHTML = NAV.map(n=>{
+    const target = !!TARGETS[n.to];
+    return `<a data-to="${n.to}" class="${state.route===n.to?'active':''}">
+      <span class="i">${ICONS[n.to]||'·'}</span>${n.label}${target?'':'<span class="out">不改</span>'}
+    </a>`;
+  }).join('');
+  document.querySelectorAll('#nav a').forEach(a=>a.onclick=()=>{
+    state.route = a.dataset.to; state.open.clear();
+    document.getElementById('pageTitle').textContent = (TARGETS[state.route] || NAV.find(n=>n.to===state.route).label);
+    try{ history.replaceState(null,'','#'+state.route); }catch(e){}
+    render();
+  });
+}
+
+function cellHtml(row, col, ctx){
+  const v = col.calc ? col.calc(row) : row[col.k];
+  const raw = row[col.k];
+  const canEdit = typeof col.edit==='function' ? col.edit(row) : !!col.edit;
+  const derived = (raw==null||raw==='') && !!col.calc;
+  const key = ctx+':'+col.k;
+  const edited = state.dirty.has(key) ? ' edited' : '';
+  if(canEdit){
+    if(col.type==='bool')
+      return `<td class="ctr${edited}"><input type="checkbox" data-edit="${ctx}:${col.k}" ${v?'checked':''} style="width:auto;height:auto"></td>`;
+    if(col.type==='cat'){
+      const o = Object.entries(CATS).map(([k2,l])=>`<option value="${k2}" ${v===k2?'selected':''}>${l}</option>`).join('');
+      return `<td class="${edited}"><select data-edit="${ctx}:${col.k}">${o}</select></td>`;
+    }
+    if(col.type==='pstatus'||col.type==='cstatus'){
+      const opts = col.type==='pstatus'?['未付款','已付款','部分付款']:['未到账','已到账','部分到账'];
+      return `<td class="${edited}"><select data-edit="${ctx}:${col.k}">${opts.map(s=>`<option ${v===s?'selected':''}>${s}</option>`).join('')}</select></td>`;
+    }
+    const show = derived ? col.calc(row) : v;
+    const dv = (col.type==='num'||col.type==='calc') ? fmt(show, col.dec??2) : (show??'');
+    return `<td class="${col.type==='num'?'num ':''}${derived?'derived ':''}${edited}">`+
+           `<input data-edit="${ctx}:${col.k}" value="${dv}"></td>`;
+  }
+  if(col.type==='status'||col.type==='pstatus'||col.type==='cstatus'){
+    const m = {'已付款':'ok','已到账':'ok','正常':'ok','未付款':'no','未到账':'no','部分付款':'part','部分到账':'part','待归位':'part'};
+    return `<td class="ctr"><span class="badge ${m[v]||'no'}">${v??'—'}</span></td>`;
+  }
+  let disp;
+  if(col.type==='cat') disp = CATS[v]||'';
+  else if(col.type==='bool') disp = v?'是':'';
+  else if(col.type==='src') disp = v==='api'?'电表API':'手工';
+  else if(col.type==='num'||col.type==='calc') disp = fmt(v,col.dec??2);
+  else disp = v??'';
+  const cls = (col.type==='num'||col.type==='calc'?'num ':'') + (disp===''?'muted ':'') + (derived?'derived ':'') + (col.neg&&num(v)<0?'neg ':'');
+  return `<td class="${cls}">${disp===''?'—':disp}</td>`;
+}
+
+function renderGrid(sheet, ctxPrefix){
+  const {cols, rows} = sheet;
+  let left = 30; const off={};
+  cols.forEach(c=>{ if(c.freeze){ off[c.k]=left; left+=c.w; } });
+  const fs = c => c.freeze?` style="left:${off[c.k]}px"`:'';
+  const fc = c => c.freeze?' freeze':'';
+
+  const colgroup = '<colgroup><col style="width:30px">'+cols.map(c=>`<col style="width:${c.w}px">`).join('')+'</colgroup>';
+  const head = '<thead><tr><th class="freeze" style="left:0"></th>'+cols.map(c=>
+      `<th class="${c.type==='num'||c.type==='calc'?'num':''}${fc(c)}"${fs(c)}>${c.t}</th>`).join('')+'</tr></thead>';
+
+  let body='';
+  rows.forEach((r,i)=>{
+    const ctx = ctxPrefix+i;
+    const open = state.open.has(ctx);
+    body += `<tr class="${open?'open':''}" data-row="${ctx}">`;
+    body += `<td class="ctr freeze" style="left:0"><span class="arrow" data-toggle="${ctx}">${open?'▼':'▶'}</span></td>`;
+    cols.forEach(c=>{ body += cellHtml(r,c,ctx); });
+    body += '</tr>';
+    if(open){
+      const d = sheet.detail && sheet.detail[r.landlord+'|'+r.period];
+      body += `<tr class="detail"><td colspan="${cols.length+1}">`;
+      if(d){
+        body += `<div class="dtitle">${d.title}</div><div class="dwrap"><table><thead><tr>`+
+          d.cols.map(c=>`<th style="width:${c.w}px">${c.t}</th>`).join('')+'</tr></thead><tbody>'+
+          d.rows.map(dr=>'<tr>'+d.cols.map(c=>{
+            const v=dr[c.k];
+            if(c.type==='num') return `<td class="num">${fmt(v,2)}</td>`;
+            if(c.type==='cstatus') return `<td class="ctr"><span class="badge ${v==='已到账'?'ok':v==='部分到账'?'part':'no'}">${v}</span></td>`;
+            return `<td>${v??'—'}</td>`;
+          }).join('')+'</tr>').join('')+'</tbody></table></div>';
+      } else if(r.readings && r.readings.length){
+        body += `<div class="dtitle">${r.meter_no} · 月度读数（实际电量可直接改，替代原"抄表补录"弹窗）</div>
+          <div class="dwrap"><table><thead><tr>
+            <th style="width:80px">月份</th><th style="width:120px">平台电量</th>
+            <th style="width:130px">实际电量（可改）</th><th style="width:160px">抄表区间</th>
+            <th style="width:90px">数据来源</th></tr></thead><tbody>`+
+          r.readings.map(rd=>`<tr><td class="ctr">${rd.period}</td><td class="num">${fmt(rd.plat,2)}</td>
+            <td class="num"><input data-dedit="${ctx}|${rd.period}|actual" value="${editVal(rd.actual,2)}"></td>
+            <td class="ctr">${rd.range}</td><td class="ctr">${rd.actual!=null?'人工修正':'第三方同步'}</td></tr>`).join('')+
+          '</tbody></table></div>';
+        if(r.allocs && r.allocs.length){
+          body += `<div class="dtitle" style="margin-top:10px">${r.meter_no} · 品牌分摊（替代原"品牌分摊"弹窗）</div>
+            <div class="dwrap"><table><thead><tr>
+              <th style="width:110px">品牌</th><th style="width:90px">录入方式</th>
+              <th style="width:110px">应收金额</th><th style="width:110px">应收电量</th>
+              <th style="width:80px">单价</th><th style="width:80px">柜数</th></tr></thead><tbody>`+
+            r.allocs.map(a=>`<tr><td>${a.brand}</td>
+              <td class="ctr">${a.mode==='amount'?'录金额':'录电量'}</td>
+              <td class="num">${a.amount!=null?fmt(a.amount,2):`<span style="color:#4f7a63;font-style:italic">${fmt(num(a.kwh)*num(a.price),2)}</span>`}</td>
+              <td class="num">${a.kwh!=null?fmt(a.kwh,2):`<span style="color:#4f7a63;font-style:italic">${fmt(num(a.amount)/num(a.price||1),2)}</span>`}</td>
+              <td class="num">${a.price}</td><td class="num">${a.cabs}</td></tr>`).join('')+
+            '</tbody></table></div>';
+        }
+      } else {
+        body += '<div style="color:#94a3b8">该表暂无月度读数明细</div>';
+      }
+      body += '</td></tr>';
+    }
+  });
+
+  let foot = '<tfoot><tr><td class="freeze" style="left:0"></td>';
+  let placed=false;
+  cols.forEach(c=>{
+    if(!placed){ placed=true; foot += `<td class="${fc(c)}"${fs(c)}>合计</td>`; return; }
+    if(c.sum){
+      const s = rows.reduce((a,r)=>a+num(c.calc?c.calc(r):r[c.k]),0);
+      foot += `<td class="num${fc(c)}"${fs(c)}${(c.neg&&s<0)?' style="color:#e11d48"':''}>${fmt(s,c.dec??2)}</td>`;
+    } else foot += `<td class="${fc(c)}"${fs(c)}></td>`;
+  });
+  foot += '</tr></tfoot>';
+
+  return `<div class="grid-wrap"><table>${colgroup}${head}<tbody>${body}</tbody>${foot}</table></div>`;
+}
+
+function summary(items){
+  return '<div class="summary">'+items.map(x=>
+    `<div class="cell"><div class="lbl">${x.l}</div><div class="val ${x.tone||''}">${x.v}</div></div>`).join('')+'</div>';
+}
+
+/* ── 三个页面各自的内容 ── */
+function pageMeters(){
+  const rows = DATA.meters.rows;
+  const tot = rows.reduce((a,r)=>a+num(r.actual),0);
+  const noLandlord = rows.filter(r=>!r.landlord).length;
+  return summary([
+    {l:'电表总数',v:rows.length+' 块'},
+    {l:'全品牌共用表',v:rows.filter(r=>r.shared).length+' 块',tone:'blue'},
+    {l:'本月实际电量(合计)',v:fmt(tot,2)+' 度',tone:'green'},
+    {l:'未归位电表',v:noLandlord+' 块',tone:noLandlord?'red':'default'}
+  ])
+  + `<div class="filters">
+      <label>关键词</label><input type="text" placeholder="电表号 / 名称" style="width:150px">
+      <label>场地方</label><select><option>全部</option><option>龙泉路108</option><option>滇池会展中心</option></select>
+      <label>品牌</label><select><option>全部</option><option>台铃</option><option>青桔</option></select>
+      <label>大类</label><select><option>全部</option><option>合作商电表</option><option>民用电表</option><option>共享电表</option></select>
+      <label>全品牌共用</label><select><option>全部</option><option>是</option><option>否</option></select>
+      <span class="spacer"></span>
+      <button class="btn">同步第三方</button><button class="btn">导入 Excel</button><button class="btn primary">+ 新增电表</button>
+    </div>`
+  + renderGrid(DATA.meters,'m')
+  + `<div class="statusbar"><span>共 <b>${rows.length}</b> 块电表</span><span>未保存 <b>${state.dirty.size}</b> 处</span>
+      <span class="spacer"></span><span>点行首 ▶ 展开 → 直接改读数 / 填品牌分摊（原来要开 2 个弹窗）</span></div>`;
+}
+
+function pageRent(){
+  const rows = DATA.rent.rows;
+  const pay = rows.reduce((a,r)=>a+num(r.payable),0);
+  const recv = rows.reduce((a,r)=>a+num(r.receivable),0);
+  const unpaid = rows.filter(r=>r.pay_status!=='已付款').reduce((a,r)=>a+num(r.payable),0);
+  return summary([
+    {l:'应付场租',v:fmt(pay,2)},
+    {l:'其中未付',v:fmt(unpaid,2),tone:'red'},
+    {l:'应收场租',v:fmt(recv,2),tone:'blue'},
+    {l:'场租差价',v:fmt(recv-pay,2),tone:(recv-pay)<0?'red':'green'}
+  ])
+  + `<div class="filters">
+      <label>关键词</label><input type="text" placeholder="场地方 / 品牌" style="width:150px">
+      <label>场地方</label><select><option>全部</option><option>龙泉路108</option></select>
+      <label>起止月份</label><input type="text" value="202601" style="width:80px"> ~ <input type="text" value="202609" style="width:80px">
+      <label>付款状态</label><select><option>全部</option><option>已付款</option><option>未付款</option></select>
+      <span class="spacer"></span>
+      <button class="btn">导出 Excel</button><button class="btn primary">+ 录入付款</button>
+    </div>`
+  + renderGrid(DATA.rent,'r')
+  + `<div class="statusbar"><span>共 <b>${rows.length}</b> 行</span><span>未保存 <b>${state.dirty.size}</b> 处</span>
+      <span class="spacer"></span><span>点 ▶ 展开 → 各品牌应收场租明细（原来要点开卡片）</span></div>`;
+}
+
+function pageElec(){
+  const rows = DATA.elec.rows;
+  const pay = rows.reduce((a,r)=>a+num(r.pay_amt),0);
+  const net = rows.reduce((a,r)=>a+num(r.net),0);
+  const loss = rows.reduce((a,r)=>a+num(r.loss),0);
+  return summary([
+    {l:'电费支出',v:fmt(pay,2)},
+    {l:'收入净额',v:fmt(net,2),tone:'green'},
+    {l:'电费利润',v:fmt(net-pay,2),tone:(net-pay)<0?'red':'green'},
+    {l:'损耗电量(我方承担)',v:fmt(loss,2)+' 度',tone:'amber'}
+  ])
+  + `<div class="filters">
+      <label>场地方</label><select><option>全部</option><option>龙泉路108</option></select>
+      <label>起止月份</label><input type="text" value="202601" style="width:80px"> ~ <input type="text" value="202609" style="width:80px">
+      <label>付款状态</label><select><option>全部</option><option>已付款</option><option>未付款</option></select>
+      <label>收款状态</label><select><option>全部</option><option>已到账</option><option>未到账</option></select>
+      <span class="spacer"></span>
+      <button class="btn">导出 Excel</button><button class="btn">重新生成台账</button>
+    </div>`
+  + renderGrid(DATA.elec,'e')
+  + `<div class="statusbar"><span>共 <b>${rows.length}</b> 行</span><span>未保存 <b>${state.dirty.size}</b> 处</span>
+      <span class="spacer"></span><span>点 ▶ 展开 → 分表明细 + 损耗（原来要点"抄表核对"弹窗）</span></div>`;
+}
+
+const PAGES = {'/meters':pageMeters, '/rent':pageRent, '/electricity':pageElec};
+
+function render(){
+  renderNav();
+  const box = document.getElementById('content');
+  if(PAGES[state.route]) box.innerHTML = PAGES[state.route]();
+  else box.innerHTML = `<div class="notchanged"><b>「${NAV.find(n=>n.to===state.route).label}」本次不改</b>
+      保持现有外观与交互。本次只把 <b style="display:inline">智慧电表 / 场租台账 / 电费台账</b> 三个页面改成类 Excel 风。</div>`;
+  bind();
+}
+
+function bind(){
+  document.querySelectorAll('[data-toggle]').forEach(el=>el.onclick=e=>{
+    const k = el.dataset.toggle;
+    if(state.open.has(k)) state.open.delete(k); else state.open.add(k);
+    render();
+  });
+  document.querySelectorAll('[data-edit]').forEach(el=>el.addEventListener('change',()=>{
+    const [ctx,k] = el.dataset.edit.split(':');
+    const sheet = {m:DATA.meters,r:DATA.rent,e:DATA.elec}[ctx[0]];
+    const i = Number(ctx.slice(1));
+    const col = sheet.cols.find(c=>c.k===k);
+    let v = el.type==='checkbox' ? el.checked : el.value;
+    if(col.type==='num') v = v===''?null:Number(String(v).replace(/,/g,''));
+    if(col.type==='num' && Number.isNaN(v)) v = null;
+    sheet.rows[i][k] = v;
+    state.dirty.add(ctx+':'+k);
+    render();
+  }));
+  document.querySelectorAll('[data-dedit]').forEach(el=>el.addEventListener('change',()=>{
+    state.dirty.add(el.dataset.dedit); render();
+  }));
+}
+
+/* 深链接：#/meters 或 ?p=rent（前者给真人点，后者方便命令行/截图） */
+function applyHash(){
+  const fromQuery = new URLSearchParams(location.search).get('p');
+  const p = fromQuery ? '/'+fromQuery : (location.hash||'').replace('#','');
+  if(NAV.some(n=>n.to===p)) state.route = p;
+  document.getElementById('pageTitle').textContent = (TARGETS[state.route] || NAV.find(n=>n.to===state.route).label);
+}
+window.addEventListener('hashchange',()=>{ applyHash(); state.open.clear(); render(); });
+applyHash();
+/* ?open=1 时自动展开第一行（方便演示"展开代替弹窗"） */
+if(new URLSearchParams(location.search).has('open')){
+  const k = state.route==='/meters'?'m':state.route==='/rent'?'r':'e';
+  state.open.add(k+'0');
+}
+render();
+</script>
+
+<style>
+  /* 状态徽章（沿用现有 Stat.tsx 的 StatusBadge 色调） */
+  .badge{display:inline-flex;align-items:center;border-radius:999px;padding:1px 8px;font-size:11px;font-weight:500;border:1px solid;}
+  .badge.ok{background:#ecfdf5;color:#047857;border-color:#a7f3d0;}
+  .badge.no{background:#fff1f2;color:#be123c;border-color:#fecdd3;}
+  .badge.part{background:#fffbeb;color:#b45309;border-color:#fde68a;}
+</style>
+</body>
+</html>

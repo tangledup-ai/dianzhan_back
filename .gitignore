@@ -44,3 +44,6 @@ __pycache__/
 *.py[cod]
 # Agent workspace memory (local only)
 .workbuddy/
+# Scratch / temp files
+$null
+__tmp_cid.txt

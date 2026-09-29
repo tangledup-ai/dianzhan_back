@@ -56,7 +56,8 @@ export interface SharedAllocationBrandOption {
 export interface SharedAllocationRow {
   brandId: number;
   brandName?: string;
-  collectAmount: number;
+  /** 应收电费；null = 本月该品牌不计电费（可只录柜数/主体） */
+  collectAmount: number | null;
   unitPrice?: number | null;
   /** 该品牌当月在此共享表下投放的电柜数量（逐月可调；留空 = 未填） */
   cabinetCount?: number | null;
@@ -87,18 +88,30 @@ export interface SharedAllocationForm {
   allocations: {
     brandId: number;
     brandName: string;
-    collectAmount: number;
+    /** null = 本月该品牌只录了柜数/主体，未计电费 */
+    collectAmount: number | null;
     unitPrice: number | null;
     effectiveUnitPrice: number | null;
     taxRate: number;
     taxEnabled: boolean;
     kwh: number | null;
-    collectNet: number;
+    collectNet: number | null;
     cabinetCount: number | null;
     entityId?: number | null;
     entityName?: string | null;
     remark?: string | null;
   }[];
+  /** ★V5：该月这块共享表**应当**由哪几个品牌共享（品牌绑定清单：动态月度、默认继承上月） */
+  bindings?: {
+    brandId: number;
+    brandName: string;
+    startPeriod?: string;
+    endPeriod?: string | null;
+    /** 本月是否已录分摊 */
+    hasAllocation?: boolean;
+  }[];
+  /** ★V5：已绑定但本月尚未录分摊的品牌（漏录告警；系统不自动补） */
+  missingBrands?: { brandId: number; brandName: string }[];
   periods: string[];
   /** 电柜数量默认值：该品牌最近一次填写值，键为 brandId 字符串 */
   cabinetDefaults?: Record<string, { count: number; monthPeriod: string }>;

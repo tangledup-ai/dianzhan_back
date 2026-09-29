@@ -185,7 +185,30 @@ class DividendCalculator:
             return gross
 
         elec_income = round(sum(_meter_income(d) for d in meter_details), 2)
+        # ★V5：电费成本 = 各品牌【自己电量】的成本 + **场地级损耗**（我方承担）
+        #   损耗取自 landlord_monthly_elec（台账生成时维护：loss = final_kwh − Σ场地内所有表实际用电量）。
+        #   ⇒ 成本合计与「我方实际付给场地方的总额」一致；而各品牌分摊到的成本里【不含】损耗（品牌不被损耗放大）。
+        loss_kwh, loss_amount = 0.0, 0.0
+        try:
+            _conn = get_connection()
+            _cur = get_dict_cursor(_conn)
+            try:
+                _cur.execute(
+                    "SELECT loss_kwh, loss_amount FROM landlord_monthly_elec WHERE landlord_id = %s AND period = %s",
+                    (landlord_id, period_compact),
+                )
+                _lr = _cur.fetchone()
+                if _lr:
+                    loss_kwh = round(float(_lr.get("loss_kwh") or 0), 2)
+                    loss_amount = round(float(_lr.get("loss_amount") or 0), 2)
+            finally:
+                _cur.close()
+                _conn.close()
+        except Exception as _e:
+            # 不能静默吞：损耗拿不到会让成本偏低、利润虚高
+            print(f"⚠️ 分红：读取场地级损耗失败（landlord={landlord_id} period={period_compact}）: {_e}")
         elec_cost = round(total_kwh * elec_pay_price, 2) if elec_pay_price else 0
+        elec_cost = round(elec_cost + loss_amount, 2)
 
         # 电费税费（税费 = 含税收入 × 税率；仅启用税率的品牌计税）
         elec_tax = 0
@@ -265,6 +288,8 @@ class DividendCalculator:
                 "total": elec_income,
                 "details": [{
                     "meterNo": d["meter_no"],
+                    # ★ 带上 brandId：前端按配置过滤明细时必须用 id 比对，用品牌名会串（同名/空名）
+                    "brandId": d.get("brand_id"),
                     "brandName": d["brand_name"],
                     "kwh": float(d["kwh"] or 0),
                     # 品牌分摊录入行没有合同单价可依，展示人工/倒推用的单价
@@ -285,6 +310,9 @@ class DividendCalculator:
         # 口径：收入已为不含税，税费单独展示（elecTax/rentTax 字段保留，不参与 totalCost/profit，避免双扣）
         cost = {
             "elecCost": elec_cost,
+            # ★V5：场地级损耗（已含在 elecCost 里；单列出来供页面展示「损耗多少」，不重复扣）
+            "lossKwh": round(loss_kwh, 2),
+            "lossAmount": round(loss_amount, 2),
             "rentCost": round(rent_cost, 2),
             "opExpense": round(op_expense, 2),
             "elecTax": round(elec_tax, 2),
@@ -295,6 +323,9 @@ class DividendCalculator:
             "details": {
                 "electricity": [{
                     "meterNo": d["meter_no"],
+                    # ★ 带上 brandId/brandName：前端按配置过滤成本明细用 id 比对，且无需回查收入明细
+                    "brandId": d.get("brand_id"),
+                    "brandName": d.get("brand_name"),
                     # 付款口径电量（共享电表含亏空分摊）；收款口径见 income.elecIncome.details
                     "kwh": float(d.get("pay_kwh", d["kwh"]) or 0),
                     "unitPrice": elec_pay_price,
@@ -600,13 +631,13 @@ class DividendCalculator:
                 # 指定品牌：该品牌的电表 + 共享电表（共享表按品牌分摊后可能存在该品牌的份额）
                 conditions = [
                     "m.landlord_id = %s", "m.meter_no NOT LIKE 'TEST%%'",
-                    "(m.brand_id = %s OR (m.brand_id IS NULL AND m.tag = '共享电表'))",
+                    "(m.brand_id = %s OR (m.brand_id IS NULL AND m.is_shared = TRUE))",
                 ]
                 values = [landlord_id, brand_id]
             else:
                 conditions = [
                     "m.landlord_id = %s", "m.meter_no NOT LIKE 'TEST%%'",
-                    "(m.brand_id IS NOT NULL OR m.tag = '共享电表')",
+                    "(m.brand_id IS NOT NULL OR m.is_shared = TRUE)",
                 ]
                 values = [landlord_id]
             where = " AND ".join(conditions)
@@ -641,7 +672,7 @@ class DividendCalculator:
                 placeholders = ",".join(["%s"] * len(meter_nos))
                 cur.execute(f"""
                     SELECT mm.address as meter_no, COALESCE(SUM(mm.kwh), 0) as kwh, MAX(mm.actual_kwh) as actual_kwh
-                    FROM meter_monthly mm
+                    FROM meter_readings mm
                     WHERE mm.address IN ({placeholders}) AND mm.month_period = %s
                     GROUP BY mm.address
                 """, (*meter_nos, month_period))
@@ -649,32 +680,15 @@ class DividendCalculator:
                 kwh_map = {r["meter_no"]: float(r["kwh"] or 0) for r in rows}
                 actual_map = {r["meter_no"]: r["actual_kwh"] for r in rows if r.get("actual_kwh") is not None}
 
-                # 共享电表付款系数：付场地方按整表读数结算，品牌倒推合计与整表的差额（亏空/线损）
-                # 由我方承担 → 按各品牌用电量比例分摊进付款电量。口径与电费台账一致。
-                # 系数按表预算（用该表**全部**品牌分摊行，而非当前 brand_id 过滤后的子集）。
-                pay_scale = {}
-                for m in meters:
-                    allocs_m = alloc_map.get(m["meter_no"])
-                    if not allocs_m:
-                        continue
-                    alloc_sum = 0.0
-                    for a in allocs_m:
-                        info_a = brand_price_for(pricing, a["brand_id"], a.get("entity_id") or m.get("entity_id"))
-                        up_a = a.get("unit_price") or (info_a["price"] if info_a else None)
-                        if up_a:
-                            alloc_sum += round(float(a.get("collect_amount") or 0) / float(up_a), 2)
-                    full = actual_map.get(m["meter_no"])
-                    full = round(float(full), 2) if full is not None else \
-                        round(kwh_map.get(m["meter_no"], 0) * float(m.get("transformer_ratio") or 1), 2)
-                    pay_scale[m["meter_no"]] = (full / alloc_sum) if (full > 0 and alloc_sum > 0) else 1.0
-
+                # ★V5：**已取消**"损耗按电量比例摊进品牌付款电量"的 pay_scale 系数 ——
+                #   品牌只承担【自己用电量】的成本；差额与场地级损耗由我方承担，
+                #   在电费台账里体现为独立的「损耗行」（row_type='loss'）。
                 for m in meters:
                     allocs = alloc_map.get(m["meter_no"]) if m.get("brand_id") is None else None
                     if allocs:
                         # 共享电表品牌分摊：逐品牌一条明细，收入取人工录入金额
                         picked = [a for a in allocs
                                   if brand_id is None or int(a["brand_id"]) == int(brand_id)]
-                        scale_a = pay_scale.get(m["meter_no"], 1.0)
                         for a in picked:
                             amount = round(float(a.get("collect_amount") or 0), 2)
                             alloc_entity = a.get("entity_id") or m.get("entity_id")
@@ -683,7 +697,8 @@ class DividendCalculator:
                             if unit_price is None:
                                 unit_price = info["price"] if info else None
                             kwh_a = round(amount / float(unit_price), 2) if unit_price else 0.0
-                            pay_kwh_a = round(kwh_a * scale_a, 2)
+                            # ★V5：付款电量 = 该品牌自己的倒推电量（不乘损耗系数）
+                            pay_kwh_a = kwh_a
                             total_kwh += pay_kwh_a
                             details.append({
                                 "meter_id": m["id"],
@@ -803,6 +818,42 @@ class DividendCalculator:
         """
         if not landlord_id:
             return {}, 0
+        # ★V5：该月有【柜数快照】时优先读快照（已按"加柜本月生效/减柜下月生效"算好，
+        #   含共用表人工录入柜数、排除无品牌柜子）—— 历史月份的柜数不再随当前 cabinets 漂移。
+        #   快照缺 None 组（完全没录柜数的共用表兜底），include_shared 时再补。
+        if period:
+            try:
+                from .cabinet_snapshot import snapshot_cabinet_totals as _snap
+                snap = _snap(str(period).replace("-", ""))
+                if snap and landlord_id in snap:
+                    brand_cabs = dict(snap[landlord_id])
+                    total = int(sum(brand_cabs.values()))
+                    # 兜底组：完全没录过柜数的共用表（brand_id=None），快照不含 → 实时补
+                    if include_shared:
+                        usage = shared_allocation_repo.cabinet_usage_by_meter(
+                            landlord_id=landlord_id, period=period)
+                        conn = get_connection()
+                        cur = get_dict_cursor(conn)
+                        try:
+                            cur.execute("""
+                                SELECT m.meter_no,
+                                       GREATEST(1, (SELECT COUNT(*) FROM cabinets cab WHERE cab.meter_id = m.id)) AS cabs
+                                FROM meters m
+                                WHERE m.landlord_id = %s AND m.meter_no NOT LIKE 'TEST%%'
+                                  AND m.brand_id IS NULL AND m.is_shared = TRUE
+                            """, (landlord_id,))
+                            for r in cur.fetchall():
+                                if r["meter_no"] in usage:
+                                    continue
+                                n = int(r["cabs"] or 0)
+                                total += n
+                                brand_cabs[None] = brand_cabs.get(None, 0) + n
+                        finally:
+                            cur.close()
+                            conn.close()
+                    return brand_cabs, total
+            except Exception:
+                pass  # 快照读取失败 → 回退实时口径（下方）
         conn = get_connection()
         cur = get_dict_cursor(conn)
         try:
@@ -838,7 +889,7 @@ class DividendCalculator:
                            GREATEST(1, (SELECT COUNT(*) FROM cabinets cab WHERE cab.meter_id = m.id)) AS cabs
                     FROM meters m
                     WHERE m.landlord_id = %s AND m.meter_no NOT LIKE 'TEST%%'
-                      AND m.brand_id IS NULL AND m.tag = '共享电表'
+                      AND m.brand_id IS NULL AND m.is_shared = TRUE
                 """, (landlord_id,))
                 for r in cur.fetchall():
                     if r["meter_no"] in usage:
@@ -891,7 +942,7 @@ class DividendCalculator:
                            GREATEST(1, (SELECT COUNT(*) FROM cabinets cab WHERE cab.meter_id = m.id)) AS cabs
                     FROM meters m
                     WHERE m.landlord_id = %s AND m.meter_no NOT LIKE 'TEST%%'
-                      AND m.brand_id IS NULL AND m.tag = '共享电表'
+                      AND m.brand_id IS NULL AND m.is_shared = TRUE
                 """, (landlord_id,))
                 for r in cur.fetchall():
                     if r["meter_no"] in usage:
@@ -941,7 +992,7 @@ class DividendCalculator:
                            GREATEST(1, (SELECT COUNT(*) FROM cabinets cab WHERE cab.meter_id = m.id)) AS cabs
                     FROM meters m
                     WHERE m.landlord_id = %s AND m.meter_no NOT LIKE 'TEST%%'
-                      AND m.brand_id IS NULL AND m.tag = '共享电表'
+                      AND m.brand_id IS NULL AND m.is_shared = TRUE
                 """, (landlord_id,))
                 for r in cur.fetchall():
                     if r["meter_no"] in usage:
@@ -1020,8 +1071,10 @@ class DividendCalculator:
         if period:
             configs = self._filter_configs_by_period(configs, period)
         total_income = income["totalIncome"]
+        # ★ 与主利润（totalCost）同口径：收入端已是不含税净额（split_tax 取 net），
+        #   税费只作展示、不参与成本；这里再扣一次 elecTax/rentTax 会让「利润分红」基数被重复扣税。
         base_cost = (cost["elecCost"] + cost["rentCost"] + cost["opExpense"]
-                     + cost["elecTax"] + cost["rentTax"] + cost["rentRefund"])
+                     + cost["rentRefund"])
         base_profit = round(total_income - base_cost, 2)
 
         results = []
@@ -1043,10 +1096,12 @@ class DividendCalculator:
                 # 绑定了品牌但该品牌当月无在期合同/电表 → 本期不参与（基数 0）
                 base_income = 0.0
                 base_profit_brand = 0.0
-            elif entity:
-                # v3.2 主体基数：该主体在该场地的收入/利润（跨品牌归集场景）
-                base_income = entity["income"]
-                base_profit_brand = entity["profit"]
+            elif entity_id:
+                # v3.2 主体基数：该主体在该场地的收入/利润（跨品牌归集场景）。
+                # ★ 该主体当月无数据时同样【基数 0】，绝不回退成「整场地」——
+                #   否则一个失效/填错的主体配置会白拿整个场地当月分红。
+                base_income = float(entity["income"]) if entity else 0.0
+                base_profit_brand = float(entity["profit"]) if entity else 0.0
             else:
                 base_income = total_income
                 base_profit_brand = base_profit
@@ -1121,9 +1176,10 @@ class DividendCalculator:
             elif brand_id:
                 base_income_total = 0.0
                 base_profit_total = 0.0
-            elif entity:
-                base_income_total = entity["income"]
-                base_profit_total = entity["profit"]
+            elif entity_id:
+                # ★ 与商务分红同一处理：绑了主体就只认该主体，取不到数据即 0，不回退整场地
+                base_income_total = float(entity["income"]) if entity else 0.0
+                base_profit_total = float(entity["profit"]) if entity else 0.0
             else:
                 base_income_total = total_income
                 base_profit_total = profit

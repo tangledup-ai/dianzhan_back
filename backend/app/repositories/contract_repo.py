@@ -58,9 +58,9 @@ def list_contracts(brand_id: int = None, landlord_id: int = None, station_id: in
                       -- 全品牌收入合同（无品牌）：匹配该场地的共享电表；
                       -- 该共享表已按品牌录入分摊柜数时不再按整表计（柜数由分摊行提供，见下方归集）
                       OR (c.contract_type = '品牌方合同' AND c.brand_id IS NULL
-                          AND m.brand_id IS NULL AND m.tag = '共享电表'
+                          AND m.brand_id IS NULL AND m.is_shared = TRUE
                           AND NOT EXISTS (SELECT 1 FROM meter_shared_allocations sa
-                                          WHERE sa.address = m.meter_no
+                                          WHERE sa.meter_id = m.id
                                             AND sa.cabinet_count IS NOT NULL))
                     )
                 ) t
@@ -75,9 +75,9 @@ def list_contracts(brand_id: int = None, landlord_id: int = None, station_id: in
                   FROM meters m
                   WHERE m.landlord_id = c.landlord_id
                     AND (m.brand_id IS NOT NULL
-                         OR (m.tag = '共享电表'
+                         OR (m.is_shared = TRUE
                              AND NOT EXISTS (SELECT 1 FROM meter_shared_allocations sa
-                                             WHERE sa.address = m.meter_no
+                                             WHERE sa.meter_id = m.id
                                                AND sa.cabinet_count IS NOT NULL)))
                     AND m.meter_no NOT LIKE 'TEST%%'
                 ) t
@@ -99,9 +99,9 @@ def list_contracts(brand_id: int = None, landlord_id: int = None, station_id: in
                           AND v.brand_id IS NOT NULL
                       )
                       OR (
-                        m.brand_id IS NULL AND m.tag = '共享电表'
+                        m.brand_id IS NULL AND m.is_shared = TRUE
                         AND NOT EXISTS (SELECT 1 FROM meter_shared_allocations sa
-                                        WHERE sa.address = m.meter_no
+                                        WHERE sa.meter_id = m.id
                                           AND sa.cabinet_count IS NOT NULL)
                         AND EXISTS (
                           SELECT 1 FROM contracts v2
@@ -422,8 +422,15 @@ def update_contract(contract_id: int, data: dict, operator: str = None):
         conn.commit()
         # 修复 #7：合同月租/付款方式/起止日期变更后，重建收付款分期（generate_schedules 会按 seq 保留已付状态）；
         # 自动拆期开关关闭时跳过重建，用户手动添加/调整的分期保持原样；
-        # 自定义周期的分期完全手动定义，永不自动重建
-        if updated.get("auto_split") and updated.get("pay_method") != "自定义周期":
+        # 自定义周期的分期完全手动定义，永不自动重建。
+        # ★补强（2026-09-28）：只在【影响分期的字段真的变了】或【该合同还没有任何分期】时才重建 ——
+        #   否则改个备注/名称也会把分期整体重算（金额按公式重算，覆盖手调过的金额）。
+        split_fields = ("pay_method", "monthly_rent", "start_date", "end_date", "early_end_date", "first_month_rent")
+        split_changed = any(str(before.get(k)) != str(updated.get(k)) for k in split_fields)
+        _tbl = "rent_payment_schedule" if updated.get("contract_type", "场地合同") == "场地合同" else "rent_income_schedule"
+        cur.execute(f"SELECT 1 FROM {_tbl} WHERE contract_id = %s LIMIT 1", (contract_id,))
+        _has_rows = cur.fetchone() is not None
+        if updated.get("auto_split") and updated.get("pay_method") != "自定义周期" and (split_changed or not _has_rows):
             try:
                 from .contract_schedule_repo import generate_schedules
                 generate_schedules(

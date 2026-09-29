@@ -40,7 +40,7 @@ async def get_landlord_locations():
         # 状态派生：有正常电表 → 运营中；有电表 → 筹建中；否则已关停
         for r in rows:
             cur.execute("""
-                SELECT COUNT(*) FILTER (WHERE status = '正常') as active, COUNT(*) as total
+                SELECT COUNT(*) FILTER (WHERE status = 'active') as active, COUNT(*) as total
                 FROM meters WHERE landlord_id = %s AND meter_no NOT LIKE 'TEST%%'
             """, (r["id"],))
             m = cur.fetchone()
@@ -67,7 +67,7 @@ async def get_landlord_meter_view(landlord_id: int, period: str = None, request:
         today = date.today()
         period = today.strftime("%Y-%m")
 
-    # period 统一为 6 位 YYYYMM（electricity_records / meter_monthly 均用 6 位）
+    # period 统一为 6 位 YYYYMM（electricity_records / meter_readings 均用 6 位）
     from ..infra.period import to_compact
     elec_period = to_compact(period)
 
@@ -138,7 +138,7 @@ async def get_landlord_meter_view(landlord_id: int, period: str = None, request:
 
             cur.execute(f"""
                 SELECT address, month_period, kwh, actual_kwh
-                FROM meter_monthly
+                FROM meter_readings
                 WHERE address IN ({placeholders})
                 ORDER BY month_period DESC
                 LIMIT 30

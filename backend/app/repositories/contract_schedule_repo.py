@@ -148,9 +148,10 @@ def generate_schedules(contract_id: int, contract_type: str, pay_method: str,
             if period_amount is None and old.get("amount") is not None:
                 period_amount = old["amount"]
             cur.execute(f"""
-                INSERT INTO {table} (contract_id, seq, period_start, period_end, amount, status, pay_date, invoice, remark)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO {table} (contract_id, seq, period, period_start, period_end, amount, status, pay_date, invoice, remark, data_source)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'auto')
                 ON CONFLICT (contract_id, seq) DO UPDATE SET
+                    period = EXCLUDED.period,
                     period_start = EXCLUDED.period_start,
                     period_end = EXCLUDED.period_end,
                     amount = EXCLUDED.amount,
@@ -159,7 +160,7 @@ def generate_schedules(contract_id: int, contract_type: str, pay_method: str,
                     invoice = EXCLUDED.invoice,
                     remark = EXCLUDED.remark
             """, (
-                contract_id, i, ps, pe, period_amount,
+                contract_id, i, ps.strftime("%Y%m"), ps, pe, period_amount,
                 old.get("status") or ("未付款" if table == "rent_payment_schedule" else "未到账"),
                 old.get("pay_date"), old.get("invoice"), old.get("remark"),
             ))
@@ -233,11 +234,12 @@ def create_schedule(contract_id: int, side: str, data: dict):
         next_seq = cur.fetchone()["next_seq"]
 
         cur.execute(f"""
-            INSERT INTO {table} (contract_id, seq, period_start, period_end, amount, status, pay_date, invoice, remark)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO {table} (contract_id, seq, period, period_start, period_end, amount, status, pay_date, invoice, remark, data_source)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'manual')
             RETURNING *
         """, (
             contract_id, next_seq,
+            (data.get("period") or (str(data.get("periodStart"))[:7].replace("-", "") or None)),
             data.get("periodStart"), data.get("periodEnd"),
             data.get("amount"), data.get("status") or default_status,
             data.get("payDate"), data.get("invoice"), data.get("remark")

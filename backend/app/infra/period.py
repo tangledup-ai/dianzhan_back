@@ -1,4 +1,4 @@
-"""period 统一格式化：全系统用 6 位 YYYYMM（与 meter_monthly.month_period 一致）"""
+"""period 统一格式化：全系统用 6 位 YYYYMM（与 meter_readings.month_period 一致）"""
 
 
 def to_compact(period: str) -> str:

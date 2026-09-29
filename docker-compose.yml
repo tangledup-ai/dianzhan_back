@@ -7,8 +7,13 @@ services:
     ports:
       - "3001:3001"
     environment:
-      # v2 真实库：huandian_v2（39 表，与 database_init.sql 一致）——勿连 dianzhan-test（另一个项目的旧库）
-      - DATABASE_URL=postgresql://quant:quant-speed123@host.docker.internal:5432/huandian_v2
+      # ★V5 适配（切片1）：切到 huandian_v5（45 表 + 4 视图，见 database_init_v5.sql）
+      # 回滚：把库名改回 huandian_v2 即可（旧库一字未动）
+      - DATABASE_URL=postgresql://quant:quant-speed123@host.docker.internal:5432/huandian_v5
+      # ★V5：建库脚本改用 v5（否则启动时会把 v2 的 meter_monthly 等表建回新库）
+      - DB_SCHEMA_FILE=database_init_v5.sql
+      # 让 print() 立即输出，便于看启动/台账生成的日志
+      - PYTHONUNBUFFERED=1
       - PORT=3001
       - TQ_API_URL=https://api1.tqdianbiao.com
       - TQ_AUTH_CODE=5ec0b6bf6f59984d97ec54f775a3c780

@@ -40,6 +40,30 @@ def log_sync(sync_type: str, status: str, records: int = 0, error: str = None):
         logger.error(f"记录同步日志失败: {e}")
 
 
+# ★V5：月度读数的唯一键是 (meter_id, period)，写库前必须把「平台设备地址」解析成本库电表 id。
+# 解析顺序：device_address（设备真身，不随人工改编号变化）→ meter_no（兼容历史数据）。
+# 查不到 ⇒ 返回 None，由调用方【跳过并计数告警】，不能静默丢（迁移时已因此丢了 32 行真实读数）。
+def resolve_meter_id(cur, address: str, cache: dict = None):
+    if not address:
+        return None
+    if cache is not None and address in cache:
+        return cache[address]
+    cur.execute(
+        """
+        SELECT id FROM meters
+        WHERE device_address = %s OR meter_no = %s
+        ORDER BY (device_address = %s) DESC NULLS LAST, id
+        LIMIT 1
+        """,
+        (address, address, address),
+    )
+    row = cur.fetchone()
+    mid = (row[0] if isinstance(row, (list, tuple)) else (row.get("id") if row else None)) if row else None
+    if cache is not None:
+        cache[address] = mid
+    return mid
+
+
 def parse_kwh_data(item: dict) -> dict:
     """解析能耗数据，处理多费率格式
 
@@ -401,6 +425,8 @@ async def sync_monthly_data():
         conn = get_connection()
         cur = conn.cursor()
         synced = 0
+        skipped = 0          # ★V5：平台有数据但本库没有对应电表档案（不能静默丢）
+        _mid_cache = {}      # ★V5：address → meter_id 缓存
         try:
             if cfg["id"]:
                 cur.execute("SELECT device_id, address FROM meter_devices WHERE config_id = %s", (cfg["id"],))
@@ -423,18 +449,29 @@ async def sync_monthly_data():
                         parsed = parse_kwh_data(item)
                         prev_reading, prev_reading_date, curr_reading, curr_reading_date = parse_reading_fields(item)
                         month_period = period_key.replace("-", "")  # 统一 6 位 YYYYMM
+                        # ★V5：先解析本库电表 id —— 唯一键已改为 (meter_id, period)
+                        meter_id = resolve_meter_id(cur, address, _mid_cache)
+                        if meter_id is None:
+                            skipped += 1
+                            continue
                         cur.execute("""
-                            INSERT INTO meter_monthly (device_id, address, month_period, kwh, raw_data, synced_at,
-                                prev_reading, prev_reading_date, curr_reading, curr_reading_date)
-                            VALUES (%s, %s, %s, %s, %s::jsonb, NOW(), %s, %s, %s, %s)
-                            ON CONFLICT (address, month_period) DO UPDATE SET
+                            INSERT INTO meter_readings
+                                (meter_id, period, device_address, device_id, address, month_period,
+                                 kwh, raw_data, synced_at,
+                                 prev_reading, prev_reading_date, curr_reading, curr_reading_date,
+                                 transformer_ratio_snapshot)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, NOW(), %s, %s, %s, %s,
+                                    (SELECT transformer_ratio FROM meters WHERE id = %s))
+                            ON CONFLICT (meter_id, period) DO UPDATE SET
                                 device_id = EXCLUDED.device_id,
+                                device_address = EXCLUDED.device_address,
+                                address = EXCLUDED.address, month_period = EXCLUDED.month_period,
                                 kwh = EXCLUDED.kwh, raw_data = EXCLUDED.raw_data, synced_at = NOW(),
                                 prev_reading = EXCLUDED.prev_reading, prev_reading_date = EXCLUDED.prev_reading_date,
                                 curr_reading = EXCLUDED.curr_reading, curr_reading_date = EXCLUDED.curr_reading_date
-                        """, (device_id, address, month_period,
+                        """, (meter_id, month_period, address, device_id, address, month_period,
                               parsed["total"], json.dumps(item, ensure_ascii=False),
-                              prev_reading, prev_reading_date, curr_reading, curr_reading_date))
+                              prev_reading, prev_reading_date, curr_reading, curr_reading_date, meter_id))
                         synced += 1
             elif isinstance(data, list):
                 for p in data:
@@ -448,22 +485,36 @@ async def sync_monthly_data():
                         cur.execute("SELECT device_id FROM meter_devices WHERE address = %s LIMIT 1", (address,))
                         dev_row = cur.fetchone()
                         dev_id = dev_row[0] if dev_row else address
+                        # ★V5：先解析本库电表 id —— 唯一键已改为 (meter_id, period)
+                        meter_id = resolve_meter_id(cur, address, _mid_cache)
+                        if meter_id is None:
+                            skipped += 1
+                            continue
                         cur.execute("""
-                            INSERT INTO meter_monthly (device_id, address, month_period, kwh, raw_data, synced_at,
-                                prev_reading, prev_reading_date, curr_reading, curr_reading_date)
-                            VALUES (%s, %s, %s, %s, %s::jsonb, NOW(), %s, %s, %s, %s)
-                            ON CONFLICT (address, month_period) DO UPDATE SET
+                            INSERT INTO meter_readings
+                                (meter_id, period, device_address, device_id, address, month_period,
+                                 kwh, raw_data, synced_at,
+                                 prev_reading, prev_reading_date, curr_reading, curr_reading_date,
+                                 transformer_ratio_snapshot)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, NOW(), %s, %s, %s, %s,
+                                    (SELECT transformer_ratio FROM meters WHERE id = %s))
+                            ON CONFLICT (meter_id, period) DO UPDATE SET
                                 device_id = EXCLUDED.device_id,
+                                device_address = EXCLUDED.device_address,
+                                address = EXCLUDED.address, month_period = EXCLUDED.month_period,
                                 kwh = EXCLUDED.kwh, raw_data = EXCLUDED.raw_data, synced_at = NOW(),
                                 prev_reading = EXCLUDED.prev_reading, prev_reading_date = EXCLUDED.prev_reading_date,
                                 curr_reading = EXCLUDED.curr_reading, curr_reading_date = EXCLUDED.curr_reading_date
-                        """, (dev_id, address, month_period,
+                        """, (meter_id, month_period, address, dev_id, address, month_period,
                               m.get("kwh"), json.dumps(m, ensure_ascii=False),
-                              prev_reading, prev_reading_date, curr_reading, curr_reading_date))
+                              prev_reading, prev_reading_date, curr_reading, curr_reading_date, meter_id))
                         synced += 1
 
             conn.commit()
-            logger.info(f"✅ 账户[{cfg.get('name')}] 月用电量同步完成: {synced} 条")
+            logger.info(
+                f"✅ 账户[{cfg.get('name')}] 月用电量同步完成: {synced} 条"
+                + (f"；⚠️ {skipped} 条因本库无对应电表档案被跳过（需先建档）" if skipped else "")
+            )
             total += synced
         finally:
             cur.close()

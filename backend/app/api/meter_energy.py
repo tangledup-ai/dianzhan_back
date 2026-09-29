@@ -136,8 +136,20 @@ async def get_monthly_kwh(
         if request is not None:
             _scope_conditions(conditions, values, request, "m")
         if meterNo:
-            conditions.append("mm.address = %s")
-            values.append(meterNo)
+            # ★V5：把「电表号 / 设备地址」先解析成电表 id 再过滤 —— 读数表已不再按字符串关联，
+            #       这样人工改电表编号后历史读数依然查得到（旧库已因此失联 14 块表）。
+            cur.execute(
+                """
+                SELECT id FROM meters
+                WHERE meter_no = %s OR device_address = %s
+                ORDER BY (meter_no = %s) DESC NULLS LAST, id
+                LIMIT 1
+                """,
+                (meterNo, meterNo, meterNo),
+            )
+            _m = cur.fetchone()
+            conditions.append("mm.meter_id = %s")
+            values.append(_m["id"] if _m else -1)   # 解析不到 ⇒ -1（返回空列表，不报错）
         if startMonth:
             conditions.append("mm.month_period >= %s")
             values.append(startMonth)
@@ -148,8 +160,8 @@ async def get_monthly_kwh(
 
         cur.execute(f"""
             SELECT mm.*, m.meter_name, m.landlord_id, l.name as station_name, m.transformer_ratio
-            FROM meter_monthly mm
-            LEFT JOIN meters m ON m.meter_no = mm.address
+            FROM meter_readings mm
+            LEFT JOIN meters m ON m.id = mm.meter_id
             LEFT JOIN landlords l ON m.landlord_id = l.id
             {where}
             ORDER BY mm.month_period DESC, mm.address
@@ -159,7 +171,8 @@ async def get_monthly_kwh(
         # raw_kwh 保留原始表码度数，供「读数编辑表单」回填，避免读→编辑→写回导致二次相乘
         for r in rows:
             if r.get("kwh") is not None or r.get("actual_kwh") is not None:
-                ratio = float(r.get("transformer_ratio") or 1)
+                # ★V5：倍数优先取**读数行上的快照**（换互感器倍数不影响历史月份）
+                ratio = float(r.get("transformer_ratio_snapshot") or r.get("transformer_ratio") or 1)
                 r["raw_kwh"] = float(r["kwh"]) if r.get("kwh") is not None else None
                 if r.get("actual_kwh") is not None:
                     r["kwh"] = round(float(r["actual_kwh"]), 2)
@@ -202,6 +215,28 @@ async def save_meter_reading(data: dict, request: Request = None):
             raise HTTPException(403, "电表不存在，无法录入读数")
         ensure_meter_in_scope(request, meter.get("tag"), meter.get("landlord_id"))
 
+    # ★V5：读数唯一键已改为 (meter_id, period)，写库前必须解析出本库电表 id。
+    # 解析顺序：业务编号 meter_no（前端目前传的是它）→ 设备地址 device_address（改名后仍能对上）。
+    conn = get_connection()
+    cur = get_dict_cursor(conn)
+    try:
+        cur.execute(
+            """
+            SELECT id FROM meters
+            WHERE meter_no = %s OR device_address = %s
+            ORDER BY (meter_no = %s) DESC NULLS LAST, id
+            LIMIT 1
+            """,
+            (address, address, address),
+        )
+        mid_row = cur.fetchone()
+    finally:
+        cur.close()
+        conn.close()
+    if not mid_row:
+        raise HTTPException(404, f"电表档案不存在，无法录入读数：{address}")
+    meter_id = mid_row["id"]
+
     # 如果提供了起始度数和抄表度数，自动计算区间度数
     if kwh is None and prev_reading is not None and curr_reading is not None:
         kwh = float(curr_reading) - float(prev_reading)
@@ -222,10 +257,14 @@ async def save_meter_reading(data: dict, request: Request = None):
     cur = conn.cursor()
     try:
         cur.execute("""
-            INSERT INTO meter_monthly (address, month_period, kwh, actual_kwh, prev_actual_reading, curr_actual_reading,
-                prev_reading_date, prev_reading, curr_reading_date, curr_reading, synced_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
-            ON CONFLICT (address, month_period)
+            INSERT INTO meter_readings
+                (meter_id, period, address, month_period,
+                 kwh, actual_kwh, prev_actual_reading, curr_actual_reading,
+                 prev_reading_date, prev_reading, curr_reading_date, curr_reading,
+                 synced_at, data_source, transformer_ratio_snapshot)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), 'manual',
+                    (SELECT transformer_ratio FROM meters WHERE id = %s))
+            ON CONFLICT (meter_id, period)
             DO UPDATE SET
                 kwh = EXCLUDED.kwh,
                 actual_kwh = EXCLUDED.actual_kwh,
@@ -236,8 +275,9 @@ async def save_meter_reading(data: dict, request: Request = None):
                 curr_reading_date = EXCLUDED.curr_reading_date,
                 curr_reading = EXCLUDED.curr_reading,
                 synced_at = NOW()
-        """, (address, month_period, kwh, actual_kwh, prev_actual_reading, curr_actual_reading,
-              prev_reading_date, prev_reading, curr_reading_date, curr_reading))
+        """, (meter_id, month_period, address, month_period,
+              kwh, actual_kwh, prev_actual_reading, curr_actual_reading,
+              prev_reading_date, prev_reading, curr_reading_date, curr_reading, meter_id))
         conn.commit()
         return {
             "ok": True,
@@ -288,12 +328,15 @@ async def get_shared_allocations(request: Request = None, meterNo: str = None, m
     try:
         cur.execute("""
             SELECT m.id, m.meter_no, m.meter_name, m.brand_id, m.landlord_id, m.entity_id,
-                   m.tag, m.transformer_ratio, l.name AS landlord_name, b.name AS brand_name
+                   m.tag, m.category_code, m.is_shared, m.transformer_ratio, m.device_address,
+                   l.name AS landlord_name, b.name AS brand_name
             FROM meters m
             LEFT JOIN landlords l ON m.landlord_id = l.id
             LEFT JOIN brands b ON m.brand_id = b.id
-            WHERE m.meter_no = %s
-        """, (meterNo,))
+            WHERE m.meter_no = %s OR m.device_address = %s
+            ORDER BY (m.meter_no = %s) DESC NULLS LAST, m.id
+            LIMIT 1
+        """, (meterNo, meterNo, meterNo))
         meter = cur.fetchone()
         if not meter:
             raise HTTPException(404, "电表不存在")
@@ -334,19 +377,24 @@ async def get_shared_allocations(request: Request = None, meterNo: str = None, m
         fallback = pricing["brand_price_options"].get(int(r["brand_id"]), [])
         fallback = fallback[0] if fallback else None
         price, tax_rate, tax_enabled = _price_info(r.get("unit_price"), fallback)
-        amount = float(r["collect_amount"] or 0)
-        _, net = split_tax(amount, tax_rate) if tax_enabled else (0, amount)
+        # ★应收电费可为 NULL（该品牌本月未计电费、只录了柜数/主体）→ 回填为空，不能显示成 0
+        amount = float(r["collect_amount"]) if r.get("collect_amount") is not None else None
+        if amount is None:
+            net, kwh = None, None
+        else:
+            _, net = split_tax(amount, tax_rate) if tax_enabled else (0, amount)
+            kwh = _shared_kwh(amount, price)
         entity_id = r.get("entity_id")
         allocations.append({
             "brandId": r["brand_id"],
             "brandName": r.get("brand_name") or brand_names.get(r["brand_id"], ""),
-            "collectAmount": round(amount, 2),
+            "collectAmount": round(amount, 2) if amount is not None else None,
             "unitPrice": float(r["unit_price"]) if r.get("unit_price") is not None else None,
             "effectiveUnitPrice": float(price) if price is not None else None,
             "taxRate": tax_rate,
             "taxEnabled": tax_enabled,
-            "kwh": _shared_kwh(amount, price),
-            "collectNet": round(net, 2),
+            "kwh": kwh,
+            "collectNet": round(net, 2) if net is not None else None,
             "cabinetCount": int(r["cabinet_count"]) if r.get("cabinet_count") is not None else None,
             "entityId": int(entity_id) if entity_id is not None else None,
             "entityName": r.get("entity_name"),
@@ -356,11 +404,33 @@ async def get_shared_allocations(request: Request = None, meterNo: str = None, m
     # 电柜数量默认值：该品牌最近一次填写值（逐月可调整；本月留空则沿用）
     cabinet_defaults = shared_allocation_repo.latest_cabinet_counts(meterNo, before_period=month_period or None)
 
+    # ★V5：品牌绑定清单（该月这块共享表**应当**由哪几个品牌共享）+ 漏录检查
+    #   绑定是「动态月度、默认继承上月」的：start_period<=本月 且 (end 为空 or end>=本月)
+    bindings = []
+    missing_brands = []
+    if month_period and meter.get("is_shared"):
+        bound = shared_allocation_repo.bound_brands(meter["id"], month_period)
+        saved_ids = {int(r["brand_id"]) for r in saved}
+        for b in bound:
+            bid = int(b["brand_id"])
+            bname = b.get("brand_name") or brand_names.get(bid, f"品牌{bid}")
+            bindings.append({
+                "brandId": bid,
+                "brandName": bname,
+                "startPeriod": b.get("start_period"),
+                "endPeriod": b.get("end_period"),
+                "hasAllocation": bid in saved_ids,
+            })
+            # 已绑定但本月没录分摊 ⇒ 告警（不自动补，交由财务核对）
+            if bid not in saved_ids:
+                missing_brands.append({"brandId": bid, "brandName": bname})
+
     return {
         "monthPeriod": month_period,
         "displayPeriod": to_display(month_period) if month_period else "",
         "meter": meter,
-        "isShared": (meter.get("tag") == "共享电表") and (meter.get("brand_id") is None),
+        # ★V5：是否共用**读表级 is_shared 列**，不再由「大类=共享电表」推导（那是滇池写错的根源）
+        "isShared": bool(meter.get("is_shared")),
         "payPrice": pricing.get("pay_price"),
         "sharedPrice": (pricing.get("shared_price") or {}).get("price"),
         "brands": candidates,
@@ -369,6 +439,10 @@ async def get_shared_allocations(request: Request = None, meterNo: str = None, m
         # 默认报税主体 = 整场地口径：该共享电表自身的主体（未指定主体时展示为「未指定」）
         "defaultEntityId": meter.get("entity_id"),
         "allocations": allocations,
+        # ★V5：这块共享表的「品牌绑定清单」——该月**应当**由哪些品牌共享（动态月度、继承上月）
+        "bindings": bindings,
+        # 已绑定但**本月还没录分摊**的品牌（漏录 ⇒ 页面告警，不自动补）
+        "missingBrands": missing_brands,
         "periods": shared_allocation_repo.list_periods_for_meter(meterNo),
         # {"<brandId>": {"count": 12, "monthPeriod": "202608"}}
         "cabinetDefaults": {str(bid): info for bid, info in cabinet_defaults.items()},
@@ -418,15 +492,19 @@ async def save_shared_allocations(data: dict, request: Request = None):
             raise HTTPException(400, f"品牌方重复：{brand_id}（同一电表同一月一个品牌只能一行）")
         seen.add(brand_id)
 
+        # ★应收电费：留空 = 本月该品牌不计电费（存 NULL）。
+        #   ⚠️ 不能因为「金额为空」就把整行丢掉 —— 共享表的**柜数**独立于电费：
+        #   财务常只录柜数（该品牌本月没有应收电费），旧逻辑会把它静默丢弃，
+        #   导致合同页「计费柜数」永远是 0（本次修复的 bug）。
         amount_raw = r.get("collectAmount")
-        if amount_raw is None or str(amount_raw).strip() == "":
-            continue  # 金额留空 = 该行不保存
-        try:
-            amount = round(float(amount_raw), 2)
-        except (TypeError, ValueError):
-            raise HTTPException(400, f"应收电费格式无效：{amount_raw}")
-        if amount < 0:
-            raise HTTPException(400, "应收电费不能为负数")
+        amount = None
+        if amount_raw is not None and str(amount_raw).strip() not in ("", "null", "None"):
+            try:
+                amount = round(float(amount_raw), 2)
+            except (TypeError, ValueError):
+                raise HTTPException(400, f"应收电费格式无效：{amount_raw}")
+            if amount < 0:
+                raise HTTPException(400, "应收电费不能为负数")
 
         unit_price = r.get("unitPrice")
         if unit_price is not None and str(unit_price).strip() != "":
@@ -461,6 +539,10 @@ async def save_shared_allocations(data: dict, request: Request = None):
         else:
             entity_id = None
 
+        # 应收电费 / 柜数 / 报税主体 三项全空 = 空行，不保存
+        if amount is None and cabinet_count is None and entity_id is None:
+            continue
+
         rows.append({
             "brandId": brand_id,
             "entityId": entity_id,
@@ -474,7 +556,16 @@ async def save_shared_allocations(data: dict, request: Request = None):
     conn = get_connection()
     cur = get_dict_cursor(conn)
     try:
-        cur.execute("SELECT id, tag, landlord_id, brand_id FROM meters WHERE meter_no = %s", (address,))
+        cur.execute(
+            """
+            SELECT id, tag, category_code, is_shared, landlord_id, brand_id
+            FROM meters
+            WHERE meter_no = %s OR device_address = %s
+            ORDER BY (meter_no = %s) DESC NULLS LAST, id
+            LIMIT 1
+            """,
+            (address, address, address),
+        )
         meter = cur.fetchone()
     finally:
         cur.close()
@@ -486,8 +577,9 @@ async def save_shared_allocations(data: dict, request: Request = None):
     # 台账按「场地 × 品牌 × 主体」生成，电表没有场地方则分摊无法落到台账上
     if not meter.get("landlord_id"):
         raise HTTPException(400, "该电表未关联场地方，无法生成电费台账；请先在电表档案里设置场地方")
-    # 只有「所有品牌共用此电表」（标签=共享电表 且 未指定品牌方）才谈得上按品牌分摊
-    if (meter.get("tag") or "") != "共享电表" or meter.get("brand_id") is not None:
+    # 只有「所有品牌共用此电表」（表级 is_shared=TRUE）才谈得上按品牌分摊
+    # ★V5：判定读 is_shared 列，与「电表大类」彻底解耦
+    if not meter.get("is_shared"):
         raise HTTPException(400, "只有「所有品牌共用此电表」的电表才能按品牌录入分摊（请在电表档案里打开该开关）")
 
     try:
@@ -508,7 +600,8 @@ async def save_shared_allocations(data: dict, request: Request = None):
         "address": address,
         "monthPeriod": month_period,
         "saved": saved,
-        "totalAmount": round(sum(r["collectAmount"] for r in rows), 2),
+        # 只累加有应收电费的行（可能有无金额、只录柜数的行 → None 不能直接相加）
+        "totalAmount": round(sum(float(r["collectAmount"]) for r in rows if r.get("collectAmount") is not None), 2),
         "regenerated": regenerated,
     }
 

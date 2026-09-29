@@ -242,7 +242,7 @@ def _detect_elec_yoy(cur, yoy_ratio: float, allowed=None, tag_scope=None):
     """
     # 最近一个有数据的月份 = 上月（当月可能不完整）
     cur.execute("""
-        SELECT MAX(month_period) AS latest FROM meter_monthly
+        SELECT MAX(month_period) AS latest FROM meter_readings
         WHERE kwh IS NOT NULL AND kwh > 0
     """)
     latest = (cur.fetchone() or {}).get("latest")
@@ -262,12 +262,12 @@ def _detect_elec_yoy(cur, yoy_ratio: float, allowed=None, tag_scope=None):
             prv.kwh AS prev_kwh,
             CASE WHEN prv.kwh IS NULL OR prv.kwh = 0 THEN NULL
                  ELSE ROUND((cur.kwh::numeric / prv.kwh)::numeric, 2) END AS ratio
-        FROM meter_monthly cur
-        JOIN meters m ON m.meter_no = cur.address
+        FROM meter_readings cur
+        JOIN meters m ON m.id = cur.meter_id
         LEFT JOIN landlords l ON m.landlord_id = l.id
         LEFT JOIN brands b ON m.brand_id = b.id
-        LEFT JOIN meter_monthly prv
-               ON prv.address = cur.address AND prv.month_period = %s
+        LEFT JOIN meter_readings prv
+               ON prv.meter_id = cur.meter_id AND prv.month_period = %s
         WHERE cur.month_period = %s
           AND m.landlord_id IS NOT NULL AND m.brand_id IS NOT NULL
           AND m.meter_no NOT LIKE 'TEST%%'

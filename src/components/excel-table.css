@@ -1,0 +1,395 @@
+/* ============================================================
+   Excel 风表格样式
+   ------------------------------------------------------------
+   ★ 只给三个页面用：智慧电表 / 场租台账 / 电费台账
+     （其它页面不要引用本文件，保持原样）
+   ★ 不改 index.css 的主题变量，不污染全局
+   ★ 用法：外层容器加 .xl-wrap（或 .xl-wrap 的变体），<table> 加 .xl-table
+   ============================================================ */
+
+/* 外层容器：紧边框 + 白底 + 滚动 */
+.xl-wrap {
+  border: 1px solid #d0d0d0;
+  background: #fff;
+  overflow: auto;
+}
+/* ★ 主表专用：固定高度的「视口」——表头吸顶 + 横/纵滚动条始终停在可见区域底部
+   （否则内容超宽时，横向滚动条会被压到整张表的最底下，必须滚到页面底部才能拖） */
+.xl-wrap-scroll {
+  border: 1px solid #d0d0d0;
+  background: #fff;
+  overflow: auto;
+  max-height: calc(100vh - 210px);
+  scrollbar-gutter: stable;
+}
+/* Excel 风细滚动条（横向 X 轴醒目、始终可见高度提示） */
+.xl-wrap::-webkit-scrollbar,
+.xl-wrap-scroll::-webkit-scrollbar {
+  height: 10px;
+  width: 10px;
+}
+.xl-wrap::-webkit-scrollbar-track,
+.xl-wrap-scroll::-webkit-scrollbar-track {
+  background: #f1f5f9;
+  border-top: 1px solid #e2e8f0;
+}
+.xl-wrap::-webkit-scrollbar-thumb,
+.xl-wrap-scroll::-webkit-scrollbar-thumb {
+  background: #94a3b8;
+  border-radius: 0;
+  border: 2px solid #f1f5f9;
+}
+.xl-wrap::-webkit-scrollbar-thumb:hover,
+.xl-wrap-scroll::-webkit-scrollbar-thumb:hover {
+  background: #64748b;
+}
+
+/* 表格本体：紧凑网格
+   ★ width:max-content —— 按【各列声明的宽度】排布，不再被拉伸
+   （原来 width:100% + 表格 minWidth 会把多余空间按比例摊到每列，把「场地方」这类窄列撑得很宽） */
+.xl-table {
+  width: max-content;
+  min-width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: 12.5px;
+  color: #1c1c1c;
+}
+
+/* 表头：吸顶 + 灰底 + 网格线 */
+.xl-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  background: #f3f3f3;
+  border-right: 1px solid #d0d0d0;
+  border-bottom: 1px solid #9a9a9a;
+  padding: 0 8px;
+  height: 30px;
+  font-weight: 600;
+  font-size: 12.5px;
+  text-align: left;
+  white-space: nowrap;
+  color: #334155;
+}
+/* 二级表头（详情表里那种分组的） */
+.xl-table thead tr:nth-child(2) th {
+  top: 30px;
+  background: #ededed;
+}
+
+/* 数据行：固定高度 30px，网格线 */
+.xl-table tbody td {
+  border-right: 1px solid #d0d0d0;
+  border-bottom: 1px solid #d0d0d0;
+  padding: 0 8px;
+  height: 30px;
+  white-space: nowrap;
+  vertical-align: middle;
+  line-height: 1.25;
+}
+.xl-table tbody tr:hover > td {
+  background: #f7fbf8;
+}
+/* 展开中的主行 */
+.xl-table tbody tr.xl-open > td {
+  background: #eef7f1;
+}
+
+/* 合计行：吸底 */
+.xl-table tfoot td {
+  position: sticky;
+  bottom: 0;
+  z-index: 3;
+  background: #f7f7f7;
+  border-top: 2px solid #9a9a9a;
+  border-right: 1px solid #d0d0d0;
+  font-weight: 700;
+  height: 30px;
+  padding: 0 8px;
+  white-space: nowrap;
+  color: #1c1c1c;
+}
+
+/* 单元格修饰 */
+.xl-num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.xl-ctr {
+  text-align: center;
+}
+.xl-muted {
+  color: #94a3b8;
+}
+.xl-neg {
+  color: #e11d48;
+}
+/* 人工还没填、由系统推导出来的值：灰斜体 */
+.xl-derived {
+  color: #4f7a63;
+  font-style: italic;
+}
+
+/* 冻结左侧列（配合内联 style 的 left 偏移使用） */
+.xl-freeze {
+  position: sticky;
+  z-index: 4;
+  background: #fff;
+}
+.xl-table thead th.xl-freeze {
+  z-index: 6;
+  background: #f3f3f3;
+}
+.xl-table thead tr:nth-child(2) th.xl-freeze {
+  background: #ededed;
+}
+.xl-table tbody tr:hover > td.xl-freeze {
+  background: #f7fbf8;
+}
+.xl-table tbody tr.xl-open > td.xl-freeze {
+  background: #eef7f1;
+}
+.xl-table tfoot td.xl-freeze {
+  z-index: 6;
+  background: #f7f7f7;
+}
+
+/* ★ 右侧固定列（如「操作」）：横向滚动时钉在右边，不用拉到最右也能点 */
+.xl-freeze-r {
+  position: sticky;
+  right: 0;
+  z-index: 4;
+  background: #fff;
+  border-left: 1px solid #d0d0d0 !important;
+}
+.xl-table thead th.xl-freeze-r {
+  z-index: 6;
+  background: #f3f3f3;
+}
+.xl-table tbody tr:hover > td.xl-freeze-r {
+  background: #f7fbf8;
+}
+.xl-table tbody tr.xl-open > td.xl-freeze-r {
+  background: #eef7f1;
+}
+.xl-table tfoot td.xl-freeze-r {
+  z-index: 6;
+  background: #f7f7f7;
+}
+
+/* 行内编辑的输入框 */
+.xl-input {
+  width: 100%;
+  height: 28px;
+  border: none;
+  background: transparent;
+  font: inherit;
+  font-size: 12.5px;
+  padding: 0;
+  color: inherit;
+}
+.xl-input:focus {
+  outline: 2px solid #10b981;
+  outline-offset: -2px;
+  background: #fff;
+}
+.xl-input.xl-num {
+  text-align: right;
+}
+/* 已改未保存 */
+.xl-edited {
+  background: #fff3cd !important;
+}
+
+/* 展开的明细区（用于替代弹窗） */
+.xl-detail > td {
+  background: #fbfdfc;
+  border-bottom: 2px solid #9a9a9a;
+  padding: 8px 10px;
+  height: auto;
+  white-space: normal;
+}
+.xl-dtitle {
+  font-size: 12px;
+  font-weight: 700;
+  color: #047857;
+  margin-bottom: 6px;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.xl-dtitle .sub {
+  font-weight: 400;
+  color: #94a3b8;
+}
+
+/* ★ 展开区迷你表格（对齐原型 .dwrap）：行高 26px、窄列、内联输入 */
+.xl-dwrap {
+  border: 1px solid #d0d0d0;
+  background: #fff;
+  overflow: auto;
+}
+.xl-dwrap table {
+  width: auto;
+  min-width: 100%;
+  border-collapse: collapse;
+}
+.xl-dwrap th {
+  background: #f3f3f3;
+  font-size: 12px;
+  height: 26px;
+  border-right: 1px solid #d0d0d0;
+  border-bottom: 1px solid #9a9a9a;
+  text-align: center;
+  padding: 0 6px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.xl-dwrap td {
+  font-size: 12px;
+  height: 26px;
+  border-right: 1px solid #d0d0d0;
+  border-bottom: 1px solid #e5e7eb;
+  padding: 0 6px;
+  white-space: nowrap;
+}
+.xl-dwrap td.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.xl-dwrap td.ctr {
+  text-align: center;
+}
+.xl-dwrap input,
+.xl-dwrap select {
+  width: 100%;
+  height: 26px;
+  border: none;
+  background: transparent;
+  font: inherit;
+  font-size: 12px;
+  padding: 0;
+}
+.xl-dwrap input.num {
+  text-align: right;
+}
+.xl-dwrap input:focus,
+.xl-dwrap select:focus {
+  outline: 2px solid #10b981;
+  outline-offset: -2px;
+  background: #fff;
+}
+/* 自动推导值：灰绿斜体（原型 .derived） */
+.xl-derived {
+  color: #4f7a63;
+  font-style: italic;
+}
+/* 迷你表合计行 */
+.xl-dwrap tr.xl-dtotal td {
+  background: #f9fafb;
+  font-weight: 700;
+  border-bottom: none;
+}
+
+/* 紧凑汇总条（可选：替代一整排大 StatCard） */
+.xl-summary {
+  display: flex;
+  flex-wrap: wrap;
+  border: 1px solid #d0d0d0;
+  background: #fff;
+}
+.xl-summary > div {
+  padding: 6px 16px;
+  border-right: 1px solid #e5e7eb;
+  min-width: 130px;
+}
+.xl-summary > div:last-child {
+  border-right: none;
+}
+.xl-summary .lbl {
+  font-size: 11px;
+  color: #64748b;
+}
+.xl-summary .val {
+  font-size: 15px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ────────────────────────────────────────────────────────────
+   ★ 台账「行内详情」布局（场租台账行展开用）
+   结构：指标条(.xl-summary) → 分栏(.xl-cols) → 通栏小节(.xl-sec)
+   每小节用带左侧色条的标题条(.xl-sec-head)分隔：不套外框，避免框套框
+   ──────────────────────────────────────────────────────────── */
+.xl-cols {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 4px 14px;
+  min-width: 0;
+}
+@media (min-width: 1280px) {
+  .xl-cols {
+    grid-template-columns: minmax(0, 5fr) minmax(0, 6fr);
+    align-items: start;
+  }
+}
+.xl-sec {
+  min-width: 0;
+}
+.xl-sec-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 4px 8px 4px 7px;
+  margin-bottom: 6px;
+  background: linear-gradient(90deg, #f1f5f9 0%, rgba(255, 255, 255, 0) 90%);
+  border-left: 3px solid #94a3b8;
+  font-size: 12px;
+  font-weight: 600;
+  color: #334155;
+}
+.xl-sec-head .tag {
+  font-weight: 400;
+  color: #94a3b8;
+}
+.xl-sec-head.is-contract {
+  border-left-color: #0ea5e9;
+}
+.xl-sec-head.is-plan {
+  border-left-color: #6366f1;
+}
+.xl-sec-head.is-year {
+  border-left-color: #10b981;
+}
+.xl-sec-head.is-pay {
+  border-left-color: #f43f5e;
+}
+.xl-sec-head.is-income {
+  border-left-color: #10b981;
+}
+/* 细进度条（付款计划用：一行文字 + 一条细线，替代大号进度卡） */
+.xl-bar {
+  height: 5px;
+  border-radius: 999px;
+  background: #f1f5f9;
+  overflow: hidden;
+}
+.xl-bar > i {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+}
+/* 指标条：小一号，跟在行里不喧宾夺主 */
+.xl-summary.xl-summary-sm {
+  margin-bottom: 0;
+}
+.xl-summary.xl-summary-sm > div {
+  padding: 4px 12px;
+  min-width: 108px;
+}
+.xl-summary.xl-summary-sm .val {
+  font-size: 13.5px;
+}

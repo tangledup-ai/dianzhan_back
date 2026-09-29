@@ -1,17 +1,17 @@
 import { Fragment, useMemo, useState, useEffect } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { getElectricityMonthlyLedger, exportElectricityLedger, getReadingDetail, updateElectricityStatus, type ElecLedgerDim } from "@/api/electricity";
+import { getElectricityMonthlyLedger, exportElectricityLedger, getReadingDetail, updateElectricityStatus, getLandlordMonthlyElec, saveLandlordMonthlyElec } from "@/api/electricity";
 import { listLandlords } from "@/api/directory";
 import { submitStationApproval } from "@/api/approvals";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { Field, TextInput, inputCls } from "@/components/fields";
+import { Field, TextInput, SearchSelect, inputCls } from "@/components/fields";
 import { fmtMoney, fmtNum } from "@/lib/format";
 import { toCompact, toDisplay } from "@/lib/period";
-import { Building2, Tag, ChevronDown, ChevronRight, Download, Send, FileText, Landmark } from "lucide-react";
-import { groupByEntity, GROUP_COLOR_NEUTRAL } from "@/lib/groupColors";
+import { ChevronDown, ChevronRight, Download, Send, FileText, Zap } from "lucide-react";
 import * as XLSX from "xlsx";
 import { toast } from "sonner";
+import "@/components/excel-table.css";   // ★ Excel 风表格样式（仅本页/场租台账/智慧电表使用）
 
 // 电费月台账（v2 重设计）：只显示电费经营信息
 // 参考 Rent 页风格：月份区间 + 按场地方/品牌方 + 区间总览 + 按月展开明细
@@ -91,9 +91,9 @@ function ReadingDetailDialog({ target, onClose }: { target: { meterNo: string; p
       `区间度数：${rd.kwh ?? "—"} × 倍数 ${ratio} = 计费用量 ${usage.toFixed(2)} 度`,
       ...(ledgerRows.length > 1
         ? [
-            `【付场地方（整表一笔）】${fmtNum(sharedKwh)} 度 × ${fmtMoney(sharedPayPrice)} 元/度 = ` +
+            `【付场地方（整表）】${fmtNum(sharedKwh)} 度 × ${fmtMoney(sharedPayPrice)} 元/度 = ` +
             `${fmtMoney(sharedPayAmount)} 元（${sharedPayStatus}）`,
-            "【品牌分摊明细】",
+            "【品牌分摊明细】各品牌只承担自己用电量对应的成本（损耗我方承担，不摊品牌）：",
             ...ledgerRows.map((r: any) =>
               `${r.brandName || "全品牌共享"}：应收（品牌方支付）${fmtMoney(Number(r.collectAmount ?? 0))} 元` +
               `（不含税 ${fmtMoney(Number(r.collectNet ?? 0))}）`
@@ -171,13 +171,13 @@ function ReadingDetailDialog({ target, onClose }: { target: { meterNo: string; p
             </div>
             {ledgerRows.length > 1 ? (
               <div className="space-y-2">
-                {/* 共享电表：付给场地方是一整笔（整表读数 × 场地单价），不按品牌拆 */}
+                {/* 共享电表：付给场地方按整表（整表读数 × 场地单价）；各品牌只承担自己用电量那部分成本 */}
                 <div className="rounded-md border border-rose-100 bg-rose-50/50 px-3 py-2">
-                  <div className="text-[10px] text-rose-500">应付电费（付场地方 · 整表一笔）· {sharedPayStatus}</div>
+                  <div className="text-[10px] text-rose-500">应付电费（付场地方 · 整表）· {sharedPayStatus}</div>
                   <div className="font-semibold tabular-nums text-rose-600">{fmtMoney(sharedPayAmount)} 元</div>
                   <div className="text-[10px] text-slate-400">
                     = 整表 {fmtNum(sharedKwh)} 度 × {fmtMoney(sharedPayPrice)} 元/度
-                    （亏空按电量摊入各品牌，合计就是这一笔）
+                    （各品牌只承担自己用电量对应的成本；未分摊差额由我方承担，不摊品牌）
                   </div>
                 </div>
                 <div>
@@ -636,10 +636,149 @@ function buildLedgerSheet(data: any): XLSX.WorkSheet {
   return ws;
 }
 
+// ─── ★V5 场地级月度电费对账弹窗（损耗的唯一录入口）───
+// 参考电量（系统算 = Σ场地所有表）→ 财务填「最终付给场地方的电量/金额」→ 损耗 = 差额（我方承担）
+// 保存后后端自动重算该月台账（品牌行 + 损耗行）。
+function LandlordMonthlyDialog({ open, period: initialPeriod, onClose }: { open: boolean; period: string; onClose: () => void }) {
+  const queryClient = useQueryClient();
+  const [period, setPeriod] = useState(initialPeriod);
+  useEffect(() => { if (open) setPeriod(initialPeriod); }, [open, initialPeriod]);
+
+  const q = useQuery({
+    queryKey: ["landlord-monthly-elec", period],
+    queryFn: () => getLandlordMonthlyElec(period),
+    enabled: open && !!period,
+  });
+  // 行内编辑态：landlordId → { finalKwh, finalAmount }
+  const [edits, setEdits] = useState<Record<number, { kwh: string; amount: string }>>({});
+  useEffect(() => { setEdits({}); }, [period, open]);
+
+  const save = useMutation({
+    mutationFn: (r: any) => {
+      const e = edits[r.landlordId] ?? {};
+      const kwh = e.kwh?.trim() === "" ? null : Number(e.kwh);
+      const amount = e.amount?.trim() === "" ? null : Number(e.amount);
+      if (kwh == null && amount == null) throw new Error("请至少填写最终电量或最终金额");
+      if (kwh != null && isNaN(kwh)) throw new Error("最终电量必须是数字");
+      if (amount != null && isNaN(amount)) throw new Error("最终金额必须是数字");
+      return saveLandlordMonthlyElec(r.landlordId, { period, finalKwh: kwh, finalAmount: amount });
+    },
+    onSuccess: () => {
+      toast.success("已保存，台账已按新值重算");
+      queryClient.invalidateQueries({ queryKey: ["landlord-monthly-elec"] });
+      queryClient.invalidateQueries({ queryKey: ["electricity-monthly-ledger-range"] });
+    },
+    onError: (e: any) => toast.error(e.response?.data?.detail || e.message || "保存失败"),
+  });
+
+  const rows = (q.data?.rows ?? []) as any[];
+  // 有参考电量（= 本月有读数的场地）的排前面
+  const sorted = [...rows].sort((a, b) => (b.refKwh ?? 0) - (a.refKwh ?? 0));
+
+  return (
+    <Dialog open={open} onOpenChange={(o) => !o && onClose()}>
+      <DialogContent className="!max-w-4xl max-h-[85vh] overflow-y-auto">
+        <DialogHeader>
+          <DialogTitle>场地级电费对账（{toDisplay(period)}）</DialogTitle>
+        </DialogHeader>
+        <div className="space-y-2">
+          <div className="flex items-center gap-2 text-xs text-slate-500">
+            <span>对账月份</span>
+            <input type="month" className={`${inputCls} w-36`} value={toDisplay(period)}
+              onChange={(e) => e.target.value && setPeriod(toCompact(e.target.value))} />
+            <span className="text-slate-400">
+              参考电量 = Σ场地内所有表的实际用电量（系统算）；填「最终电量/金额」后，差额即<b className="mx-0.5 text-amber-700">损耗</b>（我方承担，不摊给品牌）
+            </span>
+          </div>
+          {q.isLoading ? (
+            <div className="py-10 text-center text-sm text-slate-400">加载中…</div>
+          ) : sorted.length === 0 ? (
+            <div className="py-10 text-center text-sm text-slate-400">该月没有电表数据</div>
+          ) : (
+            <div className="xl-wrap rounded-md">
+              <table className="xl-table min-w-[860px]">
+                <thead>
+                  <tr>
+                    <th className="xl-ctr" style={{ minWidth: 140 }}>场地方</th>
+                    <th className="xl-num">参考电量(度)</th>
+                    <th className="xl-num">场地单价</th>
+                    <th className="xl-num">最终电量(度) ✏️</th>
+                    <th className="xl-num">最终金额(元) ✏️</th>
+                    <th className="xl-num">损耗(度)</th>
+                    <th className="xl-num">损耗金额</th>
+                    <th className="xl-ctr"></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {sorted.map((r) => {
+                    const e = edits[r.landlordId] ?? { kwh: r.finalKwh != null ? String(r.finalKwh) : "", amount: r.finalAmount != null ? String(r.finalAmount) : "" };
+                    const dirty = r.landlordId in edits;
+                    const loss = r.lossKwh ?? 0;
+                    return (
+                      <tr key={r.landlordId} className={loss !== 0 ? "bg-amber-50/60" : ""}>
+                        <td className="px-2 py-1 font-medium">{r.landlordName}</td>
+                        <td className="xl-num text-slate-600">{r.refKwh != null ? fmtNum(r.refKwh) : "—"}</td>
+                        <td className="xl-num text-slate-500">{r.unitPrice != null ? r.unitPrice : "—"}</td>
+                        <td className="px-1 py-1">
+                          <input type="number" step="0.01" min="0" className={`${inputCls} h-7 w-24 text-xs`}
+                            placeholder={r.refKwh != null ? String(r.refKwh) : "—"}
+                            title="最终付给场地方老板的电量（默认 = 参考电量）"
+                            value={e.kwh}
+                            onChange={(ev) => setEdits((p) => ({ ...p, [r.landlordId]: { ...e, kwh: ev.target.value } }))} />
+                        </td>
+                        <td className="px-1 py-1">
+                          <input type="number" step="0.01" min="0" className={`${inputCls} h-7 w-24 text-xs`}
+                            placeholder="账单金额"
+                            title="账单只给钱不给度数时直接填金额（系统按场地单价反推电量）"
+                            value={e.amount}
+                            onChange={(ev) => setEdits((p) => ({ ...p, [r.landlordId]: { ...e, amount: ev.target.value } }))} />
+                        </td>
+                        <td className={`xl-num font-medium ${loss > 0 ? "text-amber-700" : loss < 0 ? "text-rose-600" : "text-slate-400"}`}>
+                          {r.lossKwh != null ? fmtNum(r.lossKwh) : "—"}
+                        </td>
+                        <td className={`xl-num ${loss > 0 ? "text-amber-700" : "text-slate-400"}`}>
+                          {r.lossAmount != null ? fmtMoney(r.lossAmount) : "—"}
+                        </td>
+                        <td className="xl-ctr">
+                          <Button size="sm" variant="outline" className="h-7 px-2 text-[11px]"
+                            disabled={!dirty || save.isPending}
+                            onClick={() => save.mutate(r)}>
+                            {save.isPending ? "保存中…" : "保存"}
+                          </Button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+          <p className="text-[11px] leading-relaxed text-slate-400">
+            · 只填电量或只填金额都可以：只填金额时系统按「场地合同单价」反推电量。<br />
+            · 保存后该月台账自动重算：各品牌行的付款金额<b>不变</b>（品牌不承担损耗），差额进独立的<b className="text-amber-700">「损耗行」</b>（利润 = −损耗金额）。<br />
+            · 没填的场地按「最终 = 参考」处理（损耗 0）。已保存过的行会在下次生成时保留人工值（不被同步覆盖）。
+          </p>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 export default function Electricity() {
+  /* ══ 筛选条件（★重设计）══
+     原来顶部是「按场地方 / 按品牌方 / 按公司主体」三个维度按钮 —— 其实那是**同一批台账数据的三种分组方式**，
+     每次切换都要重新请求、还看不到明细。现在改为在同一张平铺台账表上用筛选条件定位：
+     月份区间 / 场地方 / 品牌方 / 公司主体 / 行类型 / 付款情况 / 到账情况 / 关键词。
+     （「报税主体」不再作为分组维度，改成普通的一列 + 一个筛选项。） */
   const [startPeriod, setStartPeriod] = useState(CUR_MONTH);
   const [endPeriod, setEndPeriod] = useState(CUR_MONTH);
-  const [dim, setDim] = useState<ElecLedgerDim>("landlord");
+  const [fLandlord, setFLandlord] = useState("");
+  const [fBrand, setFBrand] = useState("");
+  const [fEntity, setFEntity] = useState("");
+  const [fRowType, setFRowType] = useState("");
+  const [fPay, setFPay] = useState("");
+  const [fCollect, setFCollect] = useState("");
+  const [keyword, setKeyword] = useState("");
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
 
   const monthRange = useMemo(() => {
@@ -655,9 +794,11 @@ export default function Electricity() {
   }, [startPeriod, endPeriod]);
 
   const q = useQuery({
-    queryKey: ["electricity-monthly-ledger-range", startPeriod, endPeriod, dim],
+    queryKey: ["electricity-monthly-ledger-range", startPeriod, endPeriod],
     queryFn: async () => {
-      const results = await Promise.all(monthRange.map((p) => getElectricityMonthlyLedger(p, dim)));
+      // ★固定用「场地方」维度拉取：它一次就带回 场地方 + 主体 + 行类型 + 电表明细，
+      // 足够拼出任何筛选视角（品牌/主体筛选在前端做），不用再按维度重复请求。
+      const results = await Promise.all(monthRange.map((p) => getElectricityMonthlyLedger(p, "landlord")));
       return monthRange.map((p, i) => ({ period: p, ...results[i] }));
     },
     enabled: monthRange.length > 0,
@@ -673,19 +814,318 @@ export default function Electricity() {
   };
 
   const months: any[] = q.data ?? [];
+
+  // ── 平铺台账行：一行 = 一块电表 × 月份 ──
+  //   共用表：付款只有一整笔（整表读数 × 场地单价）、收款按品牌分摊。
+  //   ★场地级损耗（row_type=loss：我方承担、不归主体、不摊品牌）**不再单独成行**，
+  //     而是并入「该场地当月的第一行」—— 因为那一行代表的是"这块表付给场地方的钱"，
+  //     损耗正是这笔钱里品牌没承担的那一段 ⇒ 合并后 电量 / 付款 / 利润 才是"付场地方"的真实口径。
+  //     损耗仅在行内用小字标注（含损耗 XX 度 / XX 元），展开行里也仍能看到明细。
+  const flatRows = useMemo(() => {
+    const out: any[] = [];
+    const r2 = (x: number) => Math.round(x * 100) / 100;
+    const lossByGroup = new Map<string, { kwh: number; pay: number; rows: any[] }>();
+    const firstIdxOfGroup = new Map<string, number>();   // `${月份}|${场地}` → 该组第一行在 out 的下标
+
+    for (const m of months) {
+      for (const g of (m.rows ?? []) as any[]) {
+        const rowType = g.rowType || "normal";
+        const gk = `${m.period}|${g.key}`;
+        const mgs = groupDetailsByMeter(g.details ?? []);
+        const base = {
+          period: m.period,
+          landlordKey: g.key,
+          landlordName: g.name,
+          entityId: g.entityId ?? null,
+          entityName: g.entityName ?? "未指定主体",
+          rowType,
+          isLoss: rowType === "loss",
+          lossKwh: 0,
+          lossPay: 0,
+          hasLoss: false,
+          rowG: g,
+        };
+        if (mgs.length === 0) {
+          if (rowType === "loss") {
+            // 场地级损耗：暂存，稍后并入同场地同月第一行
+            const cur = lossByGroup.get(gk) ?? { kwh: 0, pay: 0, rows: [] as any[] };
+            cur.kwh = r2(cur.kwh + Number(g.kwh ?? 0));
+            cur.pay = r2(cur.pay + Number(g.payAmount ?? 0));
+            cur.rows.push(g);
+            lossByGroup.set(gk, cur);
+            continue;
+          }
+          out.push({
+            ...base,
+            key: `${m.period}|row|${g.key}|${g.entityId ?? "x"}|${rowType}`,
+            meterNo: "",
+            meterName: "（无电表明细）",
+            transformerRatio: null,
+            brands: [] as string[],
+            brandIds: [] as number[],
+            kwh: g.kwh, payUnitPrice: null, payAmount: g.payAmount, payStatus: g.payStatus,
+            collectUnitPrice: null, collectAmount: g.collectAmount, collectNet: g.collectNet,
+            elecTax: g.elecTax, profit: g.profit, collectStatus: null, dataSource: null,
+            recordIds: [] as number[], details: [] as any[],
+          });
+          continue;
+        }
+        for (const mg of mgs) {
+          const d0 = mg.rows[0] ?? {};
+          const sum = (f: (d: any) => number) => r2(mg.rows.reduce((s, d) => s + f(d), 0));
+          const collectAmount = sum((d) => Number(d.collectAmount ?? 0));
+          const collectNet = sum((d) => Number(d.collectNet ?? 0));
+          const doneCollected = mg.rows.filter((d) => d.collectStatus === "已到账").length;
+          const priceRow = mg.rows.find((d) => Number(d.collectUnitPrice ?? 0) > 0);
+          if (!firstIdxOfGroup.has(gk)) firstIdxOfGroup.set(gk, out.length);
+          out.push({
+            ...base,
+            key: `${m.period}|${d0.meterNo ?? "x"}|${g.key}|${g.entityId ?? "x"}`,
+            meterNo: d0.meterNo ?? "",
+            meterName: d0.meterName ?? "",
+            transformerRatio: d0.transformerRatio ?? null,
+            brands: [...new Set(mg.rows.map((d) => d.brandName).filter(Boolean))] as string[],
+            brandIds: [...new Set(mg.rows.map((d) => d.brandId).filter((x) => x != null))] as number[],
+            kwh: mg.kwh, payUnitPrice: mg.payUnitPrice, payAmount: mg.payAmount, payStatus: mg.payStatus,
+            collectUnitPrice: priceRow ? Number(priceRow.collectUnitPrice) : null,
+            collectAmount, collectNet, elecTax: r2(collectAmount - collectNet),
+            profit: r2(collectNet - Number(mg.payAmount ?? 0)),
+            collectStatus: collectAmount <= 0 ? null
+              : doneCollected === mg.rows.length ? "已到账"
+                : doneCollected > 0 ? "部分到账" : "未到账",
+            dataSource: d0.dataSource ?? null,
+            recordIds: mg.recordIds,
+            details: mg.rows,
+          });
+        }
+      }
+    }
+
+    // 把场地级损耗并进「该场地当月第一行」：电量/付款加上它、利润扣掉它（只算一次）
+    for (const [gk, L] of lossByGroup) {
+      const idx = firstIdxOfGroup.get(gk);
+      if (idx == null) {
+        // 极端情况：该场地当月只有损耗、没有任何电表行 → 退化成独立一行（否则这笔成本就丢了）
+        const g0 = L.rows[0];
+        out.push({
+          period: (gk.split("|")[0]) || g0.period,
+          landlordKey: g0.key, landlordName: g0.name,
+          entityId: null, entityName: "—（我方承担）",
+          rowType: "loss", isLoss: true, lossKwh: L.kwh, lossPay: L.pay, hasLoss: true, rowG: g0,
+          key: `${gk}|loss-only`, meterNo: "", meterName: "场地级损耗（我方承担）",
+          transformerRatio: null, brands: [], brandIds: [],
+          kwh: L.kwh, payUnitPrice: null, payAmount: L.pay, payStatus: g0.payStatus,
+          collectUnitPrice: null, collectAmount: 0, collectNet: 0, elecTax: 0,
+          profit: r2(-L.pay), collectStatus: null, dataSource: null,
+          recordIds: [], details: [],
+        });
+        continue;
+      }
+      const row = out[idx];
+      row.hasLoss = true;
+      row.lossKwh = L.kwh;
+      row.lossPay = L.pay;
+      row.kwh = r2(Number(row.kwh ?? 0) + L.kwh);
+      row.payAmount = r2(Number(row.payAmount ?? 0) + L.pay);
+      row.profit = r2(Number(row.profit ?? 0) - L.pay);
+    }
+    return out;
+  }, [months]);
+
+  // ── 筛选项候选值（从已取到的数据派生，天然受账号数据范围约束）──
+  const landlordOptions = useMemo(() => {
+    const seen = new Map<string, string>();
+    for (const r of flatRows) seen.set(String(r.landlordKey), r.landlordName ?? "");
+    return [...seen.entries()].map(([value, label]) => ({ value, label }));
+  }, [flatRows]);
+  const brandOptions = useMemo(() => {
+    const seen = new Map<string, string>();
+    for (const r of flatRows) for (const d of r.details) if (d.brandId != null) seen.set(String(d.brandId), d.brandName ?? "");
+    return [...seen.entries()].map(([value, label]) => ({ value, label }));
+  }, [flatRows]);
+  const entityOptions = useMemo(() => {
+    const seen = new Map<string, string>();
+    for (const r of flatRows) seen.set(String(r.entityId ?? "none"), r.entityName ?? "未指定主体");
+    return [...seen.entries()].map(([value, label]) => ({ value, label }));
+  }, [flatRows]);
+
+  // ── 筛选 ──
+  const rows = useMemo(() => {
+    const kw = keyword.trim().toLowerCase();
+    return flatRows.filter((r) => {
+      if (fLandlord && String(r.landlordKey) !== fLandlord) return false;
+      if (fBrand && !r.brandIds.includes(Number(fBrand))) return false;
+      if (fEntity && String(r.entityId ?? "none") !== fEntity) return false;
+      // 「含场地损耗」筛的是并入了损耗的那一行（损耗已不再单独成行）
+      if (fRowType === "loss") { if (!r.hasLoss) return false; }
+      else if (fRowType && r.rowType !== fRowType) return false;
+      if (fPay === "unpaid" && !(Number(r.payAmount ?? 0) > 0 && r.payStatus !== "已付款")) return false;
+      if (fPay === "paid" && r.payStatus !== "已付款") return false;
+      if (fCollect === "uncollected" && !(Number(r.collectAmount ?? 0) > 0 && r.collectStatus !== "已到账")) return false;
+      if (fCollect === "collected" && r.collectStatus !== "已到账") return false;
+      if (kw && !`${r.meterNo} ${r.meterName} ${r.landlordName} ${r.entityName}`.toLowerCase().includes(kw)) return false;
+      return true;
+    });
+  }, [flatRows, fLandlord, fBrand, fEntity, fRowType, fPay, fCollect, keyword]);
+
+  /* ══ 两级聚合（★多月份改造）══
+     L1 月级行：一行 = 场地 × 主体 × 类型 × 月份（把「电表×月」级行合并；损耗已并入其中的品牌行）
+     L0 场地块：一行 = 场地 × 主体 × 类型，数值 = 所选区间合计，展开后是各月（L1）
+     筛选在「电表×月」级先做（rows），所以聚合后天然只含命中筛选的月份。 */
+  const periodRows = useMemo(() => {
+    const map = new Map<string, any>();
+    const r2 = (x: number) => Math.round(x * 100) / 100;
+    for (const r of rows) {
+      const k = `${r.landlordKey}|${r.entityId ?? "x"}|${r.rowType}|${r.period}`;
+      let g = map.get(k);
+      if (!g) {
+        g = {
+          key: `L1|${k}`,
+          period: r.period,
+          landlordKey: r.landlordKey, landlordName: r.landlordName,
+          entityId: r.entityId ?? null, entityName: r.entityName,
+          rowType: r.rowType, isLoss: !!r.isLoss, rowG: r.rowG,
+          kwh: 0, payAmount: 0, collectAmount: 0, collectNet: 0, elecTax: 0, profit: 0,
+          lossKwh: 0, lossPay: 0, hasLoss: false,
+          details: [] as any[],
+          _payPrices: new Set<number>(), _collectPrices: new Set<number>(), _ratios: new Set<number>(),
+          _payStatus: new Set<string>(), _collectStatus: new Set<string>(),
+          _sources: new Set<string>(),
+          brands: new Set<string>(), brandIds: new Set<number>(),
+          recordIds: new Set<number>(), meterNos: new Set<string>(),
+          _meterNames: [] as string[],
+        };
+        map.set(k, g);
+      }
+      g.kwh = r2(g.kwh + Number(r.kwh ?? 0));
+      g.payAmount = r2(g.payAmount + Number(r.payAmount ?? 0));
+      g.collectAmount = r2(g.collectAmount + Number(r.collectAmount ?? 0));
+      g.collectNet = r2(g.collectNet + Number(r.collectNet ?? 0));
+      g.elecTax = r2(g.elecTax + Number(r.elecTax ?? 0));
+      g.profit = r2(g.profit + Number(r.profit ?? 0));
+      if (Number(r.payUnitPrice ?? 0) > 0) g._payPrices.add(Number(r.payUnitPrice));
+      if (Number(r.collectUnitPrice ?? 0) > 0) g._collectPrices.add(Number(r.collectUnitPrice));
+      if (r.transformerRatio != null) g._ratios.add(Number(r.transformerRatio));
+      g._payStatus.add(r.payStatus ?? "");
+      g._collectStatus.add(r.collectStatus ?? "");
+      if (r.dataSource) g._sources.add(r.dataSource);
+      for (const b of r.brands ?? []) g.brands.add(b);
+      for (const b of r.brandIds ?? []) g.brandIds.add(b);
+      for (const id of r.recordIds ?? []) g.recordIds.add(id);
+      for (const d of r.details ?? []) g.details.push(d);
+      if (r.meterNo) g.meterNos.add(r.meterNo);
+      if (r.meterName) g._meterNames.push(r.meterName);
+      if (r.hasLoss) {
+        g.hasLoss = true;
+        g.lossKwh = r2(g.lossKwh + Number(r.lossKwh ?? 0));
+        g.lossPay = r2(g.lossPay + Number(r.lossPay ?? 0));
+      }
+    }
+    return [...map.values()].map((g) => ({
+      ...g,
+      brands: [...g.brands] as string[],
+      brandIds: [...g.brandIds] as number[],
+      recordIds: [...g.recordIds] as number[],
+      meterCount: g.meterNos.size,
+      meterNo: g.meterNos.size === 1 ? [...g.meterNos][0] : "",
+      meterName: g._meterNames.length === 1 ? g._meterNames[0] : `${g.meterNos.size} 块电表`,
+      payUnitPrice: g._payPrices.size === 1 ? [...g._payPrices][0] : null,
+      collectUnitPrice: g._collectPrices.size === 1 ? [...g._collectPrices][0] : null,
+      transformerRatio: g._ratios.size === 1 ? [...g._ratios][0] : null,
+      payStatus: g._payStatus.size === 1 ? [...g._payStatus][0] : "部分已付款",
+      collectStatus: g._collectStatus.size === 1 ? [...g._collectStatus][0] : "部分到账",
+      dataSource: g._sources.size === 1 ? [...g._sources][0] : (g._sources.size > 1 ? "mixed" : null),
+    }));
+  }, [rows]);
+
+  const landlordRows = useMemo(() => {
+    const map = new Map<string, any>();
+    const r2 = (x: number) => Math.round(x * 100) / 100;
+    for (const p of periodRows) {
+      const k = `L0|${p.landlordKey}|${p.entityId ?? "x"}|${p.rowType}`;
+      let g = map.get(k);
+      if (!g) {
+        g = {
+          key: k,
+          landlordKey: p.landlordKey, landlordName: p.landlordName,
+          entityId: p.entityId, entityName: p.entityName,
+          rowType: p.rowType, isLoss: p.isLoss,
+          kwh: 0, payAmount: 0, collectAmount: 0, collectNet: 0, elecTax: 0, profit: 0,
+          lossKwh: 0, lossPay: 0, hasLoss: false,
+          months: [] as any[],
+          brands: new Set<string>(), meterNos: new Set<string>(),
+          paid: 0, paidTotal: 0, collected: 0, collectedTotal: 0,
+          _sources: new Set<string>(),
+        };
+        map.set(k, g);
+      }
+      g.kwh = r2(g.kwh + Number(p.kwh ?? 0));
+      g.payAmount = r2(g.payAmount + Number(p.payAmount ?? 0));
+      g.collectAmount = r2(g.collectAmount + Number(p.collectAmount ?? 0));
+      g.collectNet = r2(g.collectNet + Number(p.collectNet ?? 0));
+      g.elecTax = r2(g.elecTax + Number(p.elecTax ?? 0));
+      g.profit = r2(g.profit + Number(p.profit ?? 0));
+      if (p.hasLoss) {
+        g.hasLoss = true;
+        g.lossKwh = r2(g.lossKwh + Number(p.lossKwh ?? 0));
+        g.lossPay = r2(g.lossPay + Number(p.lossPay ?? 0));
+      }
+      for (const b of p.brands ?? []) g.brands.add(b);
+      for (const n of p.meterNos ?? []) g.meterNos.add(n);
+      for (const s of p._sources ?? []) if (s) g._sources.add(s);
+      if (Number(p.payAmount ?? 0) > 0) { g.paidTotal += 1; if (p.payStatus === "已付款") g.paid += 1; }
+      if (Number(p.collectAmount ?? 0) > 0) { g.collectedTotal += 1; if (p.collectStatus === "已到账") g.collected += 1; }
+      g.months.push(p);
+    }
+    return [...map.values()].map((g) => ({
+      ...g,
+      brands: [...g.brands] as string[],
+      meterCount: g.meterNos.size,
+      dataSource: g._sources.size === 1 ? [...g._sources][0] : (g._sources.size > 1 ? "mixed" : null),
+      // 近月在上（与 Meters 展开行一致）
+      months: (g.months as any[]).sort((a, b) => String(b.period).localeCompare(String(a.period))),
+    }));
+  }, [periodRows]);
+
+  // 区间内付款/到账状态汇总（多月不一致时给「已付 1/2」并标黄提醒）
+  const paySummary = (g: any) => {
+    if (g.paidTotal === 0) return g.paid > 0 ? "已付款" : "—";
+    if (g.paid === 0) return "未付款";
+    if (g.paid === g.paidTotal) return g.paidTotal > 1 ? `${g.paidTotal} 个月均已付` : "已付款";
+    return `已付 ${g.paid}/${g.paidTotal}`;
+  };
+  const collectSummary = (g: any) => {
+    if (g.collectedTotal === 0) return g.collected > 0 ? "已到账" : "—";
+    if (g.collected === 0) return "未到账";
+    if (g.collected === g.collectedTotal) return g.collectedTotal > 1 ? `${g.collectedTotal} 个月均已到账` : "已到账";
+    return `已到账 ${g.collected}/${g.collectedTotal}`;
+  };
+
+  // 区间只有一个月：场地块默认展开，省掉一次点击（多选月份时默认收起）
+  const singleMonth = monthRange.length === 1;
+  useEffect(() => {
+    if (!singleMonth) return;
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      for (const g of landlordRows) next.add(g.key);
+      return next;
+    });
+  }, [singleMonth, landlordRows]);
+
+  // 合计：跟随筛选结果（与表尾合计一致）
   const totals = useMemo(() => {
     const t = { kwh: 0, payAmount: 0, collectAmount: 0, collectNet: 0, elecTax: 0, profit: 0 };
-    for (const m of months) {
-      const mt = m.totals ?? {};
-      t.kwh += mt.kwh ?? 0;
-      t.payAmount += mt.payAmount ?? 0;
-      t.collectAmount += mt.collectAmount ?? 0;
-      t.collectNet += mt.collectNet ?? 0;
-      t.elecTax += mt.elecTax ?? 0;
-      t.profit += mt.profit ?? 0;
+    for (const r of rows) {
+      t.kwh += Number(r.kwh ?? 0);
+      t.payAmount += Number(r.payAmount ?? 0);
+      t.collectAmount += Number(r.collectAmount ?? 0);
+      t.collectNet += Number(r.collectNet ?? 0);
+      t.elecTax += Number(r.elecTax ?? 0);
+      t.profit += Number(r.profit ?? 0);
     }
+    for (const k of Object.keys(t) as (keyof typeof t)[]) t[k] = Math.round(t[k] * 100) / 100;
     return t;
-  }, [months]);
+  }, [rows]);
 
   const quick = (n: number) => {
     setEndPeriod(CUR_MONTH);
@@ -697,6 +1137,8 @@ export default function Electricity() {
   const [payElec, setPayElec] = useState<{ landlordId: number; landlordName: string; period: string; g: any } | null>(null);
   // 抄表核对详情弹窗
   const [readingTarget, setReadingTarget] = useState<{ meterNo: string; period: string } | null>(null);
+  // ★V5 场地级月度电费对账弹窗
+  const [lmeOpen, setLmeOpen] = useState(false);
   // 付款/收款状态行内编辑（可反复修改）
   // key = 正在编辑的单元格；recordIds = 一起改的台账行（共享电表给场地方是一整笔付款，多品牌行同改）
   const [statusEdit, setStatusEdit] = useState<{ key: string; recordIds: number[]; field: "pay" | "collect" } | null>(null);
@@ -722,7 +1164,7 @@ export default function Electricity() {
       const wb = XLSX.utils.book_new();
       let sheetCount = 0;
       for (const p of monthRange) {
-        const data = await exportElectricityLedger(p, dim);
+        const data = await exportElectricityLedger(p, "landlord");
         if (!data || !data.rows || data.rows.length === 0) continue;
         XLSX.utils.book_append_sheet(wb, buildLedgerSheet(data), toDisplay(p).replace("-", "").slice(0, 31) || "台账");
         sheetCount++;
@@ -741,41 +1183,76 @@ export default function Electricity() {
 
   return (
     <div className="space-y-4">
-      {/* ── 顶部：月份区间 + 维度切换 ── */}
-      <div className="flex flex-wrap items-center gap-3">
-        <h2 className="text-lg font-bold">电费月台账</h2>
+      {/* ── 顶部：月份区间 + ★筛选条件（不再切换维度） ── */}
+      <div className="flex flex-wrap items-center gap-2">
+        <h2 className="text-lg font-bold">电费台账</h2>
         <div className="flex items-center gap-1 text-xs text-slate-500">
-          <span>从</span>
           <input type="month" className={`${inputCls} w-36`} value={toDisplay(startPeriod)}
-            onChange={(e) => e.target.value && setStartPeriod(toCompact(e.target.value))} />
-          <span>到</span>
+            onChange={(e) => {
+              const v = e.target.value;
+              if (!v) return;
+              setStartPeriod(toCompact(v));
+              if (toCompact(v) > endPeriod) setEndPeriod(toCompact(v));
+            }} title="起始月" />
+          <span>~</span>
           <input type="month" className={`${inputCls} w-36`} value={toDisplay(endPeriod)}
-            onChange={(e) => e.target.value && setEndPeriod(toCompact(e.target.value))} />
+            onChange={(e) => {
+              const v = e.target.value;
+              if (!v) return;
+              setEndPeriod(toCompact(v));
+              if (toCompact(v) < startPeriod) setStartPeriod(toCompact(v));
+            }} title="结束月" />
         </div>
-        <div className="flex gap-1">
-          <Button size="sm" variant="outline" onClick={() => { setStartPeriod(CUR_MONTH); setEndPeriod(CUR_MONTH); }}>本月</Button>
-          <Button size="sm" variant="outline" onClick={() => quick(3)}>近3月</Button>
-          <Button size="sm" variant="outline" onClick={() => quick(6)}>近6月</Button>
-          <Button size="sm" variant="outline" onClick={() => quick(12)}>近12月</Button>
+        <div className="flex items-center gap-0.5 rounded-md border border-slate-200 bg-white p-0.5">
+          {([["本月", 1], ["近3月", 3], ["近6月", 6], ["近12月", 12]] as const).map(([label, n]) => (
+            <button key={label} type="button" onClick={() => quick(n)}
+              className="rounded px-1.5 py-1 text-[11px] text-slate-600 transition-colors hover:bg-slate-100 hover:text-blue-600">
+              {label}
+            </button>
+          ))}
         </div>
-        <div className="flex overflow-hidden rounded-lg border">
-          <Button size="sm" variant={dim === "landlord" ? "default" : "ghost"}
-            className={dim === "landlord" ? "bg-emerald-600 hover:bg-emerald-700" : ""}
-            onClick={() => setDim("landlord")}>
-            <Building2 className="mr-1 h-3.5 w-3.5" />按场地方
-          </Button>
-          <Button size="sm" variant={dim === "brand" ? "default" : "ghost"}
-            className={dim === "brand" ? "bg-blue-600 hover:bg-blue-700" : ""}
-            onClick={() => setDim("brand")}>
-            <Tag className="mr-1 h-3.5 w-3.5" />按品牌方
-          </Button>
-          <Button size="sm" variant={dim === "entity" ? "default" : "ghost"}
-            className={dim === "entity" ? "bg-indigo-600 hover:bg-indigo-700" : ""}
-            onClick={() => setDim("entity")}>
-            <Landmark className="mr-1 h-3.5 w-3.5" />按公司主体
-          </Button>
+        <input className={`${inputCls} w-44`} placeholder="搜索电表编号 / 名称 / 场地…"
+          value={keyword} onChange={(e) => setKeyword(e.target.value)} />
+        <div className="w-36">
+          <SearchSelect value={fLandlord} onChange={setFLandlord} placeholder="全部场地方"
+            options={landlordOptions} />
         </div>
-        <span className="text-xs text-slate-400">{toDisplay(startPeriod)} ~ {toDisplay(endPeriod)} · 电费经营信息</span>
+        <div className="w-36">
+          <SearchSelect value={fBrand} onChange={setFBrand} placeholder="全部品牌方"
+            options={brandOptions} />
+        </div>
+        <div className="w-36">
+          <SearchSelect value={fEntity} onChange={setFEntity} placeholder="全部主体"
+            options={entityOptions} />
+        </div>
+        <select className={`${inputCls} w-28`} value={fRowType} onChange={(e) => setFRowType(e.target.value)}
+          title="行类型：品牌行 / 民用电表（只付场地、无收款）/ 场地级损耗（我方承担）">
+          <option value="">全部类型</option>
+          <option value="normal">品牌行</option>
+          <option value="civil">民用电表</option>
+          <option value="loss">含场地损耗</option>
+        </select>
+        <select className={`${inputCls} w-28`} value={fPay} onChange={(e) => setFPay(e.target.value)}>
+          <option value="">付款：全部</option>
+          <option value="unpaid">仅未付款</option>
+          <option value="paid">仅已付款</option>
+        </select>
+        <select className={`${inputCls} w-28`} value={fCollect} onChange={(e) => setFCollect(e.target.value)}>
+          <option value="">到账：全部</option>
+          <option value="uncollected">仅未到账</option>
+          <option value="collected">仅已到账</option>
+        </select>
+        <button type="button"
+          onClick={() => { setFLandlord(""); setFBrand(""); setFEntity(""); setFRowType(""); setFPay(""); setFCollect(""); setKeyword(""); }}
+          className="rounded px-1.5 py-1 text-[11px] text-slate-400 hover:text-slate-600">清空筛选</button>
+        <span className="text-xs text-slate-400">
+          {toDisplay(startPeriod)} ~ {toDisplay(endPeriod)} · {landlordRows.length} 个场地块（{rows.length} / {flatRows.length} 行明细）
+        </span>
+        {/* ★V5：场地级对账（录「最终付给场地方的电量/金额」→ 损耗） */}
+        <Button size="sm" variant="outline" className="border-amber-300 text-amber-700 hover:bg-amber-50"
+          onClick={() => setLmeOpen(true)}>
+          <Zap className="mr-1 h-3.5 w-3.5" />场地级对账（损耗）
+        </Button>
         <Button size="sm" className="ml-auto bg-blue-600 hover:bg-blue-700" disabled={exporting} onClick={doExport}>
           <Download className="mr-1 h-3.5 w-3.5" />{exporting ? "导出中…" : "导出 Excel"}
         </Button>
@@ -791,267 +1268,393 @@ export default function Electricity() {
         <StatCard label="电费利润" value={totals.profit} tone="blue" />
       </div>
 
-      {/* ── 按月总览表 ── */}
-      <div className="overflow-x-auto rounded-xl border bg-white shadow-sm">
-        <table className="w-full min-w-[1000px] text-xs">
+      {/* ── 台账平铺明细（★重设计：一行 = 一块电表 × 月份；筛选条件定位，不再按主体分层展开） ── */}
+      <div className="xl-wrap xl-wrap-scroll rounded-xl shadow-sm">
+        <table className="xl-table" style={{ minWidth: 1650 }}>
           <thead>
-            <tr className="border-b bg-slate-50 text-left text-[11px] text-slate-500">
-              <th className="w-8 px-2 py-2.5"></th>
-              <th className="px-3 py-2.5 font-medium">月份</th>
-              <th className="px-3 py-2.5 text-right font-medium">电量（度）</th>
-              <th className="px-3 py-2.5 text-right font-medium">电费付款</th>
-              <th className="px-3 py-2.5 text-right font-medium">收款含税</th>
-              <th className="px-3 py-2.5 text-right font-medium">收款不含税</th>
-              <th className="px-3 py-2.5 text-right font-medium">税费</th>
-              <th className="px-3 py-2.5 text-right font-medium">利润</th>
+            <tr>
+              <th className="xl-freeze xl-ctr" style={{ left: 0, width: 30 }}></th>
+              <th className="xl-freeze" style={{ left: 30, width: 78 }}>月份</th>
+              <th className="xl-freeze" style={{ left: 108, width: 104 }}>场地方</th>
+              <th style={{ width: 96 }}>主体</th>
+              <th style={{ width: 150 }}>电表</th>
+              <th style={{ width: 104 }}>品牌方</th>
+              <th className="xl-ctr" style={{ width: 58 }} title="品牌行 / 民用电表（无收款对象）；带「含损耗」= 该行已并入场地级损耗（我方承担）">类型</th>
+              <th className="xl-num" style={{ width: 52 }}>倍数</th>
+              <th className="xl-num" style={{ width: 86 }} title="付给场地方的电量（含场地级损耗那一段）">电量(度)</th>
+              <th className="xl-num" style={{ width: 74 }}>付款单价</th>
+              <th className="xl-num" style={{ width: 92 }} title="付给场地方的钱（含场地级损耗；损耗由我方承担、不摊品牌、不归主体）">付款金额</th>
+              <th className="xl-ctr" style={{ width: 84 }}>付款情况</th>
+              <th className="xl-num" style={{ width: 74 }}>收款单价</th>
+              <th className="xl-num" style={{ width: 92 }}>收款(含税)</th>
+              <th className="xl-num" style={{ width: 88 }}>不含税</th>
+              <th className="xl-num" style={{ width: 74 }}>税费</th>
+              <th className="xl-num" style={{ width: 86 }}>利润</th>
+              <th className="xl-ctr" style={{ width: 84 }}>到账情况</th>
+              <th className="xl-ctr" style={{ width: 60 }}>来源</th>
+              <th className="xl-ctr xl-freeze-r" style={{ width: 78 }}>操作</th>
             </tr>
           </thead>
           <tbody>
-            {months.length === 0 && (
-              <tr><td colSpan={8} className="px-3 py-8 text-center text-slate-400">
-                {q.isLoading ? "加载中…" : "请选择有效的月份区间"}
-              </td></tr>
+            {rows.length === 0 && (
+              <tr>
+                <td colSpan={20} className="xl-ctr xl-muted" style={{ padding: "28px 8px" }}>
+                  {q.isLoading ? "加载中…" : "所选筛选条件下没有电费台账数据"}
+                </td>
+              </tr>
             )}
-            {months.map((m) => {
-              const mt = m.totals ?? {};
-              const mKey = `m-${m.period}`;
-              const mOpen = expanded.has(mKey);
+            {landlordRows.map((L0) => {
+              const open0 = expanded.has(L0.key);
+              const payMixed = L0.paidTotal > 1 && L0.paid > 0 && L0.paid < L0.paidTotal;
+              const colMixed = L0.collectedTotal > 1 && L0.collected > 0 && L0.collected < L0.collectedTotal;
               return (
-                <Fragment key={mKey}>
-                  <tr className="cursor-pointer border-b hover:bg-slate-50/60" onClick={() => toggle(mKey)}>
-                    <td className="px-2 py-2.5 text-slate-400">
-                      {mOpen ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
+                <Fragment key={L0.key}>
+                  {/* ── L0：场地 × 主体 × 类型（数值 = 所选区间合计；展开看逐月）── */}
+                  <tr className={`${open0 ? "xl-open" : ""} font-medium`}>
+                    <td className="xl-freeze xl-ctr" style={{ left: 0 }}>
+                      <button className="text-slate-500 hover:text-slate-700" onClick={() => toggle(L0.key)} title="展开该场地在该区间内的各月份">
+                        {open0 ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
+                      </button>
                     </td>
-                    <td className="px-3 py-2.5 font-medium text-slate-700">{toDisplay(m.period)}</td>
-                    <td className="px-3 py-2.5 text-right tabular-nums text-slate-600">{fmtNum(mt.kwh)}</td>
-                    <td className="px-3 py-2.5 text-right tabular-nums text-rose-600">{fmtMoney(mt.payAmount)}</td>
-                    <td className="px-3 py-2.5 text-right tabular-nums text-slate-500">{fmtMoney(mt.collectAmount)}</td>
-                    <td className="px-3 py-2.5 text-right tabular-nums text-emerald-600">{fmtMoney(mt.collectNet)}</td>
-                    <td className="px-3 py-2.5 text-right tabular-nums text-slate-500">{fmtMoney(mt.elecTax)}</td>
-                    <td className="px-3 py-2.5 text-right tabular-nums font-medium text-slate-700">{fmtMoney(mt.profit)}</td>
+                    <td className="xl-freeze text-slate-700" style={{ left: 30 }}>
+                      {L0.months.length === 1 ? toDisplay(L0.months[0].period) : `${L0.months.length} 个月`}
+                    </td>
+                    <td className="xl-freeze truncate" style={{ left: 108 }} title={L0.landlordName}>{L0.landlordName ?? "未指定场地"}</td>
+                    <td className="truncate text-slate-600" title={L0.entityName}>{L0.entityName}</td>
+                    <td className="truncate text-slate-500">
+                      {L0.meterCount > 0 ? `${L0.meterCount} 块电表` : <span className="xl-muted">—</span>}
+                    </td>
+                    <td className="truncate text-slate-500" title={L0.brands.join("、")}>
+                      {L0.brands.length === 0
+                        ? <span className="xl-muted">—</span>
+                        : L0.brands.length === 1
+                          ? L0.brands[0]
+                          : <span className="font-medium text-purple-600">{L0.brands.length} 个品牌</span>}
+                    </td>
+                    <td className="xl-ctr">
+                      {L0.isLoss ? (
+                        <span className="rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700">损耗</span>
+                      ) : L0.rowType === "civil" ? (
+                        <span className="rounded-full bg-slate-200 px-1.5 py-0.5 text-[10px] font-medium text-slate-600"
+                          title="民用电表：无品牌归属、无收款对象，只有付给场地方的成本">民用</span>
+                      ) : (
+                        <span className="rounded-full bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-500">品牌行</span>
+                      )}
+                      {L0.hasLoss && !L0.isLoss && (
+                        <span className="ml-0.5 rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700"
+                          title={`区间内已并入场地级损耗 ${fmtNum(L0.lossKwh)} 度 / ${fmtMoney(L0.lossPay)}（我方承担：不归主体、不摊品牌）`}>
+                          含损耗
+                        </span>
+                      )}
+                    </td>
+                    <td className="xl-num"><span className="xl-muted">—</span></td>
+                    <td className="xl-num text-slate-700">
+                      {fmtNum(L0.kwh)}
+                      {L0.hasLoss && !L0.isLoss && (
+                        <div className="text-[9px] font-normal text-amber-600" title="付给场地方的电量 = 各品牌分摊电量 + 场地级损耗">含损耗 {fmtNum(L0.lossKwh)}</div>
+                      )}
+                    </td>
+                    <td className="xl-num"><span className="xl-muted">—</span></td>
+                    <td className="xl-num xl-neg">
+                      {fmtMoney(L0.payAmount)}
+                      {L0.hasLoss && !L0.isLoss && (
+                        <div className="text-[9px] font-normal text-amber-600" title="场地级损耗（我方承担）：最终付场地方电量 − 已入台账的各品牌电量">含损耗 {fmtMoney(L0.lossPay)}</div>
+                      )}
+                    </td>
+                    <td className="xl-ctr">
+                      <span title="付款状态按月记账（主表只汇总，点开逐月查看/修改）"
+                        className={`inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-medium ${
+                          L0.paidTotal > 0 && L0.paid === L0.paidTotal ? "bg-emerald-100 text-emerald-700"
+                            : payMixed ? "bg-amber-100 text-amber-700"
+                            : "border border-slate-200 bg-white text-slate-500"}`}>
+                        {paySummary(L0)}
+                      </span>
+                    </td>
+                    <td className="xl-num"><span className="xl-muted">—</span></td>
+                    <td className="xl-num">{fmtMoney(L0.collectAmount)}</td>
+                    <td className="xl-num text-emerald-600">{fmtMoney(L0.collectNet)}</td>
+                    <td className="xl-num text-slate-500">{fmtMoney(L0.elecTax)}</td>
+                    <td className="xl-num text-slate-700">{fmtMoney(L0.profit)}</td>
+                    <td className="xl-ctr">
+                      <span title="到账状态按月记账（主表只汇总，点开逐月查看/修改）"
+                        className={`inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-medium ${
+                          L0.collectedTotal > 0 && L0.collected === L0.collectedTotal ? "bg-emerald-100 text-emerald-700"
+                            : colMixed ? "bg-amber-100 text-amber-700"
+                            : "border border-slate-200 bg-white text-slate-500"}`}>
+                        {collectSummary(L0)}
+                      </span>
+                    </td>
+                    <td className="xl-ctr text-[10px] text-slate-400" title={L0.dataSource === "manual" ? "人工修正" : L0.dataSource === "synced" ? "第三方同步" : L0.dataSource === "mixed" ? "部分月人工、部分月第三方" : ""}>
+                      {L0.dataSource === "manual" ? "人工" : L0.dataSource === "synced" ? "第三方" : L0.dataSource === "mixed" ? "混合" : "—"}
+                    </td>
+                    <td className="xl-ctr xl-freeze-r">
+                      <button className="text-[10px] text-slate-400 hover:text-slate-600" onClick={() => toggle(L0.key)}>
+                        {open0 ? "收起" : `展开 ${L0.months.length} 个月`}
+                      </button>
+                    </td>
                   </tr>
-                  {mOpen && (
-                    <tr className="border-b bg-slate-50/40">
-                      <td colSpan={8} className="px-6 py-3">
-                        <div className="space-y-1">
-                          <div className="text-[11px] font-medium text-slate-400">
-                            {toDisplay(m.period)} · 按{dim === "landlord" ? "场地方" : dim === "entity" ? "公司主体" : "品牌方"}明细（点击展开电表）
-                          </div>
-                          {(dim === "brand"
-                            ? [{ entityName: "", color: GROUP_COLOR_NEUTRAL, rows: m.rows ?? [] }]
-                            : groupByEntity(m.rows ?? [])
-                          ).map((grp, gi) => {
-                            const grpKey = `grp-${m.period}-${dim}-${gi}`;
-                            return (
-                            <div key={grpKey} className={dim !== "brand" ? `space-y-1.5 rounded-lg border p-2 ${grp.color.border} ${grp.color.bg}` : "space-y-1"}>
-                            {dim !== "brand" && (
-                              <div className="flex items-center gap-2 px-1">
-                                <div className={`flex h-5 w-5 items-center justify-center rounded ${grp.color.icon}`}>
-                                  <Landmark className="h-3 w-3 text-white" />
-                                </div>
-                                <span className={`text-[11px] font-semibold ${grp.color.text}`}>{grp.entityName}</span>
-                                <span className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${grp.color.chip}`}>{grp.rows.length} {dim === "landlord" ? "个场地方" : "条台账"}</span>
-                              </div>
-                            )}
-                            {grp.rows.map((g: any) => {
-                            // 同场地跨主体会拆成多行，行键需带主体区分
-                            const rKey = `r-${m.period}-${dim}-${g.key}-${g.entityId ?? "x"}`;
-                            const rOpen = expanded.has(rKey);
-                            const hasTransformerRatio = (g.details ?? []).some((d: any) => d.transformerRatio && d.transformerRatio !== 1);
-                            const hasBrandDimension = (g.details ?? []).some((d: any) => d.brandName);
-                            // 明细按电表分组后摊平：共享表的付款信息只在第一行出现
-                            const meterGroups = groupDetailsByMeter(g.details ?? []);
-                            const flatDetails = meterGroups.flatMap((mg, gi) =>
-                              mg.rows.map((d: any, i: number) => ({ d, mg, gi, first: i === 0 })));
-                            const hasSharedMeter = meterGroups.some((mg) => mg.shared);
-                            return (
-                              <Fragment key={rKey}>
-                                <div
-                                  className="grid cursor-pointer items-center gap-x-3 rounded-md border bg-white px-3 py-1.5 text-xs hover:bg-slate-50"
-                                  style={{ gridTemplateColumns: "minmax(0, 1fr) 100px 120px 120px 90px 110px auto" }}
-                                  onClick={() => toggle(rKey)}
-                                >
-                                  <span className="flex min-w-0 items-center gap-1">
-                                    <span className="shrink-0 text-slate-400">{rOpen ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}</span>
-                                    <span className="truncate font-medium text-slate-700" title={g.name}>{g.name}</span>
-                                  </span>
-                                  <span className="text-right text-slate-500 tabular-nums">{fmtNum(g.kwh)} 度</span>
-                                  <span className="text-right tabular-nums text-rose-600"
-                                    title="应付电费（付给场地方）：合计本场地各电表；共享电表按整表读数 × 场地合同单价">
-                                    付 {fmtMoney(g.payAmount)}
-                                  </span>
-                                  <span className="text-right tabular-nums text-emerald-600">收 {fmtMoney(g.collectNet)}</span>
-                                  <span className="text-right tabular-nums text-slate-400">税 {fmtMoney(g.elecTax)}</span>
-                                  <span className="text-right tabular-nums font-medium text-slate-700">利 {fmtMoney(g.profit)}</span>
-                                  {dim === "landlord" && g.payStatus === "未付款" && g.payAmount > 0 && (
-                                    <button
-                                      onClick={(e) => { e.stopPropagation(); setPayElec({ landlordId: Number(g.key), landlordName: g.name, period: m.period, g }); }}
-                                      className="rounded-md border border-rose-200 bg-rose-50 px-2 py-1 text-[10px] font-medium text-rose-600 hover:border-rose-300 hover:bg-rose-100"
-                                    >
-                                      <Send className="mr-1 inline h-3 w-3" />提交应付电费审批
-                                    </button>
-                                  )}
-                                </div>
-                                {rOpen && (
-                                  <div className="ml-6 overflow-x-auto rounded-lg border bg-white">
-                                    <table className="w-full min-w-[920px] text-[11px]">
-                                      <thead>
-                                        <tr className="border-b bg-slate-100 text-left text-[10px] text-slate-500">
-                                          <th className="px-2 py-1.5" rowSpan={2}>{dim === "landlord" ? "电表" : "电表"}</th>
-                                          {hasBrandDimension && <th className="px-2 py-1.5" rowSpan={2}>品牌方</th>}
-                                          {hasTransformerRatio && <th className="px-2 py-1.5" rowSpan={2}>互感器倍数</th>}
-                                          <th className="px-2 py-1.5" rowSpan={2}>度数(kWh)</th>
-                                          <th className="border-x bg-rose-50/70 px-2 py-1.5 text-center" colSpan={3}>付款信息</th>
-                                          <th className="border-x bg-emerald-50/70 px-2 py-1.5 text-center" colSpan={4}>收款信息</th>
-                                          <th className="px-2 py-1.5" rowSpan={2}>利润</th>
-                                        </tr>
-                                        <tr className="border-b bg-slate-100 text-[10px] text-slate-500">
-                                          <th className="border-x px-2 py-1">单价</th>
-                                          <th className="px-2 py-1">金额</th>
-                                          <th className="px-2 py-1">情况</th>
-                                          <th className="border-x px-2 py-1">单价</th>
-                                          <th className="px-2 py-1">金额(含税)</th>
-                                          <th className="px-2 py-1">不含税</th>
-                                          <th className="px-2 py-1">到账</th>
-                                        </tr>
-                                      </thead>
-                                      <tbody>
-                                        {flatDetails.map(({ d, mg, gi, first }, fi) => {
-                                          // 付款信息归「电表」：共享表只在第一行渲染（rowSpan 跨全部品牌行）
-                                          const payKey = `pay-${rKey}-${gi}`;
-                                          const collectKey = `collect-${d.recordId}`;
-                                          return (
-                                          <tr key={`${gi}-${fi}`} className="border-b last:border-0 hover:bg-slate-50/50">
-                                            {first && (
-                                              <td className="px-2 py-1.5 align-top" rowSpan={mg.rows.length}>
-                                                <div className="font-medium text-slate-700">{d.meterName ?? d.stationName ?? "—"}</div>
-                                                <div className="font-mono text-[10px] text-slate-400">{d.meterNo}{d.meterName ? ` · ${d.meterName}` : ""}</div>
-                                                {dim === "entity" && d.landlordName && (
-                                                  <div className="text-[10px] text-slate-400">场地：{d.landlordName}</div>
-                                                )}
-                                                {d.dataSource === "manual" && (
-                                                  <span className="mt-0.5 inline-block rounded bg-amber-100 px-1 text-[10px] text-amber-700">已人工修改</span>
-                                                )}
-                                                <button type="button" className="mt-0.5 block text-[11px] text-rose-600 hover:text-rose-700"
-                                                  onClick={(e) => { e.stopPropagation(); setReadingTarget({ meterNo: d.meterNo, period: m.period }); }}>
-                                                  详细
-                                                </button>
-                                              </td>
-                                            )}
-                                            {hasBrandDimension && (
-                                              <td className={`px-2 py-1.5 tabular-nums ${!d.brandName ? "font-medium text-purple-600" : ""}`}>
-                                                {d.brandName ?? "全品牌共享"}
-                                              </td>
-                                            )}
-                                            {hasTransformerRatio && first && (
-                                              <td className="px-2 py-1.5 align-top tabular-nums" rowSpan={mg.rows.length}>{fmtNum(d.transformerRatio)}</td>
-                                            )}
-                                            {/* 度数 + 付款信息：同一块电表只有一整笔（共享表 = 整表读数 × 场地单价） */}
-                                            {first && (
-                                              <>
-                                                <td className="px-2 py-1.5 align-top tabular-nums" rowSpan={mg.rows.length}>
-                                                  {fmtNum(mg.kwh)}
-                                                  {mg.shared && <div className="text-[10px] font-normal text-amber-600">整表</div>}
-                                                </td>
-                                                <td className="border-x px-2 py-1.5 text-right align-top tabular-nums" rowSpan={mg.rows.length}>
-                                                  {Number(mg.payUnitPrice ?? 0) > 0 ? fmtNum(mg.payUnitPrice) : "—"}
-                                                </td>
-                                                <td className="px-2 py-1.5 text-right align-top tabular-nums text-rose-600" rowSpan={mg.rows.length}
-                                                  title={mg.shared && Number(mg.payUnitPrice ?? 0) > 0
-                                                    ? `付场地方 = 整表 ${fmtNum(mg.kwh)} 度 × ${fmtNum(mg.payUnitPrice ?? 0)} 元/度（亏空按电量摊入各品牌）`
-                                                    : undefined}>
-                                                  {fmtMoney(mg.payAmount)}
-                                                  {mg.shared && !(Number(mg.payUnitPrice ?? 0) > 0) && (
-                                                    <div className="text-[10px] font-normal text-rose-500">场地合同未填电费单价</div>
-                                                  )}
-                                                </td>
-                                                <td className="px-2 py-1.5 text-center align-top" rowSpan={mg.rows.length}>
-                                                  {statusEdit?.key === payKey && statusEdit.field === "pay" ? (
-                                                    <div className="flex flex-wrap items-center justify-center gap-1">
-                                                      <button type="button" className="rounded bg-emerald-100 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 hover:bg-emerald-200"
-                                                        onClick={(e) => { e.stopPropagation(); updateStatusMut.mutate({ recordIds: mg.recordIds, payStatus: "已付款" }); }}>已付款</button>
-                                                      <button type="button" className="rounded border border-slate-200 bg-white px-1.5 py-0.5 text-[10px] text-slate-500 hover:bg-slate-100"
-                                                        onClick={(e) => { e.stopPropagation(); updateStatusMut.mutate({ recordIds: mg.recordIds, payStatus: "未付款" }); }}>未付款</button>
-                                                      <button type="button" className="rounded px-1 text-[10px] text-slate-400 hover:text-slate-600"
-                                                        onClick={(e) => { e.stopPropagation(); setStatusEdit(null); }}>取消</button>
-                                                    </div>
-                                                  ) : (
-                                                    <button type="button"
-                                                      title={mg.recordIds.length > 0
-                                                        ? (mg.shared ? "点击修改付款状态（该共享表全部品牌一起改）" : "点击修改付款状态")
-                                                        : "台账记录ID缺失，请刷新页面后重试"}
-                                                      disabled={mg.recordIds.length === 0}
-                                                      className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium ${mg.payStatus === "已付款" ? "bg-emerald-100 text-emerald-700" : "border border-slate-200 bg-white text-slate-500"} hover:border-sky-300 disabled:cursor-not-allowed disabled:opacity-60`}
-                                                      onClick={(e) => { e.stopPropagation(); if (mg.recordIds.length > 0) setStatusEdit({ key: payKey, recordIds: mg.recordIds, field: "pay" }); }}>
-                                                      {mg.payStatus}
-                                                    </button>
-                                                  )}
-                                                  {mg.shared && <div className="mt-0.5 text-[10px] text-slate-400">整表一笔</div>}
-                                                </td>
-                                              </>
-                                            )}
-                                            <td className="border-x px-2 py-1.5 text-right tabular-nums">{d.collectUnitPrice != null ? fmtNum(d.collectUnitPrice) : "—"}</td>
-                                            <td className="px-2 py-1.5 text-right tabular-nums">{fmtMoney(d.collectAmount)}</td>
-                                            <td className="px-2 py-1.5 text-right tabular-nums text-emerald-600">{fmtMoney(d.collectNet)}</td>
-                                            <td className="px-2 py-1.5 text-center">
-                                              {statusEdit?.key === collectKey && statusEdit.field === "collect" && d.recordId != null ? (
-                                                <div className="flex items-center justify-center gap-1">
-                                                  <button type="button" className="rounded bg-emerald-100 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 hover:bg-emerald-200"
-                                                    onClick={(e) => { e.stopPropagation(); updateStatusMut.mutate({ recordIds: [d.recordId], collectStatus: "已到账" }); }}>已到账</button>
-                                                  <button type="button" className="rounded border border-slate-200 bg-white px-1.5 py-0.5 text-[10px] text-slate-500 hover:bg-slate-100"
-                                                    onClick={(e) => { e.stopPropagation(); updateStatusMut.mutate({ recordIds: [d.recordId], collectStatus: "未到账" }); }}>未到账</button>
-                                                  <button type="button" className="rounded px-1 text-[10px] text-slate-400 hover:text-slate-600"
-                                                    onClick={(e) => { e.stopPropagation(); setStatusEdit(null); }}>取消</button>
-                                                </div>
-                                              ) : (
-                                                <button type="button" title={d.recordId != null ? "点击修改收款状态" : "台账记录ID缺失，请刷新页面后重试"}
-                                                  disabled={d.recordId == null}
-                                                  className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium ${d.collectStatus === "已到账" ? "bg-emerald-100 text-emerald-700" : "border border-slate-200 bg-white text-slate-500"} hover:border-sky-300 disabled:cursor-not-allowed disabled:opacity-60`}
-                                                  onClick={(e) => { e.stopPropagation(); if (d.recordId != null) setStatusEdit({ key: collectKey, recordIds: [d.recordId], field: "collect" }); }}>
-                                                  {d.collectStatus ?? "—"}
-                                                </button>
-                                              )}
-                                            </td>
-                                            <td className="px-2 py-1.5 text-right tabular-nums font-medium text-slate-700">
-                                              {fmtMoney(d.profit ?? (Number(d.collectNet ?? 0) - Number(d.payAmount ?? 0)))}
-                                            </td>
-                                          </tr>
-                                          );
-                                        })}
-                                      </tbody>
-                                    </table>
-                                    {hasSharedMeter && (
-                                      <div className="border-t bg-amber-50/60 px-2 py-1.5 text-[10px] leading-4 text-amber-700">
-                                        共享电表（「所有品牌共用此电表」）：付给场地方只有一整笔 —— 度数＝整表读数，金额＝整表读数 × 场地合同单价；
-                                        各品牌行只显示自己的收款。亏空按电量比例摊在品牌上，但合计就是这一笔付款。
-                                      </div>
+                  {open0 && L0.months.map((r: any) => {
+                    const open = expanded.has(r.key);
+                    // 可展开：多品牌明细，或该月并入了场地级损耗（展开里能看到损耗那一笔）
+                    const canExpand = (r.details?.length ?? 0) > 1 || r.hasLoss;
+                    const showApproval = Number(r.payAmount ?? 0) > 0 && r.payStatus !== "已付款";
+                    const payKey = `pay-${r.key}`;
+                    const collectKey = `collect-${r.key}`;
+                    return (
+                      <Fragment key={r.key}>
+                        <tr className={`xl-l1 ${open ? "xl-open" : ""} ${r.isLoss ? "bg-amber-50/60" : ""}`}>
+                    <td className="xl-freeze xl-ctr" style={{ left: 0 }}>
+                      <div className="pl-3">
+                        {canExpand ? (
+                          <button className="text-slate-400 hover:text-slate-600" onClick={() => toggle(r.key)} title="展开该月各品牌的品牌分摊明细">
+                            {open ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
+                          </button>
+                        ) : (
+                          <span className="text-slate-200">·</span>
+                        )}
+                      </div>
+                    </td>
+                    <td className="xl-freeze text-slate-600" style={{ left: 30 }}>{toDisplay(r.period)}</td>
+                    <td className="xl-freeze text-slate-300" style={{ left: 108 }} title={r.landlordName}>〃</td>
+                    <td className="text-slate-300" title={r.entityName}>〃</td>
+                    <td className="truncate" title={r.meterNo ? `${r.meterName ?? ""} ${r.meterNo}` : r.meterName}>
+                      {r.meterCount > 1 ? (
+                        <span className="text-slate-500">{r.meterCount} 块电表</span>
+                      ) : r.meterNo ? (
+                        <>
+                          <span className="text-slate-700">{r.meterName || "—"}</span>
+                          <div className="font-mono text-[10px] text-slate-400">{r.meterNo}</div>
+                        </>
+                      ) : (
+                        <span className={r.isLoss ? "font-medium text-amber-700" : "text-slate-400"}>{r.meterName}</span>
+                      )}
+                    </td>
+                    <td className="truncate" title={r.brands.join("、")}>
+                      {r.brands.length === 0
+                        ? <span className="xl-muted">—</span>
+                        : r.brands.length === 1
+                          ? r.brands[0]
+                          : <span className="font-medium text-purple-600">{r.brands.length} 个品牌</span>}
+                    </td>
+                    <td className="xl-ctr">
+                      {r.isLoss ? (
+                        <span className="rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700"
+                          title="该场地当月只有损耗、没有电表行（退化显示）">
+                          损耗
+                        </span>
+                      ) : r.rowType === "civil" ? (
+                        <span className="rounded-full bg-slate-200 px-1.5 py-0.5 text-[10px] font-medium text-slate-600"
+                          title="民用电表：无品牌归属、无收款对象，只有付给场地方的成本">民用</span>
+                      ) : (
+                        <span className="rounded-full bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-500">品牌行</span>
+                      )}
+                      {r.hasLoss && !r.isLoss && (
+                        <span className="ml-0.5 rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700"
+                          title={`本行已并入场地级损耗 ${fmtNum(r.lossKwh)} 度 / ${fmtMoney(r.lossPay)}（我方承担：不归主体、不摊品牌）`}>
+                          含损耗
+                        </span>
+                      )}
+                    </td>
+                    <td className="xl-num">{r.transformerRatio != null ? fmtNum(r.transformerRatio) : <span className="xl-muted">—</span>}</td>
+                    <td className="xl-num text-slate-600">
+                      {r.kwh != null ? fmtNum(r.kwh) : <span className="xl-muted">—</span>}
+                      {r.hasLoss && !r.isLoss && (
+                        <div className="text-[9px] font-normal text-amber-600" title="付给场地方的电量 = 各品牌分摊电量 + 场地级损耗">含损耗 {fmtNum(r.lossKwh)}</div>
+                      )}
+                    </td>
+                    <td className="xl-num">{Number(r.payUnitPrice ?? 0) > 0 ? fmtNum(r.payUnitPrice) : <span className="xl-muted">—</span>}</td>
+                    <td className="xl-num xl-neg" title={Number(r.payUnitPrice ?? 0) > 0 ? undefined : "场地合同未填电费单价（付款金额按 0 计）"}>
+                      {fmtMoney(r.payAmount)}
+                      {r.hasLoss && !r.isLoss && (
+                        <div className="text-[9px] font-normal text-amber-600" title="场地级损耗（我方承担）：最终付场地方电量 − 已入台账的各品牌电量">含损耗 {fmtMoney(r.lossPay)}</div>
+                      )}
+                    </td>
+                    <td className="xl-ctr">
+                      {statusEdit?.key === payKey && statusEdit.field === "pay" ? (
+                        <div className="flex flex-wrap items-center justify-center gap-1">
+                          <button type="button" className="rounded bg-emerald-100 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 hover:bg-emerald-200"
+                            onClick={() => updateStatusMut.mutate({ recordIds: r.recordIds, payStatus: "已付款" })}>已付款</button>
+                          <button type="button" className="rounded border border-slate-200 bg-white px-1.5 py-0.5 text-[10px] text-slate-500 hover:bg-slate-100"
+                            onClick={() => updateStatusMut.mutate({ recordIds: r.recordIds, payStatus: "未付款" })}>未付款</button>
+                          <button type="button" className="rounded px-1 text-[10px] text-slate-400 hover:text-slate-600"
+                            onClick={() => setStatusEdit(null)}>取消</button>
+                        </div>
+                      ) : (
+                        <button type="button"
+                          title={r.recordIds.length > 0 ? "点击修改付款状态（共用表：整表一笔，全部品牌一起改）" : "台账记录ID缺失，请刷新页面后重试"}
+                          disabled={r.recordIds.length === 0}
+                          className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium ${r.payStatus === "已付款" ? "bg-emerald-100 text-emerald-700" : "border border-slate-200 bg-white text-slate-500"} hover:border-sky-300 disabled:cursor-not-allowed disabled:opacity-60`}
+                          onClick={() => { if (r.recordIds.length > 0) setStatusEdit({ key: payKey, recordIds: r.recordIds, field: "pay" }); }}>
+                          {r.payStatus}
+                        </button>
+                      )}
+                    </td>
+                    <td className="xl-num">{r.collectUnitPrice != null ? fmtNum(r.collectUnitPrice) : <span className="xl-muted">—</span>}</td>
+                    <td className="xl-num">{fmtMoney(r.collectAmount)}</td>
+                    <td className="xl-num text-emerald-600">{fmtMoney(r.collectNet)}</td>
+                    <td className="xl-num text-slate-500">{fmtMoney(r.elecTax)}</td>
+                    <td className="xl-num font-medium text-slate-700">{fmtMoney(r.profit)}</td>
+                    <td className="xl-ctr">
+                      {statusEdit?.key === collectKey && statusEdit.field === "collect" ? (
+                        <div className="flex items-center justify-center gap-1">
+                          <button type="button" className="rounded bg-emerald-100 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 hover:bg-emerald-200"
+                            onClick={() => updateStatusMut.mutate({ recordIds: r.recordIds, collectStatus: "已到账" })}>已到账</button>
+                          <button type="button" className="rounded border border-slate-200 bg-white px-1.5 py-0.5 text-[10px] text-slate-500 hover:bg-slate-100"
+                            onClick={() => updateStatusMut.mutate({ recordIds: r.recordIds, collectStatus: "未到账" })}>未到账</button>
+                          <button type="button" className="rounded px-1 text-[10px] text-slate-400 hover:text-slate-600"
+                            onClick={() => setStatusEdit(null)}>取消</button>
+                        </div>
+                      ) : (
+                        <button type="button"
+                          title={r.recordIds.length > 0 ? "点击修改收款到账状态" : "台账记录ID缺失，请刷新页面后重试"}
+                          disabled={r.recordIds.length === 0}
+                          className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium ${r.collectStatus === "已到账" ? "bg-emerald-100 text-emerald-700" : r.collectStatus === "部分到账" ? "bg-amber-100 text-amber-700" : "border border-slate-200 bg-white text-slate-500"} hover:border-sky-300 disabled:cursor-not-allowed disabled:opacity-60`}
+                          onClick={() => { if (r.recordIds.length > 0) setStatusEdit({ key: collectKey, recordIds: r.recordIds, field: "collect" }); }}>
+                          {r.collectStatus ?? "—"}
+                        </button>
+                      )}
+                    </td>
+                    <td className="xl-ctr text-[10px] text-slate-400" title={r.dataSource === "manual" ? "人工修正" : r.dataSource === "synced" ? "第三方同步" : r.dataSource === "mixed" ? "部分月人工、部分月第三方" : ""}>
+                      {r.dataSource === "manual" ? "人工" : r.dataSource === "synced" ? "第三方" : r.dataSource === "mixed" ? "混合" : "—"}
+                    </td>
+                    <td className="xl-ctr xl-freeze-r">
+                      <div className="flex items-center justify-center gap-1">
+                        {r.meterNo && (
+                          <button className="rounded border border-slate-200 px-1.5 py-0.5 text-[10px] text-blue-600 hover:bg-blue-50"
+                            title="抄表核对：上月/本月读数、日期、区间度数（可复制文本发给对方核对）"
+                            onClick={() => setReadingTarget({ meterNo: r.meterNo, period: r.period })}>
+                            核对
+                          </button>
+                        )}
+                        {showApproval && (
+                          <button className="rounded border border-rose-200 bg-rose-50 px-1.5 py-0.5 text-[10px] font-medium text-rose-600 hover:bg-rose-100"
+                            title="按「场地 + 主体 + 月份」提交应付电费审批"
+                            onClick={() => setPayElec({ landlordId: Number(r.landlordKey), landlordName: r.landlordName, period: r.period, g: r.rowG })}>
+                            提交审批
+                          </button>
+                        )}
+                      </div>
+                    </td>
+                  </tr>
+                  {open && canExpand && (
+                    <tr className="xl-detail">
+                      <td colSpan={20} className="p-0">
+                        <div className="xl-dtitle">
+                          {toDisplay(r.period)} · {r.landlordName} · {r.meterCount > 1 ? `${r.meterCount} 块电表` : (r.meterName || r.meterNo)} · 品牌分摊明细
+                          <span className="sub">
+                            共用表：付给场地方只有一整笔（{fmtMoney(r.payAmount)}），各品牌只出自己的收款
+                          </span>
+                        </div>
+                        <div className="xl-dwrap">
+                          <table>
+                            <thead>
+                              <tr>
+                                <th style={{ width: 150 }}>品牌方</th>
+                                <th style={{ width: 96 }}>度数(kWh)</th>
+                                <th style={{ width: 92 }}>付款单价</th>
+                                <th style={{ width: 110 }}>付款金额</th>
+                                <th style={{ width: 88 }}>收款单价</th>
+                                <th style={{ width: 110 }}>收款(含税)</th>
+                                <th style={{ width: 106 }}>不含税</th>
+                                <th style={{ width: 92 }}>利润</th>
+                                <th style={{ width: 88 }}>到账</th>
+                                <th style={{ width: 64 }}></th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {/* ★每个品牌各自承担自己的付款成本（付款金额 = 本品牌用电量 × 场地单价），
+                                  不再只把整表一笔画在第一行上 —— 否则看起来像"成本全归了第一个品牌"。 */}
+                              {r.details.map((d: any, i: number) => (
+                                <tr key={`${r.key}-${i}`}>
+                                  <td className={!d.brandName ? "font-medium text-purple-600" : ""}>{d.brandName ?? "全品牌共享（未分摊）"}</td>
+                                  <td className="num">{fmtNum(d.kwh)}</td>
+                                  <td className="num">{Number(d.payUnitPrice ?? 0) > 0 ? fmtNum(d.payUnitPrice) : "—"}</td>
+                                  <td className="num">{fmtMoney(d.payAmount)}</td>
+                                  <td className="num">{d.collectUnitPrice != null ? fmtNum(d.collectUnitPrice) : "—"}</td>
+                                  <td className="num">{fmtMoney(d.collectAmount)}</td>
+                                  <td className="num">{fmtMoney(d.collectNet)}</td>
+                                  <td className="num">{fmtMoney(Number(d.collectNet ?? 0) - Number(d.payAmount ?? 0))}</td>
+                                  <td className="ctr">{d.collectStatus ?? "—"}</td>
+                                  <td className="ctr">
+                                    {d.meterNo && (
+                                      <button className="text-[10px] text-blue-600 hover:underline"
+                                        onClick={() => setReadingTarget({ meterNo: d.meterNo, period: r.period })}>核对</button>
                                     )}
-                                  </div>
-                                )}
-                              </Fragment>
-                            );
-                            })}
-                            </div>
-                          );
-                        })}
+                                  </td>
+                                </tr>
+                              ))}
+                              {r.hasLoss && !r.isLoss && (
+                                <tr className="bg-amber-50/70">
+                                  <td className="font-medium text-amber-700"
+                                    title="场地级损耗 = 最终付场地方电量 − 已入台账的各品牌电量。由我方承担：不摊给品牌、不归报税主体（已并入本行付款金额，不单独占一行）">
+                                    场地级损耗（我方承担）
+                                  </td>
+                                  <td className="num">{fmtNum(r.lossKwh)}</td>
+                                  <td className="num">{Number(r.payUnitPrice ?? 0) > 0 ? fmtNum(r.payUnitPrice) : ""}</td>
+                                  <td className="num">{fmtMoney(r.lossPay)}</td>
+                                  <td className="num">—</td>
+                                  <td className="num">—</td>
+                                  <td className="num">—</td>
+                                  <td className="num">{fmtMoney(-Number(r.lossPay ?? 0))}</td>
+                                  <td className="ctr">—</td>
+                                  <td className="ctr"></td>
+                                </tr>
+                              )}
+                              {/* 合计 = 各品牌明细 + 场地级损耗，应与主表该行的 电量/付款/收款/利润 完全一致 */}
+                              <tr className="xl-dtotal">
+                                <td>合计（{r.brands.length || 1} 个品牌{r.hasLoss && !r.isLoss ? " + 损耗" : ""}）</td>
+                                <td className="num">{fmtNum(r.kwh)}</td>
+                                <td className="num"></td>
+                                <td className="num">{fmtMoney(r.payAmount)}</td>
+                                <td className="num"></td>
+                                <td className="num">{fmtMoney(r.collectAmount)}</td>
+                                <td className="num">{fmtMoney(r.collectNet)}</td>
+                                <td className="num">{fmtMoney(r.profit)}</td>
+                                <td className="ctr"></td>
+                                <td className="ctr"></td>
+                              </tr>
+                            </tbody>
+                          </table>
                         </div>
                       </td>
                     </tr>
                   )}
+                      </Fragment>
+                    );
+                  })}
                 </Fragment>
               );
             })}
           </tbody>
-          {months.length > 0 && (
+          {rows.length > 0 && (
             <tfoot>
-              <tr className="border-t bg-slate-50 font-medium">
-                <td className="px-2 py-2.5" colSpan={2}>区间合计（{months.length} 个月）</td>
-                <td className="px-3 py-2.5 text-right tabular-nums">{fmtNum(totals.kwh)}</td>
-                <td className="px-3 py-2.5 text-right tabular-nums text-rose-600">{fmtMoney(totals.payAmount)}</td>
-                <td className="px-3 py-2.5 text-right tabular-nums">{fmtMoney(totals.collectAmount)}</td>
-                <td className="px-3 py-2.5 text-right tabular-nums text-emerald-600">{fmtMoney(totals.collectNet)}</td>
-                <td className="px-3 py-2.5 text-right tabular-nums">{fmtMoney(totals.elecTax)}</td>
-                <td className="px-3 py-2.5 text-right tabular-nums">{fmtMoney(totals.profit)}</td>
+              <tr>
+                <td className="xl-freeze xl-ctr" style={{ left: 0 }}></td>
+                <td className="xl-freeze" style={{ left: 30 }} colSpan={2}>
+                  合计 · {landlordRows.length} 个场地块 / {periodRows.length} 个场地·月 / {new Set(rows.map((r) => r.meterNo).filter(Boolean)).size} 块表
+                  {rows.some((r) => r.hasLoss) && (
+                    <span className="ml-1 font-normal text-amber-600" title="电量 / 付款金额 已包含场地级损耗（我方承担，不摊品牌）">
+                      （电量/付款含场地损耗）
+                    </span>
+                  )}
+                </td>
+                <td></td>
+                <td></td>
+                <td></td>
+                <td></td>
+                <td></td>
+                <td className="xl-num">{fmtNum(totals.kwh)}</td>
+                <td></td>
+                <td className="xl-num xl-neg">{fmtMoney(totals.payAmount)}</td>
+                <td></td>
+                <td></td>
+                <td className="xl-num">{fmtMoney(totals.collectAmount)}</td>
+                <td className="xl-num text-emerald-600">{fmtMoney(totals.collectNet)}</td>
+                <td className="xl-num text-slate-500">{fmtMoney(totals.elecTax)}</td>
+                <td className="xl-num font-medium">{fmtMoney(totals.profit)}</td>
+                <td></td>
+                <td></td>
+                <td className="xl-freeze-r"></td>
               </tr>
             </tfoot>
           )}
@@ -1060,7 +1663,12 @@ export default function Electricity() {
 
       <p className="text-[11px] text-slate-400">
         口径：电费付款=实际度数×场地合同单价；电费收款=实际度数×品牌方合同单价（按电表品牌匹配）；
-        税费=含税收款−不含税收款；利润=不含税收款−付款。台账由「电表归属/合同/读数」变更自动生成，无需手动操作。
+        税费=含税收款−不含税收款；利润=不含税收款−付款。<br />
+        <b>场地级损耗（我方承担）</b>：= 最终付场地方电量 − 已入台账的各品牌电量（在「场地级对账（损耗）」里录最终电量/金额）。
+        它<b>不单独占一行</b>，而是并入该场地当月那一行的<b>电量 / 付款金额</b>里（行内以橙色小字标注「含损耗」，
+        展开行里能看到这一笔），所以不摊给品牌、也不归任何报税主体。台账由「电表归属/合同/读数」变更自动生成。<br />
+        <b>多月份视图</b>：主表一行 = <b>一个场地 × 主体 × 类型</b>（数值为所选区间合计），点开逐月一行（L1），
+        再点开看该月的品牌分摊明细（L2）；区间只选一个月时默认自动展开。付款/到账状态按月记账，主表只汇总（「已付 1/2」即区间内有月份未付）。
       </p>
 
       {/* 应付电费审批弹窗 */}
@@ -1073,6 +1681,8 @@ export default function Electricity() {
         g={payElec?.g ?? null}
       />
       <ReadingDetailDialog target={readingTarget} onClose={() => setReadingTarget(null)} />
+      {/* ★V5 场地级月度电费对账（录最终电量/金额 → 损耗） */}
+      <LandlordMonthlyDialog open={lmeOpen} period={endPeriod} onClose={() => setLmeOpen(false)} />
     </div>
   );
 }

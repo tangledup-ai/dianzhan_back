@@ -8,6 +8,54 @@
 from ..infra.database import get_connection, get_dict_cursor
 
 
+# ══════════════════════════════════════════════════════════════
+# ★V5：共享表的「品牌绑定清单」（meter_shared_brand_bindings）
+# 语义：这块共享表由哪几个品牌共享。动态月度 + 默认继承上月 + 变动当月生效。
+#   start_period = 从哪个月起算；end_period 为空 = 仍有效（=> 自动沿袭上月，历史可复现）
+# 用途：① 录入分摊时**知道该填哪几个品牌**；② **已绑定但某月漏录 ⇒ 告警**（不自动补）
+# ══════════════════════════════════════════════════════════════
+
+def bind_brands(cur, meter_id: int, month_period: str, brand_ids: list) -> int:
+    """把品牌绑定到该表（幂等：已存在同 (表,品牌,起始月) 就跳过）。调用方负责 commit。"""
+    n = 0
+    for bid in brand_ids or []:
+        if not bid:
+            continue
+        cur.execute(
+            """
+            INSERT INTO meter_shared_brand_bindings (meter_id, brand_id, start_period, data_source)
+            VALUES (%s, %s, %s, 'manual')
+            ON CONFLICT (meter_id, brand_id, start_period) DO NOTHING
+            """,
+            (meter_id, int(bid), month_period),
+        )
+        n += cur.rowcount or 0
+    return n
+
+
+def bound_brands(meter_id: int, month_period: str) -> list:
+    """该表在 month_period 这个月**有效**的绑定品牌（start<=月 且 (end 为空或 end>=月)）。"""
+    conn = get_connection()
+    cur = get_dict_cursor(conn)
+    try:
+        cur.execute(
+            """
+            SELECT b.brand_id, b.start_period, b.end_period, br.name AS brand_name
+            FROM meter_shared_brand_bindings b
+            LEFT JOIN brands br ON br.id = b.brand_id
+            WHERE b.meter_id = %s
+              AND b.start_period <= %s
+              AND (b.end_period IS NULL OR b.end_period >= %s)
+            ORDER BY b.brand_id
+            """,
+            (meter_id, month_period, month_period),
+        )
+        return cur.fetchall()
+    finally:
+        cur.close()
+        conn.close()
+
+
 def list_allocations(address: str = None, month_period: str = None, brand_id: int = None):
     """按条件查分摊行（带品牌名），供录入表单回填与核对展示"""
     conn = get_connection()
@@ -36,9 +84,14 @@ def list_allocations(address: str = None, month_period: str = None, brand_id: in
 
 
 def list_allocations_by_period(month_period: str) -> dict:
-    """取某月全部分摊行，按电表号分组：{address: [row, ...]}
+    """取某月**有应收电费**的分摊行，按电表号分组：{address: [row, ...]}
 
     供台账生成一次查询使用（避免逐表查询）。
+
+    ★只取 collect_amount 非空的行：分摊行现在允许「只录柜数/主体、不录应收电费」
+      （共享表的柜数独立于电费，见 save_shared_allocations）。这类行**不参与电费拆分**，
+      否则会为它生成一条 0 元的电费台账行；其柜数由 shared_meter_cabinets 单独取。
+      未录金额的月份照旧回退「整表读数 × 合同单价」口径。
     """
     conn = get_connection()
     cur = get_dict_cursor(conn)
@@ -48,7 +101,7 @@ def list_allocations_by_period(month_period: str) -> dict:
                    b.name AS brand_name
             FROM meter_shared_allocations a
             LEFT JOIN brands b ON a.brand_id = b.id
-            WHERE a.month_period = %s
+            WHERE a.month_period = %s AND a.collect_amount IS NOT NULL
             ORDER BY a.address, a.brand_id
         """, (month_period,))
         out = {}
@@ -73,7 +126,15 @@ def replace_allocations(address: str, month_period: str, rows: list) -> int:
             "DELETE FROM meter_shared_allocations WHERE address = %s AND month_period = %s",
             (address, month_period),
         )
-        cur.execute("SELECT id FROM meters WHERE meter_no = %s", (address,))
+        cur.execute(
+            """
+            SELECT id FROM meters
+            WHERE meter_no = %s OR device_address = %s
+            ORDER BY (meter_no = %s) DESC NULLS LAST, id
+            LIMIT 1
+            """,
+            (address, address, address),
+        )
         meter = cur.fetchone()
         meter_id = meter["id"] if meter else None
         if meter_id is None and rows:
@@ -88,6 +149,11 @@ def replace_allocations(address: str, month_period: str, rows: list) -> int:
                 meter_id, address, month_period, r["brandId"], r.get("entityId"),
                 r["collectAmount"], r.get("unitPrice"), r.get("cabinetCount"), r.get("remark"),
             ))
+        if meter_id is not None:
+            # ★V5：录入分摊 = 顺带把「这个品牌从这个月起算在这块共享表上」，写入品牌绑定清单。
+            #   这样财务不需要单独维护一份绑定表；绑定清单只增不减（默认继承上月），
+            #   下次录入时系统就能告诉财务「这个月该填哪几个品牌、漏了谁」。
+            bind_brands(cur, meter_id, month_period, [r["brandId"] for r in rows if r.get("brandId")])
         conn.commit()
         return len(rows)
     finally:
@@ -201,9 +267,9 @@ def cabinet_records(landlord_id: int = None, address: str = None) -> dict:
             SELECT a.address, a.brand_id, a.month_period, a.cabinet_count,
                    m.landlord_id, m.entity_id
             FROM meter_shared_allocations a
-            JOIN meters m ON m.meter_no = a.address
+            JOIN meters m ON m.id = a.meter_id
             WHERE a.cabinet_count IS NOT NULL
-              AND m.tag = '共享电表' AND m.brand_id IS NULL
+              AND m.is_shared = TRUE AND m.brand_id IS NULL
               AND m.meter_no NOT LIKE 'TEST%%'
               {where}
             ORDER BY a.address, a.brand_id, a.month_period
@@ -309,7 +375,7 @@ def shared_meter_cabinets(landlord_id: int = None, period: str = None) -> list:
     cur = get_dict_cursor(conn)
     try:
         conditions, values = [
-            "m.tag = '共享电表'", "m.brand_id IS NULL",
+            "m.is_shared = TRUE", "m.brand_id IS NULL",
             "m.landlord_id IS NOT NULL", "m.meter_no NOT LIKE 'TEST%%'",
         ], []
         if landlord_id:
@@ -329,8 +395,8 @@ def shared_meter_cabinets(landlord_id: int = None, period: str = None) -> list:
         cur.execute(f"""
             SELECT a.address, a.brand_id, a.month_period, a.cabinet_count, a.entity_id
             FROM meter_shared_allocations a
-            JOIN meters m2 ON m2.meter_no = a.address
-            WHERE m2.tag = '共享电表' AND m2.brand_id IS NULL
+            JOIN meters m2 ON m2.id = a.meter_id
+            WHERE m2.is_shared = TRUE AND m2.brand_id IS NULL
               AND m2.meter_no NOT LIKE 'TEST%%'
               AND {' AND '.join(ac)}
             ORDER BY a.address, a.brand_id, a.month_period

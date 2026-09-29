@@ -61,7 +61,7 @@ async def overview(request: Request):
                        COUNT(*) FILTER (WHERE EXISTS (
                            SELECT 1 FROM meters m2
                            WHERE m2.landlord_id = t.landlord_id AND m2.brand_id = t.brand_id
-                             AND m2.status = '正常' AND m2.meter_no NOT LIKE 'TEST%'
+                             AND m2.status = 'active' AND m2.meter_no NOT LIKE 'TEST%'
                        )) as active
                 FROM (SELECT DISTINCT landlord_id, brand_id FROM meters
                       WHERE landlord_id IS NOT NULL AND brand_id IS NOT NULL AND meter_no NOT LIKE 'TEST%') t
@@ -73,7 +73,7 @@ async def overview(request: Request):
                        COUNT(*) FILTER (WHERE EXISTS (
                            SELECT 1 FROM meters m2
                            WHERE m2.landlord_id = t.landlord_id AND m2.brand_id = t.brand_id
-                             AND m2.status = '正常' AND m2.meter_no NOT LIKE 'TEST%'
+                             AND m2.status = 'active' AND m2.meter_no NOT LIKE 'TEST%'
                        )) as active
                 FROM (SELECT DISTINCT landlord_id, brand_id FROM meters
                       WHERE landlord_id IS NOT NULL AND brand_id IS NOT NULL AND meter_no NOT LIKE 'TEST%') t
@@ -144,19 +144,19 @@ async def overview(request: Request):
             """)
         elec = cur.fetchone()
 
-        # 总电量（真实表码度数，从 meter_monthly 汇总；v3：电表挂 landlord_id）
+        # 总电量（真实表码度数，从 meter_readings 汇总；v3：电表挂 landlord_id）
         if allowed is not None:
             cur.execute("""
-                SELECT COALESCE(SUM(COALESCE(mm.actual_kwh, ROUND(mm.kwh * COALESCE(m.transformer_ratio, 1), 2))), 0) as total_kwh
-                FROM meter_monthly mm
-                JOIN meters m ON m.meter_no = mm.address AND m.landlord_id IS NOT NULL AND m.brand_id IS NOT NULL
+                SELECT COALESCE(SUM(COALESCE(mm.actual_kwh, ROUND(mm.kwh * COALESCE(mm.transformer_ratio_snapshot, m.transformer_ratio, 1), 2))), 0) as total_kwh
+                FROM meter_readings mm
+                JOIN meters m ON m.id = mm.meter_id AND m.landlord_id IS NOT NULL AND m.brand_id IS NOT NULL
                 WHERE m.meter_no NOT LIKE 'TEST%' AND m.landlord_id = ANY(%s::int[])
             """, (allowed,))
         else:
             cur.execute("""
-                SELECT COALESCE(SUM(COALESCE(mm.actual_kwh, ROUND(mm.kwh * COALESCE(m.transformer_ratio, 1), 2))), 0) as total_kwh
-                FROM meter_monthly mm
-                JOIN meters m ON m.meter_no = mm.address AND m.landlord_id IS NOT NULL AND m.brand_id IS NOT NULL
+                SELECT COALESCE(SUM(COALESCE(mm.actual_kwh, ROUND(mm.kwh * COALESCE(mm.transformer_ratio_snapshot, m.transformer_ratio, 1), 2))), 0) as total_kwh
+                FROM meter_readings mm
+                JOIN meters m ON m.id = mm.meter_id AND m.landlord_id IS NOT NULL AND m.brand_id IS NOT NULL
                 WHERE m.meter_no NOT LIKE 'TEST%'
             """)
         total_kwh = cur.fetchone()["total_kwh"]
@@ -267,9 +267,9 @@ async def overview(request: Request):
                        COALESCE(SUM(e.collect_net), 0) as collect,
                        COALESCE(SUM(e.profit), 0) as profit,
                        COALESCE((
-                           SELECT SUM(COALESCE(mm.actual_kwh, ROUND(mm.kwh * COALESCE(m.transformer_ratio, 1), 2)))
-                           FROM meter_monthly mm
-                           JOIN meters m ON m.meter_no = mm.address AND m.landlord_id IS NOT NULL AND m.brand_id IS NOT NULL
+                           SELECT SUM(COALESCE(mm.actual_kwh, ROUND(mm.kwh * COALESCE(mm.transformer_ratio_snapshot, m.transformer_ratio, 1), 2)))
+                           FROM meter_readings mm
+                           JOIN meters m ON m.id = mm.meter_id AND m.landlord_id IS NOT NULL AND m.brand_id IS NOT NULL
                            WHERE mm.month_period = e.period AND m.meter_no NOT LIKE 'TEST%' AND m.landlord_id = ANY(%s::int[])
                        ), 0) as kwh
                 FROM electricity_records e
@@ -285,9 +285,9 @@ async def overview(request: Request):
                        COALESCE(SUM(e.collect_net), 0) as collect,
                        COALESCE(SUM(e.profit), 0) as profit,
                        COALESCE((
-                           SELECT SUM(COALESCE(mm.actual_kwh, ROUND(mm.kwh * COALESCE(m.transformer_ratio, 1), 2)))
-                           FROM meter_monthly mm
-                           JOIN meters m ON m.meter_no = mm.address AND m.landlord_id IS NOT NULL AND m.brand_id IS NOT NULL
+                           SELECT SUM(COALESCE(mm.actual_kwh, ROUND(mm.kwh * COALESCE(mm.transformer_ratio_snapshot, m.transformer_ratio, 1), 2)))
+                           FROM meter_readings mm
+                           JOIN meters m ON m.id = mm.meter_id AND m.landlord_id IS NOT NULL AND m.brand_id IS NOT NULL
                            WHERE mm.month_period = e.period AND m.meter_no NOT LIKE 'TEST%'
                        ), 0) as kwh
                 FROM electricity_records e
@@ -468,16 +468,16 @@ async def monthly_detail(request: Request, period: str = None):
         # 1) 总电量（v3：电表挂 landlord_id）
         if allowed is not None:
             cur.execute("""
-                SELECT COALESCE(SUM(COALESCE(mm.actual_kwh, ROUND(mm.kwh * COALESCE(m.transformer_ratio, 1), 2))), 0) as kwh
-                FROM meter_monthly mm
-                JOIN meters m ON m.meter_no = mm.address AND m.landlord_id IS NOT NULL AND m.brand_id IS NOT NULL
+                SELECT COALESCE(SUM(COALESCE(mm.actual_kwh, ROUND(mm.kwh * COALESCE(mm.transformer_ratio_snapshot, m.transformer_ratio, 1), 2))), 0) as kwh
+                FROM meter_readings mm
+                JOIN meters m ON m.id = mm.meter_id AND m.landlord_id IS NOT NULL AND m.brand_id IS NOT NULL
                 WHERE mm.month_period = %s AND m.meter_no NOT LIKE 'TEST%%' AND m.landlord_id = ANY(%s::int[])
             """, (month_compact, allowed))
         else:
             cur.execute("""
-                SELECT COALESCE(SUM(COALESCE(mm.actual_kwh, ROUND(mm.kwh * COALESCE(m.transformer_ratio, 1), 2))), 0) as kwh
-                FROM meter_monthly mm
-                JOIN meters m ON m.meter_no = mm.address AND m.landlord_id IS NOT NULL AND m.brand_id IS NOT NULL
+                SELECT COALESCE(SUM(COALESCE(mm.actual_kwh, ROUND(mm.kwh * COALESCE(mm.transformer_ratio_snapshot, m.transformer_ratio, 1), 2))), 0) as kwh
+                FROM meter_readings mm
+                JOIN meters m ON m.id = mm.meter_id AND m.landlord_id IS NOT NULL AND m.brand_id IS NOT NULL
                 WHERE mm.month_period = %s AND m.meter_no NOT LIKE 'TEST%%'
             """, (month_compact,))
         total_kwh = cur.fetchone()["kwh"]
@@ -602,9 +602,9 @@ async def monthly_detail(request: Request, period: str = None):
             LEFT JOIN LATERAL (SELECT COUNT(*) AS cnt FROM cabinets cab WHERE cab.meter_id = m.id) cab ON TRUE
             WHERE m.landlord_id IS NOT NULL AND m.meter_no NOT LIKE 'TEST%%'
               AND (m.brand_id IS NOT NULL
-                   OR (m.tag = '共享电表' AND m.brand_id IS NULL AND NOT EXISTS (
+                   OR (m.is_shared = TRUE AND m.brand_id IS NULL AND NOT EXISTS (
                          SELECT 1 FROM meter_shared_allocations sa
-                         WHERE sa.address = m.meter_no AND sa.cabinet_count IS NOT NULL)))
+                         WHERE sa.meter_id = m.id AND sa.cabinet_count IS NOT NULL)))
               {'AND m.landlord_id = ANY(%s::int[])' if allowed is not None else ''}
             GROUP BY m.landlord_id, m.entity_id, m.brand_id
         """, (allowed,) if allowed is not None else ())
@@ -851,10 +851,10 @@ async def station_board(request: Request, landlordId: int = None, keyword: str =
                 placeholders = ",".join(["%s"] * len(meter_nos))
                 cur.execute(f"""
                     SELECT m.brand_id, b.name as brand_name,
-                           COALESCE(SUM(COALESCE(mm.actual_kwh, ROUND(mm.kwh * COALESCE(m.transformer_ratio, 1), 2))), 0) as kwh,
+                           COALESCE(SUM(COALESCE(mm.actual_kwh, ROUND(mm.kwh * COALESCE(mm.transformer_ratio_snapshot, m.transformer_ratio, 1), 2))), 0) as kwh,
                            COUNT(DISTINCT m.id) as meter_count
-                    FROM meter_monthly mm
-                    JOIN meters m ON m.meter_no = mm.address AND m.landlord_id IS NOT NULL AND m.brand_id IS NOT NULL
+                    FROM meter_readings mm
+                    JOIN meters m ON m.id = mm.meter_id AND m.landlord_id IS NOT NULL AND m.brand_id IS NOT NULL
                     LEFT JOIN brands b ON m.brand_id = b.id
                     WHERE mm.address IN ({placeholders}) AND mm.month_period = %s
                     GROUP BY m.brand_id, b.name
@@ -902,10 +902,10 @@ async def station_board(request: Request, landlordId: int = None, keyword: str =
                 _month_period = period.replace("-", "")
                 cur.execute("""
                     SELECT m.id, m.meter_no, m.entity_id,
-                           COALESCE(mm.actual_kwh, ROUND(mm.kwh * COALESCE(m.transformer_ratio, 1), 2)) AS kwh
+                           COALESCE(mm.actual_kwh, ROUND(mm.kwh * COALESCE(mm.transformer_ratio_snapshot, m.transformer_ratio, 1), 2)) AS kwh
                     FROM meters m
-                    LEFT JOIN meter_monthly mm ON mm.address = m.meter_no AND mm.month_period = %s
-                    WHERE m.landlord_id = %s AND m.tag = '共享电表' AND m.brand_id IS NULL
+                    LEFT JOIN meter_readings mm ON mm.meter_id = m.id AND mm.month_period = %s
+                    WHERE m.landlord_id = %s AND m.is_shared = TRUE AND m.brand_id IS NULL
                       AND m.meter_no NOT LIKE 'TEST%%'
                     ORDER BY m.id
                 """, (_month_period, lid))
@@ -915,8 +915,9 @@ async def station_board(request: Request, landlordId: int = None, keyword: str =
                     total_kwh += full
                     allocs = _alloc_by_meter.get(sm["meter_no"]) or []
                     if allocs:
-                        # 品牌倒推电量合计 → 亏空按电量比例摊入各品牌付款电量（与台账完全一致）
-                        picked, alloc_sum = [], 0.0
+                        # ★V5：各品牌只承担【自己倒推的电量】——不再乘损耗系数
+                        #   （场地级的损耗已包含在上面 total_kwh × 单价 的成本里，不摊给品牌）
+                        picked = []
                         for a in allocs:
                             eid_a = a.get("entity_id") or sm.get("entity_id")
                             price_a = a.get("unit_price")
@@ -925,19 +926,26 @@ async def station_board(request: Request, landlordId: int = None, keyword: str =
                                 price_a = info_a["price"] if info_a else None
                             kwh_a = round(float(a.get("collect_amount") or 0) / float(price_a), 2) if price_a else 0.0
                             picked.append((a, eid_a, kwh_a))
-                            alloc_sum += kwh_a
-                        scale = (full / alloc_sum) if (full > 0 and alloc_sum > 0) else 1.0
                         for a, eid_a, kwh_a in picked:
                             _merge_brand_row(a["brand_id"], a.get("brand_name"), eid_a,
-                                             round(kwh_a * scale, 2),
+                                             kwh_a,
                                              float(a.get("collect_amount") or 0))
                     else:
                         # 未录分摊：整表电量归「全品牌共享」行，收款走全品牌合同单价
                         _merge_brand_row(None, "全品牌共享", sm.get("entity_id"), full)
                 station_breakdown.sort(key=lambda x: -float(x.get("kwh") or 0))
 
-            # 电费成本 = 付款口径总电量（含共享表整表读数）× 场地合同电费单价
-            elec_pay = total_kwh * elec_pay_price if elec_pay_price else 0
+            # 电费成本 = 付款口径总电量（含共用表整表读数）× 场地合同电费单价
+            # ★V5：加上场地级损耗（final − Σ表；我方承担）—— 与分红/台账口径一致
+            _loss_amt = 0.0
+            cur.execute(
+                "SELECT loss_amount FROM landlord_monthly_elec WHERE landlord_id = %s AND period = %s",
+                (lid, str(period).replace("-", "")),
+            )
+            _lr = cur.fetchone()
+            if _lr and _lr.get("loss_amount") is not None:
+                _loss_amt = float(_lr["loss_amount"])
+            elec_pay = round((total_kwh * elec_pay_price if elec_pay_price else 0) + _loss_amt, 2)
 
             # 电费收入（#2 统一口径：品牌各算各的；共享表品牌分摊以人工录入金额为准，
             # 收入统一为不含税（启用税率的品牌 split_tax 拆分），与台账/分红一致）
@@ -1165,9 +1173,9 @@ async def landlord_trends(request: Request, landlordId: int, months: int = 6):
         # 从meter_monthly获取按月度数（按 月×品牌 拆分，供按品牌计收）
         cur.execute("""
             SELECT mm.month_period, m.brand_id,
-                   COALESCE(SUM(COALESCE(mm.actual_kwh, ROUND(mm.kwh * COALESCE(m.transformer_ratio, 1), 2))), 0) as kwh
-            FROM meter_monthly mm
-            JOIN meters m ON m.meter_no = mm.address AND m.landlord_id IS NOT NULL AND m.brand_id IS NOT NULL
+                   COALESCE(SUM(COALESCE(mm.actual_kwh, ROUND(mm.kwh * COALESCE(mm.transformer_ratio_snapshot, m.transformer_ratio, 1), 2))), 0) as kwh
+            FROM meter_readings mm
+            JOIN meters m ON m.id = mm.meter_id AND m.landlord_id IS NOT NULL AND m.brand_id IS NOT NULL
             WHERE m.landlord_id = %s AND m.meter_no NOT LIKE 'TEST%%'
             GROUP BY mm.month_period, m.brand_id
             ORDER BY mm.month_period DESC
@@ -1261,9 +1269,9 @@ async def landlord_station_monthly(request: Request, landlordId: int, months: in
         cur.execute("""
             SELECT DISTINCT a.brand_id, b.name AS brand_name
             FROM meter_shared_allocations a
-            JOIN meters m ON m.meter_no = a.address
+            JOIN meters m ON m.id = a.meter_id
             LEFT JOIN brands b ON b.id = a.brand_id
-            WHERE m.landlord_id = %s AND m.tag = '共享电表' AND m.brand_id IS NULL
+            WHERE m.landlord_id = %s AND m.is_shared = TRUE AND m.brand_id IS NULL
               AND a.brand_id IS NOT NULL
         """, (landlordId,))
         _known_bids = {b["brand_id"] for b in brands}
@@ -1298,9 +1306,9 @@ async def landlord_station_monthly(request: Request, landlordId: int, months: in
         # 获取近N个月的度数（按 品牌×月 拆分，供按品牌计收）
         cur.execute("""
             SELECT m.brand_id, mm.month_period,
-                   COALESCE(SUM(COALESCE(mm.actual_kwh, ROUND(mm.kwh * COALESCE(m.transformer_ratio, 1), 2))), 0) as kwh
-            FROM meter_monthly mm
-            JOIN meters m ON m.meter_no = mm.address AND m.landlord_id IS NOT NULL AND m.brand_id IS NOT NULL
+                   COALESCE(SUM(COALESCE(mm.actual_kwh, ROUND(mm.kwh * COALESCE(mm.transformer_ratio_snapshot, m.transformer_ratio, 1), 2))), 0) as kwh
+            FROM meter_readings mm
+            JOIN meters m ON m.id = mm.meter_id AND m.landlord_id IS NOT NULL AND m.brand_id IS NOT NULL
             WHERE m.landlord_id = %s AND m.meter_no NOT LIKE 'TEST%%'
             GROUP BY m.brand_id, mm.month_period
             ORDER BY mm.month_period DESC
@@ -1320,16 +1328,17 @@ async def landlord_station_monthly(request: Request, landlordId: int, months: in
             cell["kwh"] += float(r["kwh"] or 0)
             cell["own_kwh"] += float(r["kwh"] or 0)
 
-        # ── 共享电表（场地总表）并入：品牌方在这类表下没有自己的电表，电量只能取分摊行倒推；
-        #    付款按整表读数摊入（亏空/线损我方承担），与台账/分红同口径。未录分摊的表不归任何品牌。
+        # ── 共用表（所有品牌共用一个表）并入：品牌方在这类表下没有自己的电表，电量只能取分摊行倒推。
+        #    ★V5：品牌付款电量 = 自己倒推的电量（**不摊损耗**）；损耗是场地级的，由我方承担，
+        #    已包含在场地级成本（Σ场地所有表读数 × 场地单价）里，见电费台账的「损耗行」。
         from ..repositories import shared_allocation_repo as _shared_repo
         from ..domain.electricity_pricing import brand_price_for as _brand_price_for
         cur.execute("""
             SELECT m.meter_no, m.entity_id, mm.month_period,
-                   COALESCE(mm.actual_kwh, ROUND(mm.kwh * COALESCE(m.transformer_ratio, 1), 2)) AS kwh
+                   COALESCE(mm.actual_kwh, ROUND(mm.kwh * COALESCE(mm.transformer_ratio_snapshot, m.transformer_ratio, 1), 2)) AS kwh
             FROM meters m
-            LEFT JOIN meter_monthly mm ON mm.address = m.meter_no
-            WHERE m.landlord_id = %s AND m.tag = '共享电表' AND m.brand_id IS NULL
+            LEFT JOIN meter_readings mm ON mm.meter_id = m.id
+            WHERE m.landlord_id = %s AND m.is_shared = TRUE AND m.brand_id IS NULL
               AND m.meter_no NOT LIKE 'TEST%%'
         """, (landlordId,))
         shared_full: dict = {}   # (meter_no, month_period) -> 整表实际用电量
@@ -1345,20 +1354,18 @@ async def landlord_station_monthly(request: Request, landlordId: int, months: in
                     alloc_by_meter_month.setdefault(
                         (a["address"], str(a["month_period"])), []).append(a)
             for (addr, mp), allocs in alloc_by_meter_month.items():
-                full = shared_full.get((addr, mp), 0.0)
-                picked, alloc_sum = [], 0.0
+                picked = []
                 for a in allocs:
                     eid_a = a.get("entity_id") or shared_meta.get(addr)
                     info_a = _brand_price_for(pricing, a["brand_id"], eid_a)
                     price_a = a.get("unit_price") or (info_a["price"] if info_a else None)
                     kwh_a = round(float(a.get("collect_amount") or 0) / float(price_a), 2) if price_a else 0.0
                     picked.append((a, kwh_a))
-                    alloc_sum += kwh_a
-                scale = (full / alloc_sum) if (full > 0 and alloc_sum > 0) else 1.0
+                # ★V5：品牌成本只按【自己倒推的电量】计，不再乘损耗系数（损耗由我方承担，不摊给品牌）
                 for a, kwh_a in picked:
                     cell = month_map.setdefault(mp, {}).setdefault(
                         a["brand_id"], {"kwh": 0.0, "own_kwh": 0.0, "alloc_amount": None})
-                    cell["kwh"] += round(kwh_a * scale, 2)
+                    cell["kwh"] += kwh_a
                     cell["alloc_amount"] = round(
                         float(cell["alloc_amount"] or 0) + float(a.get("collect_amount") or 0), 2)
 
@@ -1502,6 +1509,8 @@ async def entity_monthly(request: Request, period: str = None):
         acc: dict = {}
 
         # 1) 电费（台账行自带 entity_id）
+        #    ★V5：损耗行（row_type='loss'）**不归任何主体** —— 主体视图只看收入报税，
+        #    成本里的损耗属于整个场地，不能摊进某个主体（否则主体成本虚高）
         cur.execute(f"""
             SELECT COALESCE(entity_id, 0) AS eid_key, entity_id,
                    COALESCE(SUM(pay_kwh), 0) AS kwh,
@@ -1509,7 +1518,7 @@ async def entity_monthly(request: Request, period: str = None):
                    COALESCE(SUM(collect_amount), 0) AS collect_amount,
                    COALESCE(SUM(collect_net), 0) AS collect_net
             FROM electricity_records
-            WHERE period = %s{scope_cond}
+            WHERE period = %s AND COALESCE(row_type, 'normal') <> 'loss'{scope_cond}
             GROUP BY entity_id
         """, (period, *scope_vals))
         elec_rows = cur.fetchall()
@@ -1523,9 +1532,9 @@ async def entity_monthly(request: Request, period: str = None):
             LEFT JOIN LATERAL (SELECT COUNT(*) AS cnt FROM cabinets cab WHERE cab.meter_id = m.id) cab ON TRUE
             WHERE m.landlord_id IS NOT NULL AND m.meter_no NOT LIKE 'TEST%%'
               AND (m.brand_id IS NOT NULL
-                   OR (m.tag = '共享电表' AND m.brand_id IS NULL AND NOT EXISTS (
+                   OR (m.is_shared = TRUE AND m.brand_id IS NULL AND NOT EXISTS (
                          SELECT 1 FROM meter_shared_allocations sa
-                         WHERE sa.address = m.meter_no AND sa.cabinet_count IS NOT NULL))){scope_cond.replace('landlord_id', 'm.landlord_id')}
+                         WHERE sa.meter_id = m.id AND sa.cabinet_count IS NOT NULL))){scope_cond.replace('landlord_id', 'm.landlord_id')}
             GROUP BY m.landlord_id, m.entity_id, m.brand_id
         """, tuple(scope_vals))
         weight_rows = cur.fetchall()

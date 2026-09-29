@@ -56,16 +56,16 @@ async def snapshot(user: dict = Depends(get_current_user)):
         # 异常场地数（当月电量低于平均值50%的场地；v3：按 landlord_id 分组）
         cur.execute("""
             WITH station_avg AS (
-                SELECT m.landlord_id, AVG(COALESCE(mm.actual_kwh, mm.kwh * COALESCE(m.transformer_ratio, 1))) as avg_kwh
-                FROM meter_monthly mm
-                JOIN meters m ON m.meter_no = mm.address AND m.landlord_id IS NOT NULL AND m.brand_id IS NOT NULL
+                SELECT m.landlord_id, AVG(COALESCE(mm.actual_kwh, mm.kwh * COALESCE(mm.transformer_ratio_snapshot, m.transformer_ratio, 1))) as avg_kwh
+                FROM meter_readings mm
+                JOIN meters m ON m.id = mm.meter_id AND m.landlord_id IS NOT NULL AND m.brand_id IS NOT NULL
                 WHERE mm.kwh > 0 AND m.meter_no NOT LIKE 'TEST%%'
                 GROUP BY m.landlord_id
             ),
             station_current AS (
-                SELECT m.landlord_id, SUM(COALESCE(mm.actual_kwh, ROUND(mm.kwh * COALESCE(m.transformer_ratio, 1), 2))) as current_kwh
-                FROM meter_monthly mm
-                JOIN meters m ON m.meter_no = mm.address AND m.landlord_id IS NOT NULL AND m.brand_id IS NOT NULL
+                SELECT m.landlord_id, SUM(COALESCE(mm.actual_kwh, ROUND(mm.kwh * COALESCE(mm.transformer_ratio_snapshot, m.transformer_ratio, 1), 2))) as current_kwh
+                FROM meter_readings mm
+                JOIN meters m ON m.id = mm.meter_id AND m.landlord_id IS NOT NULL AND m.brand_id IS NOT NULL
                 WHERE mm.month_period = %s AND m.meter_no NOT LIKE 'TEST%%'
                 GROUP BY m.landlord_id
             )
@@ -79,9 +79,9 @@ async def snapshot(user: dict = Depends(get_current_user)):
         # ── 2. 电量统计（v3：电表直接挂 landlord_id/brand_id，无需经 stations）──────
         # 本月
         cur.execute("""
-            SELECT COALESCE(SUM(COALESCE(mm.actual_kwh, ROUND(mm.kwh * COALESCE(m.transformer_ratio, 1), 2))), 0) as total
-            FROM meter_monthly mm
-            JOIN meters m ON m.meter_no = mm.address AND m.landlord_id IS NOT NULL AND m.brand_id IS NOT NULL
+            SELECT COALESCE(SUM(COALESCE(mm.actual_kwh, ROUND(mm.kwh * COALESCE(mm.transformer_ratio_snapshot, m.transformer_ratio, 1), 2))), 0) as total
+            FROM meter_readings mm
+            JOIN meters m ON m.id = mm.meter_id AND m.landlord_id IS NOT NULL AND m.brand_id IS NOT NULL
             WHERE mm.month_period = %s AND m.meter_no NOT LIKE 'TEST%%'
         """, (current_month.replace("-", ""),))
         month_kwh = float(cur.fetchone()["total"])
@@ -91,27 +91,27 @@ async def snapshot(user: dict = Depends(get_current_user)):
         quarter_start = f"{current_year}{(quarter - 1) * 3 + 1:02d}"
         quarter_end = f"{current_year}{quarter * 3:02d}"
         cur.execute("""
-            SELECT COALESCE(SUM(COALESCE(mm.actual_kwh, ROUND(mm.kwh * COALESCE(m.transformer_ratio, 1), 2))), 0) as total
-            FROM meter_monthly mm
-            JOIN meters m ON m.meter_no = mm.address AND m.landlord_id IS NOT NULL AND m.brand_id IS NOT NULL
+            SELECT COALESCE(SUM(COALESCE(mm.actual_kwh, ROUND(mm.kwh * COALESCE(mm.transformer_ratio_snapshot, m.transformer_ratio, 1), 2))), 0) as total
+            FROM meter_readings mm
+            JOIN meters m ON m.id = mm.meter_id AND m.landlord_id IS NOT NULL AND m.brand_id IS NOT NULL
             WHERE mm.month_period >= %s AND mm.month_period <= %s AND m.meter_no NOT LIKE 'TEST%%'
         """, (quarter_start, quarter_end))
         quarter_kwh = float(cur.fetchone()["total"])
 
         # 本年
         cur.execute("""
-            SELECT COALESCE(SUM(COALESCE(mm.actual_kwh, ROUND(mm.kwh * COALESCE(m.transformer_ratio, 1), 2))), 0) as total
-            FROM meter_monthly mm
-            JOIN meters m ON m.meter_no = mm.address AND m.landlord_id IS NOT NULL AND m.brand_id IS NOT NULL
+            SELECT COALESCE(SUM(COALESCE(mm.actual_kwh, ROUND(mm.kwh * COALESCE(mm.transformer_ratio_snapshot, m.transformer_ratio, 1), 2))), 0) as total
+            FROM meter_readings mm
+            JOIN meters m ON m.id = mm.meter_id AND m.landlord_id IS NOT NULL AND m.brand_id IS NOT NULL
             WHERE mm.month_period >= %s AND mm.month_period <= %s AND m.meter_no NOT LIKE 'TEST%%'
         """, (f"{current_year}01", f"{current_year}12"))
         year_kwh = float(cur.fetchone()["total"])
 
         # 月度趋势（当年每月）
         cur.execute("""
-            SELECT mm.month_period, COALESCE(SUM(COALESCE(mm.actual_kwh, ROUND(mm.kwh * COALESCE(m.transformer_ratio, 1), 2))), 0) as kwh
-            FROM meter_monthly mm
-            JOIN meters m ON m.meter_no = mm.address AND m.landlord_id IS NOT NULL AND m.brand_id IS NOT NULL
+            SELECT mm.month_period, COALESCE(SUM(COALESCE(mm.actual_kwh, ROUND(mm.kwh * COALESCE(mm.transformer_ratio_snapshot, m.transformer_ratio, 1), 2))), 0) as kwh
+            FROM meter_readings mm
+            JOIN meters m ON m.id = mm.meter_id AND m.landlord_id IS NOT NULL AND m.brand_id IS NOT NULL
             WHERE mm.month_period >= %s AND mm.month_period <= %s AND m.meter_no NOT LIKE 'TEST%%'
             GROUP BY mm.month_period
             ORDER BY mm.month_period
@@ -165,9 +165,9 @@ async def snapshot(user: dict = Depends(get_current_user)):
 
         # 获取每个场地的最新月度电量（v3：按 landlord_id 分组）
         cur.execute("""
-            SELECT m.landlord_id, SUM(COALESCE(mm.actual_kwh, ROUND(mm.kwh * COALESCE(m.transformer_ratio, 1), 2))) as kwh
-            FROM meter_monthly mm
-            JOIN meters m ON m.meter_no = mm.address AND m.landlord_id IS NOT NULL AND m.brand_id IS NOT NULL
+            SELECT m.landlord_id, SUM(COALESCE(mm.actual_kwh, ROUND(mm.kwh * COALESCE(mm.transformer_ratio_snapshot, m.transformer_ratio, 1), 2))) as kwh
+            FROM meter_readings mm
+            JOIN meters m ON m.id = mm.meter_id AND m.landlord_id IS NOT NULL AND m.brand_id IS NOT NULL
             WHERE mm.month_period = %s AND m.meter_no NOT LIKE 'TEST%%'
             GROUP BY m.landlord_id
         """, (current_month.replace("-", ""),))
@@ -175,9 +175,9 @@ async def snapshot(user: dict = Depends(get_current_user)):
 
         # 获取每个场地的历史平均电量（v3：按 landlord_id 分组）
         cur.execute("""
-            SELECT m.landlord_id, AVG(COALESCE(mm.actual_kwh, mm.kwh * COALESCE(m.transformer_ratio, 1))) as avg_kwh
-            FROM meter_monthly mm
-            JOIN meters m ON m.meter_no = mm.address AND m.landlord_id IS NOT NULL AND m.brand_id IS NOT NULL
+            SELECT m.landlord_id, AVG(COALESCE(mm.actual_kwh, mm.kwh * COALESCE(mm.transformer_ratio_snapshot, m.transformer_ratio, 1))) as avg_kwh
+            FROM meter_readings mm
+            JOIN meters m ON m.id = mm.meter_id AND m.landlord_id IS NOT NULL AND m.brand_id IS NOT NULL
             WHERE mm.kwh > 0 AND m.meter_no NOT LIKE 'TEST%'
             GROUP BY m.landlord_id
         """)
@@ -210,7 +210,7 @@ async def snapshot(user: dict = Depends(get_current_user)):
                    SUM(GREATEST(1, (SELECT COUNT(*) FROM cabinets cab WHERE cab.meter_id = m.id))) AS cnt
             FROM meters m
             WHERE m.landlord_id IS NOT NULL
-              AND (m.brand_id IS NOT NULL OR m.tag = '共享电表')
+              AND (m.brand_id IS NOT NULL OR m.is_shared = TRUE)
               AND m.meter_no NOT LIKE 'TEST%'
             GROUP BY m.landlord_id, m.brand_id
         """)

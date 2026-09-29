@@ -172,7 +172,7 @@ async def monthly_ledger(request: Request, period: str = Query(..., description=
                    GREATEST(1, (SELECT COUNT(*) FROM cabinets cab WHERE cab.meter_id = m.id)) AS cabs
             FROM meters m
             WHERE m.landlord_id IS NOT NULL
-              AND m.brand_id IS NULL AND m.tag = '共享电表'
+              AND m.brand_id IS NULL AND m.is_shared = TRUE
               AND m.meter_no NOT LIKE 'TEST%'
         """)
         shared_meters = cur.fetchall()
@@ -199,6 +199,9 @@ async def monthly_ledger(request: Request, period: str = Query(..., description=
     shared_cab_month = shared_allocation_repo.cabinet_usage_by_month(
         periods=[f"{y}{mm:02d}" for mm in range(1, 13)]
     )
+    # ★V5：柜数月度快照（优先口径；该月没生成过台账则无快照 → 上方回退实时）
+    from ..domain.cabinet_snapshot import snapshot_cabinet_totals as _snap_totals
+    snap_cabs_by_month = {f"{y}{mm:02d}": _snap_totals(f"{y}{mm:02d}") for mm in range(1, 13)}
     shared_recorded = set(shared_allocation_repo.cabinet_records().keys())
     # 完全没录过柜数的共享表 → 整表至少 1 柜，归 brand_id=None 组兜底
     for r in shared_meters:
@@ -227,11 +230,18 @@ async def monthly_ledger(request: Request, period: str = Query(..., description=
     def _live_cabs(lid, bid, ym: str = None) -> float:
         """(场地, 品牌) 的计费柜数；未匹配到电表为 0（不落快照兜底）。
 
-        柜数两条来源相加：有品牌电表数 cabinets；共享电表取分摊行人工录入值（按月取值，
-        需传 ym——柜数逐月可调）。bid=None 表示全品牌合同 → 对应场地内共享电表兜底组。
+        ★V5：传了 ym 且该月有【柜数快照】时优先读快照（快照已按
+        "加柜本月生效/减柜下月生效" 规则算好，含共用表分摊行人工录入值，
+        且排除了无品牌归属的柜子）；该月无快照（尚未生成台账）→ 回退实时口径。
+        柜数两条实时来源相加：有品牌电表数 cabinets；共享电表取分摊行人工录入值（按月）。
+        bid=None 表示全品牌合同 → 对应场地内共享电表兜底组（快照不含该组，走实时）。
         """
         if lid is None:
             return 0.0
+        if ym and bid is not None:
+            snap = (snap_cabs_by_month.get(str(ym)) or {}).get(lid)
+            if snap is not None:
+                return float(snap.get(bid, 0.0))
         cabs = float(live_brand_cabs.get(lid, {}).get(bid, 0.0))
         if ym and bid is not None:
             cabs += float((shared_cab_month.get(lid) or {}).get(str(ym), {}).get(bid, 0.0))
@@ -487,7 +497,7 @@ async def monthly_ledger(request: Request, period: str = Query(..., description=
                 SELECT m.landlord_id AS lid, m.brand_id AS bid, ent.name AS entity_name
                 FROM meters m JOIN entities ent ON ent.id = m.entity_id
                 WHERE m.meter_no NOT LIKE 'TEST%%'
-                  AND (m.brand_id IS NOT NULL OR m.tag = '共享电表')
+                  AND (m.brand_id IS NOT NULL OR m.is_shared = TRUE)
                 GROUP BY m.landlord_id, m.brand_id, ent.name
             """)
             for r in cur2.fetchall():

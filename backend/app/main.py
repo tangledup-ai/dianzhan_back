@@ -171,7 +171,7 @@ async def monthly_kwh_status():
     cur = get_dict_cursor(conn)
     try:
         cur.execute("""
-            SELECT COUNT(*) as cnt FROM meter_monthly
+            SELECT COUNT(*) as cnt FROM meter_readings
             WHERE synced_at >= date_trunc('month', CURRENT_DATE)
         """)
         row = cur.fetchone()
@@ -214,8 +214,8 @@ async def get_meter_monthly(address: str = None, month: str = None, request: Req
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         cur.execute(f"""
             SELECT mm.address, mm.month_period, mm.kwh, mm.synced_at
-            FROM meter_monthly mm
-            LEFT JOIN meters m ON m.meter_no = mm.address
+            FROM meter_readings mm
+            LEFT JOIN meters m ON m.id = mm.meter_id
             {where}
             ORDER BY mm.month_period DESC, mm.address
         """, values)
@@ -275,7 +275,7 @@ async def import_meters_from_third_party():
             # 插入 meters 表
             cur.execute("""
                 INSERT INTO meters (brand_id, landlord_id, meter_no, meter_name, collector_id, transformer_ratio, tag, status)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, '正常')
+                VALUES (%s, %s, %s, %s, %s, %s, %s, 'active')   -- ★V5：meters.status 取值改 active/inactive/removed
             """, (brand_id, None, d["address"], desc, d["collector_id"], d["rate"], meter_tag))
             imported += 1
 

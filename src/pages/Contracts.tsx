@@ -293,7 +293,8 @@ export default function Contracts() {
     };
     for (const m of metersQ.data ?? []) {
       if (!m.landlordId || m.entityId == null) continue;
-      if (!(m.brandId != null || m.tag === "共享电表")) continue;
+      // ★V5：是不是共用表读表级 isShared（大类只剩「分给哪个财务管」，不再承载是否共用）
+      if (!(m.brandId != null || m.isShared)) continue;
       if (String(m.meterNo || "").startsWith("TEST")) continue;
       // 已按品牌录柜数的共享表：柜数由分摊行提供（下方单独统计），此处跳过避免双算
       if (m.brandId == null && allocManagedMeterIds(sharedCabIndex.get(m.landlordId)).has(m.id)) continue;
@@ -900,7 +901,8 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
     // 找到匹配的电表（已按品牌录柜数的共享表交给分摊行数据统计）
     const matchedMeters = (meters.data ?? []).filter((m: any) =>
       m.landlordId === Number(f.landlordId)
-      && (isShared ? (!m.brandId && m.tag === "共享电表") : m.brandId === Number(f.brandId))
+      // ★V5：共用表按表级 isShared 判定（与后端 shared_meter_cabinets 同口径），不再看大类
+      && (isShared ? (!m.brandId && m.isShared) : m.brandId === Number(f.brandId))
       && !String(m.meterNo || "").startsWith("TEST")
       && !(m.brandId == null && allocMeters.has(m.id))
     );
@@ -914,6 +916,21 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
     const base = matchedMeters.reduce((sum: number, m: any) => sum + Math.max(1, cabByMeter.get(m.id) || 0), 0);
     return base + sharedCabsOf(sharedItems, isShared ? null : Number(f.brandId));
   }, [f.landlordId, f.brandId, f.contractType, meters.data, cabinets.data, sharedCabIndexF]);
+
+  // 「计费柜数 · 去修改」跳转智慧电表页：
+  // 该品牌在本场地**有自己的电表** → 按品牌筛选定位到那些表；
+  // 该品牌在本场地**没有自己的电表**（柜数全部来自「全品牌共用」的共享表，见上方 sharedCabsOf）
+  // → 必须跳「共用表」，否则 Meters 页按品牌筛选会一块表都匹配不到 ⇒ 页面信息空白（本次修复的 bug）。
+  const goEditCabinets = () => {
+    const lid = Number(f.landlordId);
+    const hasOwnMeter = !!f.brandId && (meters.data ?? []).some(
+      (m: any) => m.landlordId === lid && m.brandId === Number(f.brandId),
+    );
+    const brandParam = !f.brandId || !hasOwnMeter ? "shared" : f.brandId;
+    // highlight=cabinet：Meters 页据此自动展开目标电表并滚到「品牌分摊」
+    onClose();
+    window.location.href = `/meters?landlord=${f.landlordId}&brand=${brandParam}&highlight=cabinet`;
+  };
 
   // 该场地下所有收入合同（品牌方合同）的计费柜数总和（实时：与品牌方合同行同口径，
   // 优先后端实时统计 liveCabinetsCount，电表归属变更后自动跟随；存储 cabinetsCount 仅兜底）
@@ -951,7 +968,7 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
     const sharedItems = sharedCabIndexF.get(landlordId);
     const allocMeters = allocManagedMeterIds(sharedItems);
     const siteMeters = (meters.data ?? []).filter(
-      (m: any) => m.landlordId === landlordId && (m.brandId != null || m.tag === "共享电表")
+      (m: any) => m.landlordId === landlordId && (m.brandId != null || m.isShared)
         && !String(m.meterNo || "").startsWith("TEST")
         && !(m.brandId == null && allocMeters.has(m.id))
     );
@@ -1358,7 +1375,7 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
                           <button
                             type="button"
                             className="inline-flex items-center gap-0.5 text-emerald-600 hover:text-emerald-700 hover:underline"
-                            onClick={() => { onClose(); window.location.href = `/meters?landlord=${f.landlordId}&brand=${f.brandId || "shared"}&highlight=cabinet`; }}
+                            onClick={goEditCabinets}
                           >
                             去修改 <ExternalLink className="h-3 w-3" />
                           </button>

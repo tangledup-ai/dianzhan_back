@@ -2,8 +2,12 @@
 
 > **用途**：你在任意页面看到任意一个数字，用这份文档可以查到 —— 它由哪个接口返回、后端哪个函数算的、最终落到哪张表的哪一列、中间经过了什么公式或口径。
 >
-> **代码基线**：工作区当前版本（v3 口径，`stations` 站点层已下线）。文中行号对应当前工作副本，代码改动后会漂移，但**文件路径 + 函数名**是稳定锚点。
-> **生成时间**：2026-09-23
+> **代码基线**：commit `cbecb77`（v3 口径，`stations` 站点层已下线），生成于 2026-09-23。
+> 文中**行号只对该 commit 有效**，代码一改就会漂移；**文件路径 + 函数名才是稳定锚点**，重新定位请以它们为准（在文件内搜函数名/变量名）。
+>
+> **⚠️ 行号漂移预警**：自 `feature/ui-refactor` 分支起的前端外观重构会大量改动 `src/**`，届时**第 5 章（逐页溯源）与 1.1 节页面索引里的 `前端位置(file:line)` 会大面积失效**；`backend/**` 部分不受影响。若发现行号对不上，先确认 `git log -1 --oneline` 是否仍在 `cbecb77`。
+>
+> **相关文档**：`METER_DOMAIN_V4_DESIGN.md`（电表域 V4 设计草案，2026-09-23）。本手册描述**现状**，草案描述**目标态**；草案含本机库实测数据（126 块表的真实分布），可作现状的交叉验证。
 
 ---
 
@@ -1103,6 +1107,7 @@ due = period_start − rent_advance_days
 | 电表列表 | `GET /api/meters` | `meters.py:232` → `meter_repo.py:4-35` |
 | 新增/编辑/删除电表 | `POST/PUT/DELETE /api/meters[/{id}]` | `meters.py:281/306/376` |
 | Excel 导入 | `POST /api/meters/import` | `meters.py:72` `import_meters` |
+| 从第三方导入电表 **（⚠️ 前端未接线，无页面入口）** | `POST /api/meters/import-from-third-party` | `main.py:228`（见 [8.3](#83-隐性依赖与半成品功能) #11） |
 | 柜子增删改 | `/api/cabinets` | `cabinets.py:29-67` |
 | 字典（场地方/品牌/主体） | `/api/directory/{landlords,brands,entities}` | `directory` 路由 |
 | 合同（主体不一致提示） | `GET /api/contracts` | `contracts` 路由 |
@@ -2225,6 +2230,9 @@ GET /dividends/summary/shareholder → 聚合 dividend_shares.amount（已结算
 | 8 | **场地坐标无法通过常规 PUT 写入** | `directory.py:128-134` 的 `create_landlord` 只透传 `name/contact/phone/remark`；`update_landlord` 直接 `**data`（字段名须与 repo 形参一致），`latitude/longitude/region/address` **无法通过 API 可靠写入** | 地图/坐标链路存在断点 |
 | 9 | **`/mp/*` 小程序端无数据隔离、股东无只读限制** | 独立 FastAPI 子应用，不经 `AdminAuthMiddleware`；`mp_approvals` 的写接口对股东账号同样可调用 | 安全边界差异 |
 | 10 | **`/mp/auth/login` 无密码** | 仅按 name 匹配（`mp_auth.py:10-39`） | 与后台登录是两套逻辑 |
+| 11 | **`POST /api/meters/import-from-third-party` 前端未接线** | 后端 `main.py:228` 定义「从第三方平台导入电表到本地 `meters`」：取 `meter_devices` 中 `address NOT IN (SELECT meter_no FROM meters)` 的设备，按 `description` 关键词（含「台铃」/「八维通」）猜品牌后建档；但 `src/api/meters.ts` 只导出 6 个函数、**全前端无人引用该端点** | 页面上没有入口，只能直接调接口触发；勿误以为新电表会自动从第三方建档（实际建档入口是电表页手工建档 / Excel 导入） |
+| 12 | **电表不直接挂合同，靠 `(landlord_id, brand_id)` 组合匹配；`meters.contract_id` 是尚未引入的设计欠账** | `domain/electricity_pricing.py:10` 注释自陈：「并置 `pay_price_conflict=True` 供上层告警（**后续引入 `meters.contract_id` 归属后再按业主分摊**）」。即当前"这块表用哪份合同的单价"只能靠 场地×品牌 + 生效时间窗 推导 | 同场地同品牌存在多份合同时，单价归属无显式关系，靠时间窗兜底 → 重构时可考虑显式的「电表↔计价合同」归属或计价规则表 |
+| 13 | **`meters` 表存在多列"只写不读"** | `collector_id` 仅在 INSERT 时写入（`meter_repo.py:131`、`main.py:277`）无业务读取；`status` 全后端仅 `overview.py:807` 读一次展示；`remark` 无业务读取；`entity_source` 活跃（主体继承 auto/manual） | 重构时可评估保留或删除；`status` 若要表达"电表在期/退役"则需真正接入柜数与台账口径 |
 
 ### 8.4 命名误导清单
 

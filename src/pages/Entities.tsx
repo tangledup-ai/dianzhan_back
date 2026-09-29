@@ -58,7 +58,8 @@ export default function Entities() {
     for (const m of meterList) {
       if (!m.landlordId) continue;
       const sharedItems = sharedCabIndex.get(m.landlordId);
-      const isSharedHost = m.tag === "共享电表" && m.brandId == null;
+      // ★V5：共用表读表级 isShared（「大类=共享电表」不再代表共用）
+      const isSharedHost = !!m.isShared && m.brandId == null;
       if (isSharedHost && allocManagedMeterIds(sharedItems).has(m.id)) {
         // 该共享表已按品牌录柜数 → 柜数归到各品牌（报税主体：分摊行指定 → 电表主体）；
         // 不能再按「整表 max(1,柜数)」计数，否则与品牌柜数双算（口径同后端 shared_allocation_repo）

@@ -14,24 +14,40 @@ def get_dict_cursor(conn):
 
 
 def init_database():
-    """初始化数据库表"""
+    """初始化数据库表
+
+    ★V5：建库脚本按环境变量切换 —— v5 换了表结构，**用旧 DDL 会在新库里建出错表**
+    （实测：切库后被重新建出 `meter_monthly`）。切换方式：
+        DB_SCHEMA_FILE=database_init_v5.sql  → 新库 huandian_v5
+        默认 database_init.sql               → 旧库 huandian_v2（保持原行为）
+    """
+    import os
+    sql_name = os.getenv("DB_SCHEMA_FILE", "database_init.sql")
+    sql_file = os.path.join(os.path.dirname(__file__), '..', sql_name)
+    if not os.path.exists(sql_file):
+        print(f"⚠️ 找不到建库脚本 {sql_name}，跳过初始化")
+        return
     conn = get_connection()
     cur = conn.cursor()
     try:
-        import os
-        sql_file = os.path.join(os.path.dirname(__file__), '..', 'database_init.sql')
         with open(sql_file, 'r', encoding='utf-8') as f:
             cur.execute(f.read())
         conn.commit()
-        print("✅ 数据库表初始化完成")
+        print(f"✅ 数据库表初始化完成（{sql_name}）")
     except Exception as e:
         print(f"❌ 数据库初始化失败: {e}")
         conn.rollback()
     finally:
         cur.close()
         conn.close()
-    # 存量库结构同步：逐条执行、单条失败不影响其余（老库升级自动补列）
-    sync_schema()
+
+    # 存量库结构同步（v2 时代的补丁，逐条执行、单条失败不影响其余）
+    # ★V5：`schema_sync.sql` 里含 `meter_monthly`、以及【不带 row_type 的台账唯一键】等
+    #      对 v5 有害的语句（会挡住将来的"损耗行"）⇒ 切到 v5 建库脚本时**不再执行**。
+    if sql_name == "database_init.sql":
+        sync_schema()
+    else:
+        print(f"ℹ️ 已使用 {sql_name}，跳过 schema_sync.sql（v2 时代补丁，对 v5 有害）")
 
 
 def _split_sql_statements(sql: str) -> list:

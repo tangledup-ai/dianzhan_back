@@ -38,3 +38,28 @@ export const getReadingDetail = (meterNo: string, period: string) =>
 // 只更新付款/收款状态（点击状态徽章编辑；不影响金额与数据来源）
 export const updateElectricityStatus = (id: number, data: { payStatus?: string; collectStatus?: string }) =>
   client.put(`/electricity/${id}/status`, data).then((r: any) => r.data);
+
+// ─── ★V5 场地级月度电费（损耗的载体：财务填「最终付给场地方的电量/金额」）───
+export interface LandlordMonthlyElecRow {
+  landlordId: number;
+  landlordName: string;
+  /** 参考电量 = Σ场地内所有表的实际用电量（系统算） */
+  refKwh: number | null;
+  /** 财务填的最终电量（人工值） */
+  finalKwh: number | null;
+  /** 财务填的最终金额（有的账单只给钱不给度数） */
+  finalAmount: number | null;
+  unitPrice: number | null;
+  /** 损耗 = 最终 − 参考（我方承担，不摊给品牌） */
+  lossKwh: number | null;
+  lossAmount: number | null;
+  dataSource?: string | null;
+  remark?: string | null;
+}
+
+export const getLandlordMonthlyElec = (period: string): Promise<{ period: string; rows: LandlordMonthlyElecRow[] }> =>
+  client.get("/electricity/landlord-monthly", { params: { period } }).then(r => r.data);
+
+export const saveLandlordMonthlyElec = (landlordId: number, data: {
+  period: string; finalKwh?: number | null; finalAmount?: number | null; remark?: string | null;
+}) => client.put(`/electricity/landlord-monthly/${landlordId}`, data).then(r => r.data);

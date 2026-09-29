@@ -5,12 +5,13 @@ import { updateSchedule } from "@/api/contracts";
 import { submitStationApproval } from "@/api/approvals";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { Field, TextInput, inputCls } from "@/components/fields";
+import { Field, TextInput, SearchSelect, inputCls } from "@/components/fields";
 import { fmtMoney, fmtNum } from "@/lib/format";
 import { toCompact, toDisplay } from "@/lib/period";
 import { exportXlsxWithTitle } from "@/lib/export";
-import { Building2, Tag, ChevronDown, ChevronRight, Download, CalendarCheck, Clock, CheckCircle2, AlertCircle, Send, FileText, Search, Landmark } from "lucide-react";
+import { Building2, ChevronDown, ChevronRight, Download, CalendarCheck, Clock, CheckCircle2, AlertCircle, Send, FileText, Landmark } from "lucide-react";
 import { toast } from "sonner";
+import "@/components/excel-table.css";   // ★ Excel 风表格样式（仅本页/电费台账/智慧电表使用）
 
 // 场地费月台账（v2 重设计）：只含场地费（不含电费）
 // 支持：按场地方 / 按品牌方；选择任意月份区间（如 1-5 月、2-9 月）；
@@ -456,10 +457,12 @@ function PayApprovalDialog({
 
 // ─── 年度付款计划模块 ───
 function RentPaymentSchedule({ landlordId, landlordName, year, color }: { landlordId: number; landlordName: string; year: string; color: GroupColor }) {
+  /* ★重设计：付款计划要「一目了然」，所以 ——
+     ① 去掉「收款 / 付款」页签：两侧并排、同时可见，不用来回点
+     ② 去掉大号进度卡：换成一行文字 + 一条细进度线 + 「下期应付/下次应收」一眼看到下一次的钱和时间
+     ③ 逐期做成紧凑表（26px 行高、可滚动、表头吸顶），逾期未付/未收直接标红
+     ④ 操作（提交审批 / 标记付款·到账 / 修改）留在每一期的行尾，不跳页 */
   const [payDialog, setPayDialog] = useState<{ id: number; seq: number; periodStart: string; periodEnd?: string; amount: number; monthIncome?: number; monthElecIncome?: number } | null>(null);
-  const [collapsed, setCollapsed] = useState(true);
-  // 展开后默认显示收款情况，可切换到付款情况（避免两块同时铺开信息过多）
-  const [side, setSide] = useState<"income" | "pay">("income");
   const queryClient = useQueryClient();
   // 标记付款/到账：直接更新分期状态与实际日期（与合同管理页「标记付款」同一接口）
   const [markingId, setMarkingId] = useState<number | null>(null);
@@ -485,8 +488,8 @@ function RentPaymentSchedule({ landlordId, landlordName, year, color }: { landlo
     enabled: !!landlordId && !!year,
   });
 
-  // 收款侧（场地费收款：品牌方合同 rent_income_schedule，品牌方 → 公司）
-  // 注意：以下 hooks 必须位于组件的提前 return 之前（Rules of Hooks）
+  // → 收款侧数据（场地费收款：品牌方合同 rent_income_schedule，品牌方 → 公司）
+  // 以下 hooks 必须位于组件的提前 return 之前（Rules of Hooks）
   const incomeContracts = data?.incomeContracts ?? [];
   const incomeTotal = data?.incomeTotalAmount ?? 0;
   const incomePaid = data?.incomePaidAmount ?? 0;
@@ -497,32 +500,33 @@ function RentPaymentSchedule({ landlordId, landlordName, year, color }: { landlo
     .flatMap((ic: any) => (ic.schedules ?? []).map((s: any) => ({ ...s, brandName: ic.brandName })))
     .sort((a: any, b: any) => String(a.periodStart ?? "").localeCompare(String(b.periodStart ?? "")) || String(a.brandName).localeCompare(String(b.brandName)));
 
-  // 收款侧按品牌分组：先列品牌方，点击品牌方再展开该品牌的收款分期
+  // 收款侧按品牌分组（品牌方一行汇总：应收/已到账/待收/下次应收；点「期次」看逐期）
   const [incomeBrandOpen, setIncomeBrandOpen] = useState<string | null>(null);
   const incomeBrands = useMemo(() => {
-    const map = new Map<string, { brandName: string; rows: any[]; totalAmount: number; paidAmount: number; paidCount: number; totalCount: number }>();
+    const map = new Map<string, { brandName: string; rows: any[]; totalAmount: number; paidAmount: number; paidCount: number; totalCount: number; nextDue: any | null }>();
     for (const s of incomeRows) {
       const key = s.brandName || "全品牌共享";
-      if (!map.has(key)) map.set(key, { brandName: key, rows: [], totalAmount: 0, paidAmount: 0, paidCount: 0, totalCount: 0 });
+      if (!map.has(key)) map.set(key, { brandName: key, rows: [], totalAmount: 0, paidAmount: 0, paidCount: 0, totalCount: 0, nextDue: null });
       const g = map.get(key)!;
       g.rows.push(s);
       g.totalAmount += Number(s.amount || 0);
       if (s.status === "已到账") { g.paidAmount += Number(s.amount || 0); g.paidCount += 1; }
       g.totalCount += 1;
     }
+    for (const g of map.values()) {
+      const unpaid = g.rows
+        .filter((s: any) => s.status !== "已到账")
+        .sort((a: any, b: any) => String(a.periodStart ?? "").localeCompare(String(b.periodStart ?? "")));
+      g.nextDue = unpaid[0] ?? null;
+    }
     return [...map.values()];
   }, [incomeRows]);
 
   if (isLoading) {
-    return (
-      <div className="rounded-xl border bg-white p-4 text-center text-xs text-slate-400">
-        加载付款计划中…
-      </div>
-    );
+    return <div className="rounded border border-slate-200 bg-slate-50 px-3 py-3 text-[11px] text-slate-400">加载付款计划中…</div>;
   }
-
   if (!data || !data.venueContract) {
-    return null;
+    return <div className="rounded border border-slate-200 bg-slate-50 px-3 py-3 text-[11px] text-slate-400">该场地在 {year} 年没有有效场地合同，无法生成付款计划</div>;
   }
 
   const vc = data.venueContract;
@@ -533,439 +537,269 @@ function RentPaymentSchedule({ landlordId, landlordName, year, color }: { landlo
   const totalCount = data.totalCount || 0;
   const progress = totalAmount > 0 ? Math.min(100, Math.round((paidAmount / totalAmount) * 100)) : 0;
   const firstAmount = schedules[0]?.amount ?? 0;
+  const today = new Date().toISOString().slice(0, 10);
+  const remainPay = Math.round((totalAmount - paidAmount) * 100) / 100;
+  const remainIncome = Math.round((incomeTotal - incomePaid) * 100) / 100;
+  // 下一次要付的钱（未付款且期间最早的）
+  const nextPay = schedules
+    .filter((s: any) => s.status !== "已付款")
+    .sort((a: any, b: any) => String(a.periodStart ?? "").localeCompare(String(b.periodStart ?? "")))[0] ?? null;
+  const isOverdue = (s: any) => s.status !== "已付款" && !!s.periodEnd && String(s.periodEnd).slice(0, 10) < today;
+  const isOverdueIncome = (s: any) => s.status !== "已到账" && !!s.periodEnd && String(s.periodEnd).slice(0, 10) < today;
+
+  const startMark = (id: number, date?: string) => { setMarkingId(id); setMarkDate((date || new Date().toISOString().slice(0, 10)).slice(0, 10)); };
+  const cancelMark = () => { setMarkingId(null); setMarkDate(""); };
+  const markBtns = (s: any, opts: { side: "payment" | "income"; paidStatus: string; undoStatus: string; label: string }) => (
+    <div className="flex items-center justify-center gap-1">
+      <input type="date" className="h-6 w-[104px] rounded border border-slate-200 px-1 text-[11px]"
+        value={markDate} onChange={(e) => setMarkDate(e.target.value)} />
+      <button type="button" className="rounded bg-emerald-600 px-1.5 py-0.5 text-[10px] text-white hover:bg-emerald-700"
+        disabled={markDone.isPending}
+        onClick={() => {
+          if (!markDate) { toast.error(`请选择${opts.label}日期`); return; }
+          markDone.mutate({ id: s.id, status: opts.paidStatus, payDate: markDate, side: opts.side });
+        }}>保存</button>
+      {opts.undoStatus !== "" && (
+        <button type="button" className="rounded border border-amber-200 bg-amber-50 px-1.5 py-0.5 text-[10px] text-amber-600 hover:bg-amber-100"
+          disabled={markDone.isPending}
+          onClick={() => markDone.mutate({ id: s.id, status: opts.undoStatus, payDate: markDate, side: opts.side })}>撤销</button>
+      )}
+      <button type="button" className="px-1 text-[10px] text-slate-400 hover:text-slate-600" onClick={cancelMark}>取消</button>
+    </div>
+  );
 
   return (
-    <div className="overflow-hidden rounded-2xl border border-indigo-100/80 bg-white shadow-sm">
-      {/* 标题栏（点击展开/收起） */}
-      <button
-        type="button"
-        onClick={() => { if (!collapsed) setIncomeBrandOpen(null); setCollapsed((c) => !c); }}
-        className={`flex w-full flex-wrap items-center gap-3 border-b border-slate-100 bg-gradient-to-r ${color.head} px-5 py-4 text-left transition-colors hover:bg-slate-50/70`}
-      >
-        <div className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br ${color.iconGrad} text-white shadow-sm`}>
-          <CalendarCheck className="h-5 w-5" />
-        </div>
-        <div className="min-w-0 flex-1">
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="text-sm font-semibold text-slate-800">{landlordName}</span>
-            <span className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${color.badge}`}>年度付款计划 · {year}年</span>
-            {schedules.length > 0 && (
-              <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-medium text-slate-500">共 {totalCount} 期</span>
-            )}
-            {schedules.length > 0 && (
-              <span className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${paidCount >= totalCount && totalCount > 0 ? "bg-emerald-100 text-emerald-700" : "bg-amber-50 text-amber-600"}`}>
-                已付 {paidCount}/{totalCount}
-              </span>
-            )}
-          </div>
-          <div className="mt-1 text-[11px] text-slate-400">
-            合同 {vc.startDate || "—"} ~ {vc.endDate || "—"} · {vc.payMethod || "—"}付款
-            {schedules.length > 0 && <> · 每期 {fmtMoney(firstAmount)}</>}
-          </div>
-        </div>
-        <div className="flex items-center gap-3">
-          <div className="text-right">
-            <div className="text-[10px] text-slate-400">年租金成本</div>
-            <div className="text-lg font-bold tabular-nums text-slate-800">{fmtMoney(totalAmount)}</div>
-          </div>
-          {collapsed ? (
-            <ChevronRight className="h-4 w-4 text-slate-400" />
-          ) : (
-            <ChevronDown className="h-4 w-4 text-slate-400" />
-          )}
-        </div>
-      </button>
-
-      {!collapsed && (
-        <>
-      {/* 收款 / 付款 切换 */}
-      <div className="border-b border-slate-100 px-5 py-3">
-        <div className="flex items-center justify-between">
-          <div className="inline-flex overflow-hidden rounded-lg border border-slate-200">
-            <button
-              type="button"
-              onClick={() => setSide("income")}
-              className={`px-3.5 py-1.5 text-xs font-medium transition-colors ${side === "income" ? `${color.btn} text-white` : "bg-white text-slate-600 hover:bg-slate-50"}`}
-            >
-              收款情况
-            </button>
-            <button
-              type="button"
-              onClick={() => setSide("pay")}
-              className={`px-3.5 py-1.5 text-xs font-medium transition-colors ${side === "pay" ? `${color.btn} text-white` : "bg-white text-slate-600 hover:bg-slate-50"}`}
-            >
-              付款情况
-            </button>
-          </div>
-          <span className="text-[10px] text-slate-400">
-            {side === "income" ? `付款 ${paidCount}/${totalCount} 期` : `收款 ${incomePaidCount}/${incomeTotalCount} 期`}
-          </span>
-        </div>
+    <div className="space-y-2">
+      {/* ── 场地合同信息条：一行看完合同底线（期间 / 付款方式 / 年成本 / 期数） ── */}
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-1 rounded border border-slate-200 bg-slate-50/70 px-2.5 py-1.5 text-[11px] text-slate-600">
+        <span className="inline-flex items-center gap-1">
+          <CalendarCheck className="h-3.5 w-3.5 text-indigo-500" />
+          场地合同 <b className="font-medium text-slate-700">{String(vc.startDate || "—").slice(0, 10)} ~ {String(vc.endDate || "—").slice(0, 10)}</b>
+        </span>
+        <span>付款方式 <b className="font-medium text-slate-700">{vc.payMethod || "—"}</b></span>
+        <span>年租金成本 <b className="font-semibold text-slate-800">{fmtMoney(totalAmount)}</b></span>
+        <span>共 <b className="font-medium text-slate-700">{totalCount}</b> 期{schedules.length > 0 && <> · 每期约 <b className="font-medium text-slate-700">{fmtMoney(firstAmount)}</b></>}</span>
       </div>
 
-      {side === "pay" && (
-        <>
-      {/* 付款进度 */}
-      <div className="border-b border-slate-100 px-5 py-4">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-2 text-[11px] text-slate-500">
-            <span className="font-medium">付款进度</span>
-            <span className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${progress >= 100 ? "bg-emerald-100 text-emerald-700" : color.chipPay}`}>
-              {paidCount}/{totalCount} 期 · {progress}%
+      <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
+        {/* ══ 付款侧（我们 → 场地方）══ */}
+        <div className="xl-sec">
+          <div className="xl-sec-head is-pay">
+            <span>付款情况（付场地方）</span>
+            <span className="tag">已付 {paidCount}/{totalCount} 期 · {fmtMoney(paidAmount)} / {fmtMoney(totalAmount)}</span>
+            <span className={`ml-auto font-medium ${remainPay > 0 ? "text-rose-600" : "text-emerald-600"}`}>
+              {remainPay > 0 ? `待付 ${fmtMoney(remainPay)}` : "已付清"}
             </span>
           </div>
-          <span className="text-[10px] text-slate-400">{paidAmount > 0 ? `已付 ${fmtMoney(paidAmount)}` : "尚未付款"}</span>
-        </div>
-        <div className="mt-2.5 h-2 overflow-hidden rounded-full bg-slate-100">
-          <div
-            className={`h-full rounded-full bg-gradient-to-r ${color.bar} transition-all duration-500`}
-            style={{ width: `${progress}%` }}
-          />
-        </div>
-        <div className="mt-4 grid grid-cols-3 gap-3">
-          <div className="rounded-xl border border-slate-100 bg-slate-50/60 px-3 py-2.5">
-            <div className="text-[10px] text-slate-400">已付金额</div>
-            <div className="mt-0.5 text-sm font-bold tabular-nums text-emerald-600">{fmtMoney(paidAmount)}</div>
+          <div className="xl-bar mb-1.5">
+            <i className={progress >= 100 ? "bg-emerald-500" : "bg-rose-400"} style={{ width: `${progress}%` }} />
           </div>
-          <div className="rounded-xl border border-slate-100 bg-slate-50/60 px-3 py-2.5">
-            <div className="text-[10px] text-slate-400">待付金额</div>
-            <div className="mt-0.5 text-sm font-bold tabular-nums text-amber-600">{fmtMoney(totalAmount - paidAmount)}</div>
+          <div className="mb-1.5 text-[11px] text-slate-500">
+            {nextPay
+              ? <>下期应付：<b className="font-medium text-slate-700">{String(nextPay.periodStart || "").slice(0, 10)} ~ {String(nextPay.periodEnd || "").slice(0, 10)}</b> · <b className="font-medium text-rose-600">{fmtMoney(nextPay.amount)}</b>
+                {isOverdue(nextPay) && <span className="ml-1 rounded bg-rose-100 px-1.5 py-0.5 text-[10px] font-medium text-rose-700">已逾期</span>}</>
+              : <span className="text-emerald-600">本年度付款已全部结清</span>}
           </div>
-          <div className="rounded-xl border border-slate-100 bg-slate-50/60 px-3 py-2.5">
-            <div className="text-[10px] text-slate-400">付款方式</div>
-            <div className="mt-0.5 text-sm font-semibold tabular-nums text-slate-700">{vc.payMethod || "—"}</div>
-          </div>
-        </div>
-      </div>
-        </>
-      )}
-
-      {side === "income" && (
-        <>
-      {/* 收款进度（场地费收款：品牌方合同分期，品牌方 → 公司） */}
-      <div className="border-b border-slate-100 px-5 py-4">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-2 text-[11px] text-slate-500">
-            <span className="font-medium">收款进度</span>
-            <span className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${incomeTotalCount > 0 && incomePaidCount >= incomeTotalCount ? "bg-emerald-100 text-emerald-700" : color.chipPay}`}>
-              {incomePaidCount}/{incomeTotalCount} 期 · {incomeProgress}%
-            </span>
-          </div>
-          <span className="text-[10px] text-slate-400">{incomePaid > 0 ? `已收 ${fmtMoney(incomePaid)}` : "尚未收款"}</span>
-        </div>
-        <div className="mt-2.5 h-2 overflow-hidden rounded-full bg-slate-100">
-          <div
-            className={`h-full rounded-full bg-gradient-to-r ${color.bar} transition-all duration-500`}
-            style={{ width: `${incomeProgress}%` }}
-          />
-        </div>
-        <div className="mt-4 grid grid-cols-3 gap-3">
-          <div className="rounded-xl border border-slate-100 bg-slate-50/60 px-3 py-2.5">
-            <div className="text-[10px] text-slate-400">已收金额</div>
-            <div className="mt-0.5 text-sm font-bold tabular-nums text-emerald-600">{fmtMoney(incomePaid)}</div>
-          </div>
-          <div className="rounded-xl border border-slate-100 bg-slate-50/60 px-3 py-2.5">
-            <div className="text-[10px] text-slate-400">待收金额</div>
-            <div className="mt-0.5 text-sm font-bold tabular-nums text-amber-600">{fmtMoney(incomeTotal - incomePaid)}</div>
-          </div>
-          <div className="rounded-xl border border-slate-100 bg-slate-50/60 px-3 py-2.5">
-            <div className="text-[10px] text-slate-400">收款合同</div>
-            <div className="mt-0.5 text-sm font-semibold tabular-nums text-slate-700">{incomeContracts.length} 份品牌合同</div>
-          </div>
-        </div>
-        {incomeTotalCount === 0 && (
-          <div className="mt-2 text-[10px] text-slate-400">暂无收款分期数据（品牌方合同生成分期后显示）</div>
-        )}
-      </div>
-        </>
-      )}
-
-      {side === "pay" && (
-        <>
-      {/* 分期表格 */}
-      <div className="overflow-x-auto">
-        <table className="w-full text-xs">
-          <thead>
-            <tr className="text-left text-[10px] uppercase tracking-wider text-slate-400">
-              <th className="px-5 py-2.5 font-medium">期数</th>
-              <th className="px-4 py-2.5 font-medium">应付时间</th>
-              <th className="px-4 py-2.5 text-right font-medium">应付金额</th>
-              <th className="px-4 py-2.5 font-medium">状态</th>
-              <th className="px-4 py-2.5 font-medium">实际付款时间</th>
-              <th className="px-4 py-2.5 text-center font-medium">操作</th>
-            </tr>
-          </thead>
-          <tbody>
-            {schedules.length === 0 && (
-              <tr><td colSpan={6} className="py-10 text-center text-slate-400">
-                暂无付款分期数据（请先在合同管理中生成分期）
-              </td></tr>
-            )}
-            {schedules.map((s: any) => {
-              const isPaid = s.status === "已付款";
-              const isPending = !isPaid;
-              const hasApproval = (s.approvals ?? []).length > 0;
-              const latestApproval = hasApproval ? s.approvals[0] : null;
-              return (
-                <tr key={s.id} className={`border-t border-slate-50 transition-colors hover:bg-slate-50/50 ${isPaid ? "bg-emerald-50/20" : ""}`}>
-                  <td className="px-5 py-3">
-                    <span className={`inline-flex h-6 w-6 items-center justify-center rounded-full text-[11px] font-semibold ${isPaid ? "bg-emerald-100 text-emerald-700" : "bg-slate-100 text-slate-500"}`}>{s.seq}</span>
-                  </td>
-                  <td className="px-4 py-3 whitespace-nowrap text-slate-600">
-                    {s.periodStart?.slice(0, 10) || "—"} ~ {s.periodEnd?.slice(0, 10) || "—"}
-                  </td>
-                  <td className="px-4 py-3 text-right font-medium tabular-nums text-slate-700">{fmtMoney(s.amount)}</td>
-                  <td className="px-4 py-3">
-                    {isPaid ? (
-                      <span className="inline-flex items-center gap-1 rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-medium text-emerald-700">
-                        <CheckCircle2 className="h-3 w-3" />已付款
-                      </span>
-                    ) : hasApproval && latestApproval?.status === "审批中" ? (
-                      <span className="inline-flex items-center gap-1 rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-medium text-amber-700">
-                        <Clock className="h-3 w-3" />审批中
-                      </span>
-                    ) : hasApproval && latestApproval?.status === "已驳回" ? (
-                      <span className="inline-flex items-center gap-1 rounded-full bg-rose-100 px-2 py-0.5 text-[10px] font-medium text-rose-700">
-                        <AlertCircle className="h-3 w-3" />已驳回
-                      </span>
-                    ) : (
-                      <span className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-white px-2 py-0.5 text-[10px] font-medium text-slate-500">
-                        未付款
-                      </span>
-                    )}
-                  </td>
-                  <td className="px-4 py-3">
-                    {isPaid && s.payDate ? (
-                      <span className="tabular-nums text-emerald-600">{s.payDate}</span>
-                    ) : (
-                      <span className="text-slate-300">—</span>
-                    )}
-                  </td>
-                  <td className="px-4 py-3 text-center">
-                    {markingId === s.id ? (
-                      <div className="flex items-center justify-center gap-1">
-                        <input
-                          type="date"
-                          className="w-32 rounded-md border border-slate-200 px-2 py-1 text-xs"
-                          value={markDate}
-                          onChange={(e) => setMarkDate(e.target.value)}
-                        />
-                        <Button
-                          size="sm"
-                          className="h-7 rounded-lg bg-emerald-600 px-2.5 text-xs text-white hover:bg-emerald-700"
-                          disabled={markDone.isPending}
-                          onClick={() => {
-                            if (!markDate) { toast.error("请选择付款日期"); return; }
-                            markDone.mutate({ id: s.id, status: "已付款", payDate: markDate, side: "payment" });
-                          }}
-                        >
-                          保存
-                        </Button>
-                        {isPaid && (
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            className="h-7 rounded-lg border-amber-200 bg-amber-50/60 px-2.5 text-xs font-medium text-amber-600 hover:bg-amber-100"
-                            disabled={markDone.isPending}
-                            onClick={() => markDone.mutate({ id: s.id, status: "未付款", payDate: markDate, side: "payment" })}
-                          >
-                            撤销付款
-                          </Button>
-                        )}
-                        <Button size="sm" variant="outline" className="h-7 rounded-lg px-2.5 text-xs" onClick={() => { setMarkingId(null); setMarkDate(""); }}>取消</Button>
-                      </div>
-                    ) : isPending ? (
-                      <div className="flex items-center justify-center gap-1.5">
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          className={`h-7 rounded-lg px-2.5 text-xs font-medium ${color.btnOutline}`}
-                          onClick={() => setPayDialog({ id: s.id, seq: s.seq, periodStart: s.periodStart, periodEnd: s.periodEnd, amount: s.amount, monthIncome: s.monthIncome, monthElecIncome: s.monthElecIncome })}
-                        >
-                          <Send className="mr-1 h-3 w-3" />提交审批
-                        </Button>
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          className="h-7 rounded-lg border-blue-200 bg-blue-50/60 px-2.5 text-xs font-medium text-blue-600 hover:border-blue-300 hover:bg-blue-100"
-                          onClick={() => { setMarkingId(s.id); setMarkDate(new Date().toISOString().slice(0, 10)); }}
-                        >
-                          标记付款
-                        </Button>
-                      </div>
-                    ) : (
-                      <button
-                        type="button"
-                        className="rounded px-1.5 py-0.5 text-[11px] text-rose-600 hover:text-rose-700"
-                        onClick={() => { setMarkingId(s.id); setMarkDate(s.payDate || new Date().toISOString().slice(0, 10)); }}
-                      >
-                        修改
-                      </button>
-                    )}
-                  </td>
+          <div className="xl-dwrap" style={{ maxHeight: 264 }}>
+            <table>
+              <thead>
+                <tr>
+                  <th style={{ width: 44 }}>期数</th>
+                  <th style={{ width: 176 }}>应付期间</th>
+                  <th style={{ width: 92 }}>应付金额</th>
+                  <th style={{ width: 78 }}>状态</th>
+                  <th style={{ width: 88 }}>实际付款</th>
+                  <th style={{ width: 168 }}>操作</th>
                 </tr>
-              );
-            })}
-          </tbody>
-        </table>
-      </div>
-
-        </>
-      )}
-
-      {side === "income" && (
-        <>
-      {/* 收款分期明细（按品牌分组：点击品牌方展开该品牌的收款分期） */}
-      <div className={`border-t border-slate-100 ${color.bg} px-5 py-2.5`}>
-        <span className={`text-[11px] font-medium ${color.text}`}>收款分期明细（场地费收款 · 品牌方 → 公司 · 点击品牌方展开）</span>
-      </div>
-      <div className="px-5 py-3">
-        {incomeBrands.length === 0 && (
-          <div className="rounded-md bg-slate-50 px-3 py-4 text-center text-xs text-slate-400">
-            暂无收款分期数据（品牌方合同生成分期后显示）
-          </div>
-        )}
-        <div className="space-y-2">
-          {incomeBrands.map((b) => {
-            const isOpen = incomeBrandOpen === b.brandName;
-            const allPaid = b.totalCount > 0 && b.paidCount >= b.totalCount;
-            return (
-              <div key={b.brandName} className="overflow-hidden rounded-lg border border-slate-200">
-                <button
-                  type="button"
-                  className="flex w-full items-center gap-3 bg-slate-50/60 px-3 py-2.5 text-left text-xs hover:bg-slate-100/70"
-                  onClick={() => setIncomeBrandOpen(isOpen ? null : b.brandName)}
-                >
-                  {isOpen ? <ChevronDown className="h-3.5 w-3.5 shrink-0 text-slate-400" /> : <ChevronRight className="h-3.5 w-3.5 shrink-0 text-slate-400" />}
-                  <span className="font-medium text-slate-700">{b.brandName}</span>
-                  <span className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${allPaid ? "bg-emerald-100 text-emerald-700" : "bg-amber-50 text-amber-600"}`}>
-                    已到账 {b.paidCount}/{b.totalCount} 期
-                  </span>
-                  <span className="ml-auto text-right tabular-nums">
-                    <span className="text-[10px] text-slate-400">已收 </span>
-                    <span className="font-medium text-emerald-600">{fmtMoney(b.paidAmount)}</span>
-                    <span className="mx-1 text-slate-300">/</span>
-                    <span className="text-slate-600">{fmtMoney(b.totalAmount)} 元</span>
-                  </span>
-                </button>
-                {isOpen && (
-                  <div className="overflow-x-auto border-t">
-                    <table className="w-full text-xs">
-                      <thead>
-                        <tr className="text-left text-[10px] uppercase tracking-wider text-slate-400">
-                          <th className="px-5 py-2.5 font-medium">期数</th>
-                          <th className="px-4 py-2.5 font-medium">应收时间</th>
-                          <th className="px-4 py-2.5 text-right font-medium">应收金额</th>
-                          <th className="px-4 py-2.5 font-medium">状态</th>
-                          <th className="px-4 py-2.5 font-medium">实际到账时间</th>
-                          <th className="px-4 py-2.5 text-center font-medium">操作</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {b.rows.length === 0 && (
-                          <tr><td colSpan={6} className="py-6 text-center text-slate-400">暂无分期</td></tr>
-                        )}
-                        {b.rows.map((s: any) => {
-                          const isPaid = s.status === "已到账";
-                          return (
-                            <tr key={s.id} className={`border-t border-slate-50 transition-colors hover:bg-slate-50/50 ${isPaid ? "bg-emerald-50/20" : ""}`}>
-                              <td className="px-5 py-3">
-                                <span className={`inline-flex h-6 w-6 items-center justify-center rounded-full text-[11px] font-semibold ${isPaid ? "bg-emerald-100 text-emerald-700" : "bg-slate-100 text-slate-500"}`}>{s.seq}</span>
-                              </td>
-                              <td className="px-4 py-3 whitespace-nowrap text-slate-600">
-                                {s.periodStart?.slice(0, 10) || "—"} ~ {s.periodEnd?.slice(0, 10) || "—"}
-                              </td>
-                              <td className="px-4 py-3 text-right font-medium tabular-nums text-slate-700">{fmtMoney(s.amount)}</td>
-                              <td className="px-4 py-3">
-                                {isPaid ? (
-                                  <span className="inline-flex items-center gap-1 rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-medium text-emerald-700">
-                                    <CheckCircle2 className="h-3 w-3" />已到账
-                                  </span>
-                                ) : (
-                                  <span className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-white px-2 py-0.5 text-[10px] font-medium text-slate-500">
-                                    未到账
-                                  </span>
-                                )}
-                              </td>
-                              <td className="px-4 py-3">
-                                {isPaid && s.payDate ? (
-                                  <span className="tabular-nums text-emerald-600">{s.payDate}</span>
-                                ) : (
-                                  <span className="text-slate-300">—</span>
-                                )}
-                              </td>
-                              <td className="px-4 py-3 text-center">
-                                {markingId === s.id ? (
-                                  <div className="flex items-center justify-center gap-1">
-                                    <input
-                                      type="date"
-                                      className="w-32 rounded-md border border-slate-200 px-2 py-1 text-xs"
-                                      value={markDate}
-                                      onChange={(e) => setMarkDate(e.target.value)}
-                                    />
-                                    <Button
-                                      size="sm"
-                                      className="h-7 rounded-lg bg-emerald-600 px-2.5 text-xs text-white hover:bg-emerald-700"
-                                      disabled={markDone.isPending}
-                                      onClick={() => {
-                                        if (!markDate) { toast.error("请选择到账日期"); return; }
-                                        markDone.mutate({ id: s.id, status: "已到账", payDate: markDate, side: "income" });
-                                      }}
-                                    >
-                                      保存
-                                    </Button>
-                                    {isPaid && (
-                                      <Button
-                                        size="sm"
-                                        variant="outline"
-                                        className="h-7 rounded-lg border-amber-200 bg-amber-50/60 px-2.5 text-xs font-medium text-amber-600 hover:bg-amber-100"
-                                        disabled={markDone.isPending}
-                                        onClick={() => markDone.mutate({ id: s.id, status: "未到账", payDate: markDate, side: "income" })}
-                                      >
-                                        撤销到账
-                                      </Button>
-                                    )}
-                                    <Button size="sm" variant="outline" className="h-7 rounded-lg px-2.5 text-xs" onClick={() => { setMarkingId(null); setMarkDate(""); }}>取消</Button>
-                                  </div>
-                                ) : isPaid ? (
-                                  <div className="flex items-center justify-center gap-1">
-                                    <span className="tabular-nums text-emerald-600">{s.payDate || ""}</span>
-                                    <button
-                                      type="button"
-                                      className="rounded px-1.5 py-0.5 text-[11px] text-rose-600 hover:text-rose-700"
-                                      onClick={() => { setMarkingId(s.id); setMarkDate(s.payDate || new Date().toISOString().slice(0, 10)); }}
-                                    >
-                                      修改
-                                    </button>
-                                  </div>
-                                ) : (
-                                  <Button
-                                    size="sm"
-                                    variant="outline"
-                                    className="h-7 rounded-lg border-emerald-200 bg-emerald-50/60 px-2.5 text-xs font-medium text-emerald-600 hover:border-emerald-300 hover:bg-emerald-100"
-                                    onClick={() => { setMarkingId(s.id); setMarkDate(new Date().toISOString().slice(0, 10)); }}
-                                  >
-                                    标记到账
-                                  </Button>
-                                )}
-                              </td>
-                            </tr>
-                          );
-                        })}
-                      </tbody>
-                    </table>
-                  </div>
+              </thead>
+              <tbody>
+                {schedules.length === 0 && (
+                  <tr><td colSpan={6} className="ctr" style={{ color: "#94a3b8", padding: 10 }}>暂无付款分期（请先在「合同管理」生成分期）</td></tr>
                 )}
-              </div>
-            );
-          })}
+                {schedules.map((s: any) => {
+                  const paid = s.status === "已付款";
+                  const overdue = isOverdue(s);
+                  const ap = (s.approvals ?? [])[0] ?? null;
+                  return (
+                    <tr key={s.id} className={paid ? "bg-emerald-50/40" : overdue ? "bg-rose-50/40" : undefined}>
+                      <td className="ctr text-slate-500">{s.seq}</td>
+                      <td className="ctr text-slate-500">{String(s.periodStart || "").slice(0, 10)} ~ {String(s.periodEnd || "").slice(0, 10)}</td>
+                      <td className="num font-medium">{fmtMoney(s.amount)}</td>
+                      <td className="ctr">
+                        {paid ? (
+                          <span className="inline-flex items-center gap-0.5 rounded-full bg-emerald-100 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700">
+                            <CheckCircle2 className="h-3 w-3" />已付款
+                          </span>
+                        ) : ap?.status === "审批中" ? (
+                          <span className="inline-flex items-center gap-0.5 rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700">
+                            <Clock className="h-3 w-3" />审批中
+                          </span>
+                        ) : ap?.status === "已驳回" ? (
+                          <span className="inline-flex items-center gap-0.5 rounded-full bg-rose-100 px-1.5 py-0.5 text-[10px] font-medium text-rose-700">
+                            <AlertCircle className="h-3 w-3" />已驳回
+                          </span>
+                        ) : overdue ? (
+                          <span className="rounded-full bg-rose-100 px-1.5 py-0.5 text-[10px] font-medium text-rose-700" title={`应付截止 ${String(s.periodEnd).slice(0, 10)}，已逾期`}>逾期</span>
+                        ) : (
+                          <span className="rounded-full border border-slate-200 bg-white px-1.5 py-0.5 text-[10px] text-slate-500">未付款</span>
+                        )}
+                      </td>
+                      <td className="ctr tabular-nums text-emerald-600">{paid && s.payDate ? String(s.payDate).slice(0, 10) : <span style={{ color: "#cbd5e1" }}>—</span>}</td>
+                      <td className="ctr">
+                        {markingId === s.id ? markBtns(s, { side: "payment", paidStatus: "已付款", undoStatus: paid ? "未付款" : "", label: "付款" })
+                          : paid ? (
+                            <div className="flex items-center justify-center gap-1">
+                              <button type="button" className="rounded px-1.5 py-0.5 text-[10px] text-rose-600 hover:underline" onClick={() => startMark(s.id, s.payDate)}>修改</button>
+                            </div>
+                          ) : (
+                            <div className="flex items-center justify-center gap-1">
+                              <button type="button"
+                                className={`rounded border px-1.5 py-0.5 text-[10px] font-medium ${color.btnOutline}`}
+                                title="按本期生成应付电费/场地费审批单"
+                                onClick={() => setPayDialog({ id: s.id, seq: s.seq, periodStart: s.periodStart, periodEnd: s.periodEnd, amount: s.amount, monthIncome: s.monthIncome, monthElecIncome: s.monthElecIncome })}>
+                                <Send className="mr-0.5 inline h-3 w-3" />提交审批
+                              </button>
+                              <button type="button" className="rounded border border-blue-200 bg-blue-50 px-1.5 py-0.5 text-[10px] font-medium text-blue-600 hover:bg-blue-100"
+                                onClick={() => startMark(s.id)}>标记付款</button>
+                            </div>
+                          )}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        {/* ══ 收款侧（品牌方 → 我们）══ */}
+        <div className="xl-sec">
+          <div className="xl-sec-head is-income">
+            <span>收款情况（收品牌方）</span>
+            <span className="tag">已到账 {incomePaidCount}/{incomeTotalCount} 期 · {fmtMoney(incomePaid)} / {fmtMoney(incomeTotal)}</span>
+            <span className={`ml-auto font-medium ${remainIncome > 0 ? "text-amber-600" : "text-emerald-600"}`}>
+              {remainIncome > 0 ? `待收 ${fmtMoney(remainIncome)}` : "已收齐"}
+            </span>
+          </div>
+          <div className="xl-bar mb-1.5">
+            <i className={incomeProgress >= 100 ? "bg-emerald-500" : "bg-amber-400"} style={{ width: `${incomeProgress}%` }} />
+          </div>
+          <div className="mb-1.5 text-[11px] text-slate-500">
+            {incomeBrands.length === 0
+              ? <span>暂无收款分期（品牌方合同生成分期后显示）</span>
+              : <>按品牌方汇总 · 点「期次」看逐期到账情况</>}
+          </div>
+          <div className="xl-dwrap" style={{ maxHeight: 264 }}>
+            <table>
+              <thead>
+                <tr>
+                  <th style={{ width: 132 }}>品牌方</th>
+                  <th style={{ width: 92 }}>应收合计</th>
+                  <th style={{ width: 92 }}>已到账</th>
+                  <th style={{ width: 92 }}>待收</th>
+                  <th style={{ width: 172 }}>下次应收</th>
+                  <th style={{ width: 72 }}>期数</th>
+                  <th style={{ width: 56 }}></th>
+                </tr>
+              </thead>
+              <tbody>
+                {incomeBrands.length === 0 && (
+                  <tr><td colSpan={7} className="ctr" style={{ color: "#94a3b8", padding: 10 }}>暂无收款分期</td></tr>
+                )}
+                {incomeBrands.map((b) => {
+                  const open = incomeBrandOpen === b.brandName;
+                  const allPaid = b.totalCount > 0 && b.paidCount >= b.totalCount;
+                  const dueLeft = Math.round((b.totalAmount - b.paidAmount) * 100) / 100;
+                  return (
+                    <Fragment key={b.brandName}>
+                      <tr className={allPaid ? "bg-emerald-50/40" : undefined}>
+                        <td className="truncate font-medium text-slate-700" title={b.brandName}>{b.brandName}</td>
+                        <td className="num">{fmtMoney(b.totalAmount)}</td>
+                        <td className="num text-emerald-600">{fmtMoney(b.paidAmount)}</td>
+                        <td className={"num " + (dueLeft > 0 ? "font-medium text-amber-600" : "")}>{dueLeft > 0 ? fmtMoney(dueLeft) : <span style={{ color: "#cbd5e1" }}>—</span>}</td>
+                        <td className="ctr text-slate-500">
+                          {b.nextDue ? (
+                            <span className={isOverdueIncome(b.nextDue) ? "font-medium text-rose-600" : ""}>
+                              {String(b.nextDue.periodStart || "").slice(0, 10)} ~ {String(b.nextDue.periodEnd || "").slice(0, 10)}
+                              <span className="ml-1 tabular-nums">{fmtMoney(b.nextDue.amount)}</span>
+                              {isOverdueIncome(b.nextDue) && <span className="ml-1 rounded bg-rose-100 px-1 py-0.5 text-[10px]">逾期</span>}
+                            </span>
+                          ) : <span className="text-emerald-600">已收齐</span>}
+                        </td>
+                        <td className="ctr">
+                          <span className={`rounded-full px-1.5 py-0.5 text-[10px] font-medium ${allPaid ? "bg-emerald-100 text-emerald-700" : "bg-amber-50 text-amber-600"}`}>
+                            {b.paidCount}/{b.totalCount}
+                          </span>
+                        </td>
+                        <td className="ctr">
+                          <button type="button" className="rounded border border-slate-200 px-1.5 py-0.5 text-[10px] text-slate-600 hover:bg-slate-100"
+                            onClick={() => setIncomeBrandOpen(open ? null : b.brandName)}>{open ? "收起" : "期次"}</button>
+                        </td>
+                      </tr>
+                      {open && (
+                        <tr>
+                          <td colSpan={7} className="p-0" style={{ background: "#fafafa" }}>
+                            <div className="xl-dwrap" style={{ border: "none" }}>
+                              <table>
+                                <thead>
+                                  <tr>
+                                    <th style={{ width: 52 }}>期数</th>
+                                    <th style={{ width: 176 }}>应收期间</th>
+                                    <th style={{ width: 92 }}>应收金额</th>
+                                    <th style={{ width: 78 }}>状态</th>
+                                    <th style={{ width: 88 }}>实际到账</th>
+                                    <th style={{ width: 168 }}>操作</th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {b.rows.map((s: any) => {
+                                    const paid = s.status === "已到账";
+                                    const overdue = isOverdueIncome(s);
+                                    return (
+                                      <tr key={s.id} className={paid ? "bg-emerald-50/40" : overdue ? "bg-rose-50/40" : undefined}>
+                                        <td className="ctr text-slate-500">{s.seq}</td>
+                                        <td className="ctr text-slate-500">{String(s.periodStart || "").slice(0, 10)} ~ {String(s.periodEnd || "").slice(0, 10)}</td>
+                                        <td className="num font-medium">{fmtMoney(s.amount)}</td>
+                                        <td className="ctr">
+                                          {paid ? (
+                                            <span className="inline-flex items-center gap-0.5 rounded-full bg-emerald-100 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700">
+                                              <CheckCircle2 className="h-3 w-3" />已到账
+                                            </span>
+                                          ) : overdue ? (
+                                            <span className="rounded-full bg-rose-100 px-1.5 py-0.5 text-[10px] font-medium text-rose-700">逾期</span>
+                                          ) : (
+                                            <span className="rounded-full border border-slate-200 bg-white px-1.5 py-0.5 text-[10px] text-slate-500">未到账</span>
+                                          )}
+                                        </td>
+                                        <td className="ctr tabular-nums text-emerald-600">{paid && s.payDate ? String(s.payDate).slice(0, 10) : <span style={{ color: "#cbd5e1" }}>—</span>}</td>
+                                        <td className="ctr">
+                                          {markingId === s.id ? markBtns(s, { side: "income", paidStatus: "已到账", undoStatus: paid ? "未到账" : "", label: "到账" })
+                                            : paid ? (
+                                              <button type="button" className="rounded px-1.5 py-0.5 text-[10px] text-rose-600 hover:underline" onClick={() => startMark(s.id, s.payDate)}>修改</button>
+                                            ) : (
+                                              <button type="button" className="rounded border border-emerald-200 bg-emerald-50 px-1.5 py-0.5 text-[10px] font-medium text-emerald-600 hover:bg-emerald-100"
+                                                onClick={() => startMark(s.id)}>标记到账</button>
+                                            )}
+                                        </td>
+                                      </tr>
+                                    );
+                                  })}
+                                </tbody>
+                              </table>
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                    </Fragment>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
         </div>
       </div>
-        </>
-      )}
+
       {/* 提交审批弹窗 */}
-        </>
-      )}
       <PayApprovalDialog
         open={payDialog !== null}
         onClose={() => setPayDialog(null)}
@@ -983,18 +817,24 @@ function RentPaymentSchedule({ landlordId, landlordName, year, color }: { landlo
 }
 
 // 公司主体分组配色与分组逻辑见 src/lib/groupColors.ts（与 Electricity 页共用）
-import { groupByEntity, type GroupColor } from "@/lib/groupColors";
+import { groupByEntity, GROUP_COLOR_NEUTRAL, type GroupColor } from "@/lib/groupColors";
 
 export default function Rent() {
   const [startPeriod, setStartPeriod] = useState(CUR_MONTH);
   const [endPeriod, setEndPeriod] = useState(CUR_MONTH);
-  const [dim, setDim] = useState<"landlord" | "brand">("landlord");
+  /* ★重设计：原来顶部是「按场地方 / 按品牌方」两个维度按钮（同一批数据的两种分组），
+     现在改为在同一张平铺台账表上用筛选条件定位：月份区间 / 场地方 / 品牌方 / 公司主体 / 收付状态 / 关键词。 */
+  const [fLandlord, setFLandlord] = useState("");
+  const [fBrand, setFBrand] = useState("");
+  const [fEntity, setFEntity] = useState("");
+  const [fStatus, setFStatus] = useState("");
+  const [keyword, setKeyword] = useState("");
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
-  // 整年场地收支模块：默认收起（点击标题展开），置于页面末尾
-  const [yearlyOpen, setYearlyOpen] = useState(false);
-  // 年度付款计划模块：默认收起（点击标题展开）+ 场地方/品牌模糊搜索
-  const [payOpen, setPayOpen] = useState(false);
-  const [payKeyword, setPayKeyword] = useState("");
+  // 行内「整年收支」小节：默认展开（信息就在那儿），按行可收起（记 row.key）
+  const [yearHidden, setYearHidden] = useState<Set<string>>(new Set());
+  // ★「年度付款计划」「整年场地收支」已合并进台账每一行的展开区 —— 不再需要页面级折叠开关与搜索框：
+  //   点行首 ▶ 就能同时看到 ①本月合同明细 ②该场地年度付款计划（分期/审批/标记）③该场地整年收支。
+  //   要找某个场地方/品牌，直接用上面的筛选条件（场地方 / 品牌方 / 关键词）。
 
   // 区间内月份列表（限制最多 36 个月）
   const monthRange = useMemo(() => {
@@ -1010,9 +850,11 @@ export default function Rent() {
   }, [startPeriod, endPeriod]);
 
   const q = useQuery({
-    queryKey: ["rent-monthly-ledger-range", startPeriod, endPeriod, dim],
+    queryKey: ["rent-monthly-ledger-range", startPeriod, endPeriod],
     queryFn: async () => {
-      const results = await Promise.all(monthRange.map((p) => getMonthlyLedger(p, dim)));
+      // ★固定用「场地方」维度拉取：它一次带回 场地方 + 主体 + 合同快照（含品牌方合同），
+      // 足够拼出任何筛选视角（品牌/主体筛选在前端做），不用再按维度重复请求。
+      const results = await Promise.all(monthRange.map((p) => getMonthlyLedger(p, "landlord")));
       return monthRange.map((p, i) => ({ period: p, ...results[i] }));
     },
     enabled: monthRange.length > 0,
@@ -1028,6 +870,76 @@ export default function Rent() {
   };
 
   const months: any[] = q.data ?? [];
+
+  // ── 平铺台账行：一行 = 场地方 × 主体 × 月份 ──
+  //   数字与旧版「月份 → 场地/品牌」明细完全一致，只是把两层展开压平成一张可筛选的台账。
+  const flatRows = useMemo(() => {
+    const out: any[] = [];
+    for (const m of months) {
+      for (const g of (m.rows ?? []) as any[]) {
+        const contracts = (g.contracts ?? []) as any[];
+        const brandContracts = contracts.filter((c) => c.contractType === "品牌方合同");
+        const brands = [...new Set(brandContracts.map((c) => c.brandName).filter(Boolean))] as string[];
+        const brandIds = [...new Set(brandContracts.map((c) => c.brandId).filter((x) => x != null))] as number[];
+        const cabinets = brandContracts.reduce((s, c) => s + Number(c.liveCabinetsCount ?? c.cabinetsCount ?? 0), 0);
+        out.push({
+          key: `${m.period}|${g.key}|${g.entityId ?? "x"}`,
+          period: m.period,
+          landlordKey: g.key,
+          landlordName: g.name,
+          entityId: g.entityId ?? null,
+          entityName: g.entityName ?? "未指定主体",
+          brands, brandIds,
+          cabinets: Math.round(cabinets * 100) / 100,
+          cyc: rowCyclePrefixes(contracts),
+          rentIncome: Number(g.rentIncome ?? 0),
+          rentCost: Number(g.rentCost ?? 0),
+          rentTax: Number(g.rentTax ?? 0),
+          rentProfit: Number(g.rentProfit ?? 0),
+          collectedAmount: Number(g.collectedAmount ?? 0),
+          uncollectedAmount: Number(g.uncollectedAmount ?? 0),
+          paidAmount: Number(g.paidAmount ?? 0),
+          unpaidAmount: Number(g.unpaidAmount ?? 0),
+          contracts,
+          rowG: g,
+        });
+      }
+    }
+    return out;
+  }, [months]);
+
+  // 筛选项候选值（从已取到的数据派生，天然受账号数据范围约束）
+  const landlordOptions = useMemo(() => {
+    const seen = new Map<string, string>();
+    for (const r of flatRows) seen.set(String(r.landlordKey), r.landlordName ?? "");
+    return [...seen.entries()].map(([value, label]) => ({ value, label }));
+  }, [flatRows]);
+  const brandOptions = useMemo(() => {
+    const seen = new Map<string, string>();
+    for (const r of flatRows) {
+      for (const c of r.contracts) if (c.contractType === "品牌方合同" && c.brandId != null) seen.set(String(c.brandId), c.brandName ?? "");
+    }
+    return [...seen.entries()].map(([value, label]) => ({ value, label }));
+  }, [flatRows]);
+  const entityOptions = useMemo(() => {
+    const seen = new Map<string, string>();
+    for (const r of flatRows) seen.set(String(r.entityId ?? "none"), r.entityName ?? "未指定主体");
+    return [...seen.entries()].map(([value, label]) => ({ value, label }));
+  }, [flatRows]);
+
+  // ── 筛选 ──
+  const rows = useMemo(() => {
+    const kw = keyword.trim().toLowerCase();
+    return flatRows.filter((r) => {
+      if (fLandlord && String(r.landlordKey) !== fLandlord) return false;
+      if (fBrand && !r.brandIds.includes(Number(fBrand))) return false;
+      if (fEntity && String(r.entityId ?? "none") !== fEntity) return false;
+      if (fStatus === "uncollected" && !(r.uncollectedAmount > 0)) return false;
+      if (fStatus === "unpaid" && !(r.unpaidAmount > 0)) return false;
+      if (kw && !`${r.landlordName} ${r.entityName} ${r.brands.join(" ")}`.toLowerCase().includes(kw)) return false;
+      return true;
+    });
+  }, [flatRows, fLandlord, fBrand, fEntity, fStatus, keyword]);
 
   // 总览表头：区间内收/付款周期统一时用动态标题（如 本季度场地费应付）；混合周期回退通用标题
   const rangeCycles = useMemo(() => {
@@ -1051,35 +963,37 @@ export default function Rent() {
   const yearlyRows: any[] = useMemo(() => (months[0]?.yearlyRows ?? []), [months]);
   const yearLabel = useMemo(() => (startPeriod || CUR_MONTH).slice(0, 4) + "年", [startPeriod]);
 
-  // 年度付款计划：按场地方名称 / 品牌方名称 模糊过滤
-  const filteredPayRows = useMemo(() => {
-    const kw = payKeyword.trim();
-    if (!kw) return yearlyRows;
-    return yearlyRows.filter((gy: any) =>
-      (gy.landlordName || "").includes(kw)
-      || (gy.brands ?? []).some((b: any) => (b.brandName || "").includes(kw))
-    );
-  }, [yearlyRows, payKeyword]);
+  // 场地方 → 整年收支行（展开行里显示「这个场地」的整年收支）
+  const yearlyByLandlord = useMemo(() => {
+    const m = new Map<number, any>();
+    for (const y of yearlyRows) m.set(Number(y.landlordId), y);
+    return m;
+  }, [yearlyRows]);
 
-  // 年度付款计划：按场地方关联的公司主体分组（同一主体的场地方放在一起；未指定主体排最后）
-  const payGroups = useMemo(() => groupByEntity(filteredPayRows), [filteredPayRows]);
+  // 主体 → 配色（与旧版年度付款计划的配色一致）
+  const entityColor = useMemo(() => {
+    const m = new Map<string, GroupColor>();
+    for (const g of groupByEntity(flatRows)) m.set(g.entityName, g.color);
+    return m;
+  }, [flatRows]);
 
-  // 区间合计（总览）
+  // 合计：跟随筛选结果（与表尾合计、顶部总览卡一致）
   const totals = useMemo(() => {
-    const t = { rentIncome: 0, rentCost: 0, rentTax: 0, paidAmount: 0, unpaidAmount: 0, collectedAmount: 0, uncollectedAmount: 0, rentProfit: 0 };
-    for (const m of months) {
-      const mt = m.totals ?? {};
-      t.rentIncome += mt.rentIncome ?? 0;
-      t.rentCost += mt.rentCost ?? 0;
-      t.rentTax += mt.rentTax ?? 0;
-      t.paidAmount += mt.paidAmount ?? 0;
-      t.unpaidAmount += mt.unpaidAmount ?? 0;
-      t.collectedAmount += mt.collectedAmount ?? 0;
-      t.uncollectedAmount += mt.uncollectedAmount ?? 0;
+    const t = { cabinets: 0, rentIncome: 0, rentCost: 0, rentTax: 0, paidAmount: 0, unpaidAmount: 0, collectedAmount: 0, uncollectedAmount: 0, rentProfit: 0 };
+    for (const r of rows) {
+      t.cabinets += r.cabinets;
+      t.rentIncome += r.rentIncome;
+      t.rentCost += r.rentCost;
+      t.rentTax += r.rentTax;
+      t.paidAmount += r.paidAmount;
+      t.unpaidAmount += r.unpaidAmount;
+      t.collectedAmount += r.collectedAmount;
+      t.uncollectedAmount += r.uncollectedAmount;
     }
     t.rentProfit = t.rentIncome - t.rentCost - t.rentTax;
+    for (const k of Object.keys(t) as (keyof typeof t)[]) t[k] = Math.round(t[k] * 100) / 100;
     return t;
-  }, [months]);
+  }, [rows]);
 
   const quick = (n: number) => {
     setEndPeriod(CUR_MONTH);
@@ -1160,231 +1074,292 @@ export default function Rent() {
 
   return (
     <div className="space-y-4">
-      {/* ── 顶部：月份区间 + 维度切换 ── */}
-      <div className="flex flex-wrap items-center gap-3">
-        <h2 className="text-lg font-bold">场地费月台账</h2>
+      {/* ── 顶部：月份区间 + ★筛选条件（不再切换维度） ── */}
+      <div className="flex flex-wrap items-center gap-2">
+        <h2 className="text-lg font-bold">场地费台账</h2>
         <div className="flex items-center gap-1 text-xs text-slate-500">
-          <span>从</span>
           <input type="month" className={`${inputCls} w-36`} value={toDisplay(startPeriod)}
-            onChange={(e) => e.target.value && setStartPeriod(toCompact(e.target.value))} />
-          <span>到</span>
+            onChange={(e) => {
+              const v = e.target.value;
+              if (!v) return;
+              setStartPeriod(toCompact(v));
+              if (toCompact(v) > endPeriod) setEndPeriod(toCompact(v));
+            }} title="起始月" />
+          <span>~</span>
           <input type="month" className={`${inputCls} w-36`} value={toDisplay(endPeriod)}
-            onChange={(e) => e.target.value && setEndPeriod(toCompact(e.target.value))} />
+            onChange={(e) => {
+              const v = e.target.value;
+              if (!v) return;
+              setEndPeriod(toCompact(v));
+              if (toCompact(v) < startPeriod) setStartPeriod(toCompact(v));
+            }} title="结束月" />
         </div>
-        <div className="flex gap-1">
-          <Button size="sm" variant="outline" onClick={() => { setStartPeriod(CUR_MONTH); setEndPeriod(CUR_MONTH); }}>本月</Button>
-          <Button size="sm" variant="outline" onClick={() => quick(3)}>近3月</Button>
-          <Button size="sm" variant="outline" onClick={() => quick(6)}>近6月</Button>
-          <Button size="sm" variant="outline" onClick={() => quick(12)}>近12月</Button>
+        <div className="flex items-center gap-0.5 rounded-md border border-slate-200 bg-white p-0.5">
+          {([["本月", 1], ["近3月", 3], ["近6月", 6], ["近12月", 12]] as const).map(([label, n]) => (
+            <button key={label} type="button" onClick={() => quick(n)}
+              className="rounded px-1.5 py-1 text-[11px] text-slate-600 transition-colors hover:bg-slate-100 hover:text-blue-600">
+              {label}
+            </button>
+          ))}
         </div>
-        <div className="flex overflow-hidden rounded-lg border">
-          <Button size="sm" variant={dim === "landlord" ? "default" : "ghost"}
-            className={dim === "landlord" ? "bg-emerald-600 hover:bg-emerald-700" : ""}
-            onClick={() => setDim("landlord")}>
-            <Building2 className="mr-1 h-3.5 w-3.5" />按场地方
-          </Button>
-          <Button size="sm" variant={dim === "brand" ? "default" : "ghost"}
-            className={dim === "brand" ? "bg-blue-600 hover:bg-blue-700" : ""}
-            onClick={() => setDim("brand")}>
-            <Tag className="mr-1 h-3.5 w-3.5" />按品牌方
-          </Button>
+        <input className={`${inputCls} w-44`} placeholder="搜索场地方 / 品牌方 / 主体…"
+          value={keyword} onChange={(e) => setKeyword(e.target.value)} />
+        <div className="w-36">
+          <SearchSelect value={fLandlord} onChange={setFLandlord} placeholder="全部场地方" options={landlordOptions} />
         </div>
+        <div className="w-36">
+          <SearchSelect value={fBrand} onChange={setFBrand} placeholder="全部品牌方" options={brandOptions} />
+        </div>
+        <div className="w-36">
+          <SearchSelect value={fEntity} onChange={setFEntity} placeholder="全部主体" options={entityOptions} />
+        </div>
+        <select className={`${inputCls} w-32`} value={fStatus} onChange={(e) => setFStatus(e.target.value)}
+          title="按合同周期口径：未收/未付 = 该月覆盖期次还没到账 / 还没付款">
+          <option value="">收付：全部</option>
+          <option value="uncollected">仅未收（应收未到账）</option>
+          <option value="unpaid">仅未付（应付未付款）</option>
+        </select>
+        <button type="button"
+          onClick={() => { setFLandlord(""); setFBrand(""); setFEntity(""); setFStatus(""); setKeyword(""); }}
+          className="rounded px-1.5 py-1 text-[11px] text-slate-400 hover:text-slate-600">清空筛选</button>
         <span className="text-xs text-slate-400">
-          {toDisplay(startPeriod)} ~ {toDisplay(endPeriod)} · 仅场地费（不含电费）
+          {toDisplay(startPeriod)} ~ {toDisplay(endPeriod)} · {rows.length} / {flatRows.length} 行 · 仅场地费（不含电费）
         </span>
         <Button size="sm" className="ml-auto bg-blue-600 hover:bg-blue-700" onClick={doExport}>
           <Download className="mr-1 h-3.5 w-3.5" />导出 Excel
         </Button>
       </div>
 
-      {/* ── 区间总览（合计核对） ── */}
+      {/* ── 合计总览（跟随筛选条件） ── */}
       <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
-        <StatCard label="区间场地费收入" value={totals.rentIncome} tone="emerald" />
-        {dim === "landlord" && <StatCard label="区间场地费成本" value={totals.rentCost} tone="rose" />}
-        <StatCard label="区间税费" value={totals.rentTax} />
-        <StatCard label="区间利润" value={totals.rentProfit} tone="blue" />
-        <StatCard label="区间已收" value={totals.collectedAmount} tone="emerald" />
-        <StatCard label="区间未收" value={totals.uncollectedAmount} />
-        {dim === "landlord" && <StatCard label="区间已付" value={totals.paidAmount} />}
-        {dim === "landlord" && <StatCard label="区间未付" value={totals.unpaidAmount} tone="rose" />}
+        <StatCard label="场地费收入" value={totals.rentIncome} tone="emerald" />
+        <StatCard label="场地费成本" value={totals.rentCost} tone="rose" />
+        <StatCard label="税费" value={totals.rentTax} />
+        <StatCard label="利润" value={totals.rentProfit} tone="blue" />
+        <StatCard label="已收" value={totals.collectedAmount} tone="emerald" />
+        <StatCard label="未收" value={totals.uncollectedAmount} />
+        <StatCard label="已付" value={totals.paidAmount} />
+        <StatCard label="未付" value={totals.unpaidAmount} tone="rose" />
       </div>
 
-      {/* ── 年度付款计划（默认收起，可搜索场地方/品牌） ── */}
-      {yearlyRows.length > 0 && (
-        <div className="rounded-xl border bg-white shadow-sm">
-          <button className="flex w-full items-center gap-2.5 px-4 py-3 text-left" onClick={() => setPayOpen((o) => !o)}>
-            {payOpen ? <ChevronDown className="h-4 w-4 text-indigo-600" /> : <ChevronRight className="h-4 w-4 text-indigo-600" />}
-            <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-indigo-100 text-indigo-600">
-              <CalendarCheck className="h-4 w-4" />
-            </span>
-            <h3 className="text-sm font-semibold text-slate-700">年度付款计划（{yearLabel}）</h3>
-            <span className="hidden rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-medium text-slate-500 md:inline">场地费付款分期 + 收款进度 · 提交审批</span>
-            <span className="ml-auto text-[11px] text-slate-400">{payOpen ? "收起" : "展开"}</span>
-          </button>
-          {payOpen && (
-            <div className="border-t px-4 py-3">
-              <div className="mb-3 flex items-center gap-2">
-                <div className="relative">
-                  <Search className="absolute left-2 top-2 h-3.5 w-3.5 text-slate-400" />
-                  <input
-                    className={inputCls + " w-64 pl-7 text-xs"}
-                    placeholder="模糊搜索场地方 / 品牌方…"
-                    value={payKeyword}
-                    onChange={(e) => setPayKeyword(e.target.value)}
-                  />
-                </div>
-                <span className="text-[11px] text-slate-400">
-                  {filteredPayRows.length}/{yearlyRows.length} 个场地方
-                </span>
-              </div>
-              <div className="space-y-4">
-                {payGroups.map((g) => {
-                  const c = g.color;
-                  return (
-                  <div key={g.entityName} className={`space-y-3 rounded-xl border p-3 ${c.border} ${c.bg}`}>
-                    <div className="flex items-center gap-2 px-1">
-                      <div className={`flex h-6 w-6 items-center justify-center rounded-md ${c.icon}`}>
-                        <Landmark className="h-3.5 w-3.5 text-white" />
-                      </div>
-                      <span className={`text-xs font-semibold ${c.text}`}>{g.entityName}</span>
-                      <span className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${c.chip}`}>{g.rows.length} 个场地方</span>
-                    </div>
-                    {g.rows.map((gy: any) => (
-                      <RentPaymentSchedule
-                        key={gy.landlordId}
-                        landlordId={gy.landlordId}
-                        landlordName={gy.landlordName}
-                        year={(startPeriod || CUR_MONTH).slice(0, 4)}
-                        color={c}
-                      />
-                    ))}
-                  </div>
-                  );
-                })}
-                {filteredPayRows.length === 0 && (
-                  <div className="rounded-md bg-slate-50 px-3 py-4 text-center text-xs text-slate-400">
-                    没有匹配「{payKeyword.trim()}」的场地方 / 品牌方
-                  </div>
-                )}
-              </div>
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* ── 按月总览表 ── */}
-      <div className="overflow-x-auto rounded-xl border bg-white shadow-sm">
-        <table className="w-full min-w-[900px] text-xs">
+      {/* ── 场地费台账平铺明细（★重设计：一行 = 场地方 × 主体 × 月份；筛选条件定位，不再按月份分层展开）
+             展开行 = 一处看全：本月合同明细 + 该场地年度付款计划（分期/审批/标记）+ 该场地整年收支 ── */}
+      <div className="xl-wrap xl-wrap-scroll rounded-xl shadow-sm">
+        <table className="xl-table" style={{ minWidth: 1290 }}>
           <thead>
-            <tr className="border-b bg-slate-50 text-left text-[11px] text-slate-500">
-              <th className="w-8 px-2 py-2.5"></th>
-              <th className="px-3 py-2.5 font-medium">月份</th>
-              <th className="px-3 py-2.5 text-right font-medium">场地费收入(月)</th>
-              {dim === "landlord" && <th className="px-3 py-2.5 text-right font-medium">场地费成本(月)</th>}
-              <th className="px-3 py-2.5 text-right font-medium">税费(月)</th>
-              <th className="px-3 py-2.5 text-right font-medium">利润(月)</th>
-              <th className="px-3 py-2.5 text-right font-medium">{rangeCycles.income ? `${rangeCycles.income}场地费已收` : "已收(按周期)"}</th>
-              <th className="px-3 py-2.5 text-right font-medium">{rangeCycles.income ? `${rangeCycles.income}场地费未收` : "未收(按周期)"}</th>
-              {dim === "landlord" && <th className="px-3 py-2.5 text-right font-medium">{rangeCycles.pay ? `${rangeCycles.pay}场地费已付` : "已付(按周期)"}</th>}
-              {dim === "landlord" && <th className="px-3 py-2.5 text-right font-medium">{rangeCycles.pay ? `${rangeCycles.pay}场地费应付` : "未付(按周期)"}</th>}
+            <tr>
+              <th className="xl-freeze xl-ctr" style={{ left: 0, width: 30 }}></th>
+              <th className="xl-freeze" style={{ left: 30, width: 78 }}>月份</th>
+              <th className="xl-freeze" style={{ left: 108, width: 110 }}>场地方</th>
+              <th style={{ width: 96 }}>主体</th>
+              <th style={{ width: 110 }}>品牌方</th>
+              <th className="xl-num" style={{ width: 56 }} title="该场地当月计费柜数（品牌方合同柜数合计）">柜数</th>
+              <th className="xl-num" style={{ width: 104 }}>场地费收入(月)</th>
+              <th className="xl-num" style={{ width: 104 }}>场地费成本(月)</th>
+              <th className="xl-num" style={{ width: 80 }}>税费(月)</th>
+              <th className="xl-num" style={{ width: 90 }}>利润(月)</th>
+              <th className="xl-num" style={{ width: 104 }}>{rangeCycles.income ? `${rangeCycles.income}场地费已收` : "已收(按周期)"}</th>
+              <th className="xl-num" style={{ width: 104 }}>{rangeCycles.income ? `${rangeCycles.income}场地费未收` : "未收(按周期)"}</th>
+              <th className="xl-num" style={{ width: 104 }}>{rangeCycles.pay ? `${rangeCycles.pay}场地费已付` : "已付(按周期)"}</th>
+              <th className="xl-num" style={{ width: 104 }}>{rangeCycles.pay ? `${rangeCycles.pay}场地费应付` : "未付(按周期)"}</th>
             </tr>
           </thead>
           <tbody>
-            {months.length === 0 && (
-              <tr><td colSpan={dim === "landlord" ? 10 : 6} className="px-3 py-8 text-center text-slate-400">
-                {q.isLoading ? "加载中…" : "请选择有效的月份区间"}
-              </td></tr>
+            {rows.length === 0 && (
+              <tr>
+                <td colSpan={14} className="xl-ctr xl-muted" style={{ padding: "28px 8px" }}>
+                  {q.isLoading ? "加载中…" : "所选筛选条件下没有场地费台账数据"}
+                </td>
+              </tr>
             )}
-            {months.map((m) => {
-              const mt = m.totals ?? {};
-              const cyc = monthCyclePrefixes(m.rows ?? []);
-              const mKey = `m-${m.period}`;
-              const mOpen = expanded.has(mKey);
+            {rows.map((r) => {
+              const open = expanded.has(r.key);
+              const canExpand = (r.contracts?.length ?? 0) > 0;
+              // 年度付款计划按「该行月份」的年份取（跨年区间不会串年）；整年收支用起始月年份（后端按该年构建）
+              const rowYear = (r.period || CUR_MONTH).slice(0, 4);
               return (
-                <Fragment key={mKey}>
-                  <tr className="cursor-pointer border-b hover:bg-slate-50/60" onClick={() => toggle(mKey)}>
-                    <td className="px-2 py-2.5 text-slate-400">
-                      {mOpen ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
+                <Fragment key={r.key}>
+                  <tr className={open ? "xl-open" : ""}>
+                    <td className="xl-freeze xl-ctr" style={{ left: 0 }}>
+                      {canExpand ? (
+                        <button className="text-slate-400 hover:text-slate-600" onClick={() => toggle(r.key)} title="展开该场地当月的合同明细（场地合同 / 品牌方合同）">
+                          {open ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
+                        </button>
+                      ) : (
+                        <span className="text-slate-200">·</span>
+                      )}
                     </td>
-                    <td className="px-3 py-2.5 font-medium text-slate-700">{toDisplay(m.period)}</td>
-                    <td className="px-3 py-2.5 text-right tabular-nums text-emerald-600">{fmtMoney(mt.rentIncome)}</td>
-                    {dim === "landlord" && <td className="px-3 py-2.5 text-right tabular-nums text-rose-600">{fmtMoney(mt.rentCost)}</td>}
-                    <td className="px-3 py-2.5 text-right tabular-nums text-slate-500">{fmtMoney(mt.rentTax)}</td>
-                    <td className="px-3 py-2.5 text-right tabular-nums font-medium text-slate-700">{fmtMoney(mt.rentProfit)}</td>
-                    <td className="px-3 py-2.5 text-right tabular-nums text-emerald-600">{fmtMoney(mt.collectedAmount)}</td>
-                    <td className="px-3 py-2.5 text-right tabular-nums text-amber-600">{fmtMoney(mt.uncollectedAmount)}</td>
-                    {dim === "landlord" && <td className="px-3 py-2.5 text-right tabular-nums text-slate-600">{fmtMoney(mt.paidAmount)}</td>}
-                    {dim === "landlord" && <td className="px-3 py-2.5 text-right tabular-nums text-rose-600">{fmtMoney(mt.unpaidAmount)}</td>}
+                    <td className="xl-freeze font-medium text-slate-700" style={{ left: 30 }}>{toDisplay(r.period)}</td>
+                    <td className="xl-freeze truncate" style={{ left: 108 }} title={r.landlordName}>{r.landlordName ?? "未指定场地"}</td>
+                    <td className="truncate text-slate-600" title={r.entityName}>{r.entityName}</td>
+                    <td className="truncate" title={r.brands.join("、")}>
+                      {r.brands.length === 0
+                        ? <span className="xl-muted">—</span>
+                        : r.brands.length === 1
+                          ? r.brands[0]
+                          : <span className="font-medium text-blue-600">{r.brands.length} 个品牌</span>}
+                    </td>
+                    <td className="xl-num">{r.cabinets ? fmtNum(r.cabinets) : <span className="xl-muted">—</span>}</td>
+                    <td className="xl-num text-emerald-600">{fmtMoney(r.rentIncome)}</td>
+                    <td className="xl-num xl-neg">{fmtMoney(r.rentCost)}</td>
+                    <td className="xl-num text-slate-500">{fmtMoney(r.rentTax)}</td>
+                    <td className="xl-num font-medium text-slate-700">{fmtMoney(r.rentProfit)}</td>
+                    <td className="xl-num text-emerald-600" title={r.cyc.income ? `该行合同周期：${r.cyc.income}` : undefined}>
+                      {!rangeCycles.income && r.cyc.income && <span className="mr-1 text-[9px] text-slate-400">{r.cyc.income}</span>}
+                      {fmtMoney(r.collectedAmount)}
+                    </td>
+                    <td className="xl-num text-amber-600" title={r.cyc.income ? `该行合同周期：${r.cyc.income}` : undefined}>
+                      {!rangeCycles.income && r.cyc.income && <span className="mr-1 text-[9px] text-slate-400">{r.cyc.income}</span>}
+                      {fmtMoney(r.uncollectedAmount)}
+                    </td>
+                    <td className="xl-num text-slate-600" title={r.cyc.pay ? `该行合同周期：${r.cyc.pay}` : undefined}>
+                      {!rangeCycles.pay && r.cyc.pay && <span className="mr-1 text-[9px] text-slate-400">{r.cyc.pay}</span>}
+                      {fmtMoney(r.paidAmount)}
+                    </td>
+                    <td className="xl-num xl-neg" title={r.cyc.pay ? `该行合同周期：${r.cyc.pay}` : undefined}>
+                      {!rangeCycles.pay && r.cyc.pay && <span className="mr-1 text-[9px] text-slate-400">{r.cyc.pay}</span>}
+                      {fmtMoney(r.unpaidAmount)}
+                    </td>
                   </tr>
-                  {mOpen && (
-                    <tr className="border-b bg-slate-50/40">
-                      <td colSpan={dim === "landlord" ? 10 : 6} className="px-6 py-3">
-                        <div className="space-y-3">
-                          <div className="text-[11px] font-medium text-slate-400">
-                            {toDisplay(m.period)} · 按{dim === "landlord" ? "场地方" : "品牌方"}明细（点击卡片展开合同：付款/收款信息）
-                          </div>
-                          {(dim === "landlord"
-                            ? groupByEntity(m.rows ?? [])
-                            : [{ entityName: "", color: null, rows: m.rows ?? [] }]
-                          ).map((grp: any, gi: number) => (
-                            <div key={`grp-${m.period}-${gi}`} className={dim === "landlord" ? "space-y-1.5 rounded-lg border border-indigo-100 bg-indigo-50/30 p-2" : "space-y-1.5"}>
-                              {dim === "landlord" && (
-                                <div className="flex items-center gap-2 px-1">
-                                  <span className="text-[11px] font-semibold text-indigo-700">公司主体：{grp.entityName}</span>
-                                  <span className="rounded-full bg-indigo-100 px-2 py-0.5 text-[10px] font-medium text-indigo-700">{grp.rows.length} 个场地方</span>
-                                </div>
-                              )}
-                              {(grp.rows ?? []).length > 0 && (
-                              <div className="overflow-x-auto rounded-lg border bg-white">
-                              <table className="w-full min-w-[640px] text-[11px]">
-                                <thead>
-                                  <tr className="border-b bg-slate-100 text-left text-[10px] text-slate-500">
-                                    <th className="w-72 px-2 py-1">{dim === "landlord" ? "场地方" : "品牌方"}</th>
-                                    <th className="px-2 py-1 text-right">场地费收入(月)</th>
-                                    {dim === "landlord" && <th className="px-2 py-1 text-right">场地费成本(月)</th>}
-                                    <th className="px-2 py-1 text-right">税费(月)</th>
-                                    <th className="px-2 py-1 text-right">利润(月)</th>
-                                    <th className="px-2 py-1 text-right">{cyc.income ? `${cyc.income}场地费已收` : "已收(按周期)"}</th>
-                                    <th className="px-2 py-1 text-right">{cyc.income ? `${cyc.income}场地费未收` : "未收(按周期)"}</th>
-                                    {dim === "landlord" && <th className="px-2 py-1 text-right">{cyc.pay ? `${cyc.pay}场地费已付` : "已付(按周期)"}</th>}
-                                    {dim === "landlord" && <th className="px-2 py-1 text-right">{cyc.pay ? `${cyc.pay}场地费应付` : "未付(按周期)"}</th>}
-                                  </tr>
-                                </thead>
-                                <tbody>
-                                  {(grp.rows ?? []).map((g: any) => {
-                                    const tags = rowCyclePrefixes(g.contracts);
-                                    return (
-                                    <tr key={g.key} className="border-b last:border-0">
-                                      <td className="px-2 py-1.5 font-medium text-slate-700">{g.name}</td>
-                                      <td className="px-2 py-1.5 text-right tabular-nums text-emerald-600">{fmtMoney(g.rentIncome)}</td>
-                                      {dim === "landlord" && <td className="px-2 py-1.5 text-right tabular-nums text-rose-600">{fmtMoney(g.rentCost)}</td>}
-                                      <td className="px-2 py-1.5 text-right tabular-nums text-slate-500">{fmtMoney(g.rentTax)}</td>
-                                      <td className="px-2 py-1.5 text-right tabular-nums font-medium text-slate-700">{fmtMoney(g.rentProfit)}</td>
-                                      <td className="px-2 py-1.5 text-right tabular-nums text-emerald-600">
-                                        {!cyc.income && tags.income && <span className="mr-1 text-[9px] text-slate-400">{tags.income}</span>}
-                                        {fmtMoney(g.collectedAmount)}
-                                      </td>
-                                      <td className="px-2 py-1.5 text-right tabular-nums text-amber-600">
-                                        {!cyc.income && tags.income && <span className="mr-1 text-[9px] text-slate-400">{tags.income}</span>}
-                                        {fmtMoney(g.uncollectedAmount)}
-                                      </td>
-                                      {dim === "landlord" && <td className="px-2 py-1.5 text-right tabular-nums text-slate-600">
-                                        {!cyc.pay && tags.pay && <span className="mr-1 text-[9px] text-slate-400">{tags.pay}</span>}
-                                        {fmtMoney(g.paidAmount)}
-                                      </td>}
-                                      {dim === "landlord" && <td className="px-2 py-1.5 text-right tabular-nums text-rose-600">
-                                        {!cyc.pay && tags.pay && <span className="mr-1 text-[9px] text-slate-400">{tags.pay}</span>}
-                                        {fmtMoney(g.unpaidAmount)}
-                                      </td>}
-                                    </tr>
-                                    );
-                                  })}
-                                </tbody>
-                              </table>
-                              </div>
-                              )}
+                  {open && canExpand && (
+                    <tr className="xl-detail">
+                      <td colSpan={14} className="p-0">
+                        <div className="p-2 pt-1.5">
+
+                          {/* ① 本月口径指标条：这个月的钱一眼看完（口径与上方主表列一致） */}
+                          <div className="xl-summary xl-summary-sm">
+                            <div>
+                              <div className="lbl">{toDisplay(r.period)} 场地费收入</div>
+                              <div className="val text-emerald-600">{fmtMoney(r.rentIncome)}</div>
                             </div>
-                          ))}
+                            <div>
+                              <div className="lbl">场地费成本</div>
+                              <div className="val text-rose-600">{fmtMoney(r.rentCost)}</div>
+                            </div>
+                            <div>
+                              <div className="lbl">税费</div>
+                              <div className="val text-slate-500">{fmtMoney(r.rentTax)}</div>
+                            </div>
+                            <div>
+                              <div className="lbl">利润</div>
+                              <div className="val text-slate-800">{fmtMoney(r.rentProfit)}</div>
+                            </div>
+                            <div>
+                              <div className="lbl">{r.cyc.income ? `${r.cyc.income}已收` : "已收(按周期)"}</div>
+                              <div className="val text-emerald-600">{fmtMoney(r.collectedAmount)}</div>
+                            </div>
+                            <div>
+                              <div className="lbl">{r.cyc.income ? `${r.cyc.income}未收` : "未收(按周期)"}</div>
+                              <div className="val text-amber-600">{fmtMoney(r.uncollectedAmount)}</div>
+                            </div>
+                            <div>
+                              <div className="lbl">{r.cyc.pay ? `${r.cyc.pay}已付` : "已付(按周期)"}</div>
+                              <div className="val text-slate-600">{fmtMoney(r.paidAmount)}</div>
+                            </div>
+                            <div>
+                              <div className="lbl">{r.cyc.pay ? `${r.cyc.pay}应付` : "未付(按周期)"}</div>
+                              <div className="val text-rose-600">{fmtMoney(r.unpaidAmount)}</div>
+                            </div>
+                            <div>
+                              <div className="lbl">计费柜数</div>
+                              <div className="val text-slate-700">{r.cabinets ? fmtNum(r.cabinets) : "—"}</div>
+                            </div>
+                          </div>
+
+                          {/* ② 年度付款计划（通栏：它内部本身就是「付款 / 收款」双栏并排）*/}
+                          <div className="xl-sec mt-2.5">
+                            <div className="xl-sec-head is-plan">
+                              <CalendarCheck className="h-3.5 w-3.5 text-indigo-600" />
+                              {r.landlordName} · {rowYear} 年付款计划
+                              <span className="tag">左=付款（我们→场地方）· 右=收款（品牌方→我们）· 逾期标红 · 每期可提交审批 / 标记</span>
+                            </div>
+                            <RentPaymentSchedule
+                              landlordId={Number(r.landlordKey)}
+                              landlordName={r.landlordName}
+                              year={rowYear}
+                              color={entityColor.get(r.entityName) ?? GROUP_COLOR_NEUTRAL}
+                            />
+                          </div>
+
+                          {/* ③ 本月合同明细（通栏：11 列，铺开更清楚） */}
+                          <div className="xl-sec mt-2.5">
+                            <div className="xl-sec-head is-contract">
+                              <FileText className="h-3.5 w-3.5 text-sky-600" />
+                              本月合同明细
+                              <span className="tag">{toDisplay(r.period)} · {r.contracts.length} 份 · 成本=场地合同 / 收入=品牌方合同</span>
+                            </div>
+                            <div className="xl-dwrap" style={{ maxHeight: 260 }}>
+                                <table>
+                                  <thead>
+                                    <tr>
+                                      <th style={{ width: 96 }}>合同类型</th>
+                                      <th style={{ width: 130 }}>品牌方</th>
+                                      <th style={{ width: 120 }}>主体</th>
+                                      <th style={{ width: 56 }}>柜数</th>
+                                      <th style={{ width: 100 }}>月租(含税)</th>
+                                      <th style={{ width: 90 }}>单台月租</th>
+                                      <th style={{ width: 60 }}>税率</th>
+                                      <th style={{ width: 96 }}>已收/已付</th>
+                                      <th style={{ width: 96 }}>未收/应付</th>
+                                      <th style={{ width: 176 }}>租期</th>
+                                      <th style={{ width: 88 }}>付款方式</th>
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {r.contracts.map((c: any, i: number) => {
+                                      const isVenue = c.contractType !== "品牌方合同";
+                                      const cabs = Number(c.liveCabinetsCount ?? c.cabinetsCount ?? 0);
+                                      return (
+                                        <tr key={`${r.key}-${c.contractId ?? i}`}>
+                                          <td className={isVenue ? "font-medium text-rose-600" : "font-medium text-emerald-600"}>
+                                            {isVenue ? "场地合同（成本）" : "品牌方合同（收入）"}
+                                          </td>
+                                          <td>{c.brandName || <span style={{ color: "#94a3b8" }}>—</span>}</td>
+                                          <td className="truncate text-slate-600" title={c.entityName}>{c.entityName || "—"}</td>
+                                          <td className="num">{cabs ? fmtNum(cabs) : "—"}</td>
+                                          <td className="num">{fmtMoney(c.monthlyRent)}</td>
+                                          <td className="num">{c.unitMonthlyRent != null ? fmtNum(c.unitMonthlyRent) : "—"}</td>
+                                          <td className="num">{c.rentTaxRate ? `${(Number(c.rentTaxRate) * 100).toFixed(0)}%` : "—"}</td>
+                                          <td className="num">{fmtMoney(isVenue ? c.paidAmount : c.collectedAmount)}</td>
+                                          <td className="num">{fmtMoney(isVenue ? c.unpaidAmount : c.uncollectedAmount)}</td>
+                                          <td className="ctr text-slate-500">
+                                            {c.startDate ? `${String(c.startDate).slice(0, 10)} ~ ${c.endDate ? String(c.endDate).slice(0, 10) : ""}` : "—"}
+                                          </td>
+                                          <td className="ctr text-slate-500">{c.payMethod || "—"}</td>
+                                        </tr>
+                                      );
+                                    })}
+                                  </tbody>
+                                </table>
+                              </div>
+                            </div>
+
+                          {/* ④ 通栏：该场地整年收支（宽表，默认展开，可收起） */}
+                          <div className="xl-sec mt-2.5">
+                            <div className="xl-sec-head is-year">
+                              <Building2 className="h-3.5 w-3.5 text-emerald-600" />
+                              {yearLabel} 整年收支
+                              <span className="tag">付款信息 = 场地合同 · 收款信息 = 品牌方合同 · 按合同周期计</span>
+                              <button
+                                type="button"
+                                onClick={() => setYearHidden((prev) => {
+                                  const n = new Set(prev);
+                                  if (n.has(r.key)) n.delete(r.key); else n.add(r.key);
+                                  return n;
+                                })}
+                                className="ml-auto text-[11px] font-normal text-slate-400 hover:text-slate-600"
+                              >
+                                {yearHidden.has(r.key) ? "展开" : "收起"}
+                              </button>
+                            </div>
+                            {!yearHidden.has(r.key) && (yearlyByLandlord.get(Number(r.landlordKey)) ? (
+                              <YearlyTable yearlyRows={[yearlyByLandlord.get(Number(r.landlordKey))]} yearLabels={yearLabels} />
+                            ) : (
+                              <div className="rounded-md bg-slate-50 px-3 py-3 text-[11px] text-slate-400">
+                                该场地在 {yearLabel} 没有可用合同数据
+                              </div>
+                            ))}
+                          </div>
                         </div>
                       </td>
                     </tr>
@@ -1393,18 +1368,22 @@ export default function Rent() {
               );
             })}
           </tbody>
-          {months.length > 0 && (
+          {rows.length > 0 && (
             <tfoot>
-              <tr className="border-t bg-slate-50 font-medium">
-                <td className="px-2 py-2.5" colSpan={2}>区间合计（{months.length} 个月）</td>
-                <td className="px-3 py-2.5 text-right tabular-nums text-emerald-600">{fmtMoney(totals.rentIncome)}</td>
-                {dim === "landlord" && <td className="px-3 py-2.5 text-right tabular-nums text-rose-600">{fmtMoney(totals.rentCost)}</td>}
-                <td className="px-3 py-2.5 text-right tabular-nums text-slate-500">{fmtMoney(totals.rentTax)}</td>
-                <td className="px-3 py-2.5 text-right tabular-nums">{fmtMoney(totals.rentProfit)}</td>
-                <td className="px-3 py-2.5 text-right tabular-nums text-emerald-600">{fmtMoney(totals.collectedAmount)}</td>
-                <td className="px-3 py-2.5 text-right tabular-nums text-amber-600">{fmtMoney(totals.uncollectedAmount)}</td>
-                {dim === "landlord" && <td className="px-3 py-2.5 text-right tabular-nums text-slate-600">{fmtMoney(totals.paidAmount)}</td>}
-                {dim === "landlord" && <td className="px-3 py-2.5 text-right tabular-nums text-rose-600">{fmtMoney(totals.unpaidAmount)}</td>}
+              <tr>
+                <td className="xl-freeze xl-ctr" style={{ left: 0 }}></td>
+                <td className="xl-freeze" style={{ left: 30 }} colSpan={4}>
+                  合计 · {rows.length} 行 / {new Set(rows.map((r) => r.landlordKey)).size} 个场地方 × {new Set(rows.map((r) => r.period)).size} 个月
+                </td>
+                <td className="xl-num">{fmtNum(totals.cabinets)}</td>
+                <td className="xl-num text-emerald-600">{fmtMoney(totals.rentIncome)}</td>
+                <td className="xl-num xl-neg">{fmtMoney(totals.rentCost)}</td>
+                <td className="xl-num text-slate-500">{fmtMoney(totals.rentTax)}</td>
+                <td className="xl-num font-medium">{fmtMoney(totals.rentProfit)}</td>
+                <td className="xl-num text-emerald-600">{fmtMoney(totals.collectedAmount)}</td>
+                <td className="xl-num text-amber-600">{fmtMoney(totals.uncollectedAmount)}</td>
+                <td className="xl-num text-slate-600">{fmtMoney(totals.paidAmount)}</td>
+                <td className="xl-num xl-neg">{fmtMoney(totals.unpaidAmount)}</td>
               </tr>
             </tfoot>
           )}
@@ -1417,23 +1396,10 @@ export default function Rent() {
         当月周期统一时列标题随之显示（如「本季度场地费应付」），周期混合时每行金额前标注该行合同的周期。不含电费。编辑合同请到「合同管理」页。
       </p>
 
-      {/* ── 整年场地收支（页面末尾，默认收起，点击展开） ── */}
-      {yearlyRows.length > 0 && (
-        <div className="rounded-xl border bg-white shadow-sm">
-          <button className="flex w-full items-center gap-2 px-4 py-3 text-left" onClick={() => setYearlyOpen((o) => !o)}>
-            {yearlyOpen ? <ChevronDown className="h-4 w-4 text-emerald-600" /> : <ChevronRight className="h-4 w-4 text-emerald-600" />}
-            <Building2 className="h-4 w-4 text-emerald-600" />
-            <h3 className="text-sm font-semibold text-slate-700">整年场地收支（{yearLabel}）</h3>
-            <span className="hidden text-[11px] text-slate-400 md:inline">付款信息=场地合同 · 收款信息=品牌方合同 · 按合同周期计算</span>
-            <span className="ml-auto text-[11px] text-slate-400">{yearlyOpen ? "收起" : "展开"}</span>
-          </button>
-          {yearlyOpen && (
-            <div className="border-t px-4 py-3">
-              <YearlyTable yearlyRows={yearlyRows} yearLabels={yearLabels} />
-            </div>
-          )}
-        </div>
-      )}
+      <p className="text-[11px] text-slate-400">
+        · 点行首 ▶ 展开：<b>本月指标条</b> → <b>年度付款计划</b>（左付款 / 右收款，并排 · 逾期标红 · 每期可提交审批或标记）→ <b>本月合同明细</b> → <b>整年收支</b>。
+        <br />· 「年度付款计划」按该行月份的年份取数；「整年收支」按起始月所处年份构建，其「逐年」列只显示该年。
+      </p>
     </div>
   );
 }
