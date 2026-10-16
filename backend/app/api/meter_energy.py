@@ -3,7 +3,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from ..infra.database import get_connection, get_dict_cursor
 from ..infra.auth_scope import scope_landlord_ids, scope_meter_tag, ensure_meter_in_scope
 from ..infra.period import to_compact, to_display
-from ..domain.electricity_pricing import resolve_prices, split_tax
+from ..domain.electricity_pricing import resolve_prices, split_tax, brand_price_for
 from ..repositories import shared_allocation_repo
 from .base import CamelJSONResponse
 
@@ -329,7 +329,7 @@ async def get_shared_allocations(request: Request = None, meterNo: str = None, m
     cur = get_dict_cursor(conn)
     try:
         cur.execute("""
-            SELECT m.id, m.meter_no, m.meter_name, m.brand_id, m.landlord_id, m.entity_id,
+        SELECT m.id, m.meter_no, m.meter_name, m.brand_id, m.brand_contract_id, m.landlord_id, m.entity_id,
                    m.tag, m.category_code, m.is_shared, m.transformer_ratio, m.device_address,
                    l.name AS landlord_name, b.name AS brand_name
             FROM meters m
@@ -364,6 +364,7 @@ async def get_shared_allocations(request: Request = None, meterNo: str = None, m
     # 候选品牌：该场地方已签品牌方合同的品牌（默认单价 = 合同单价）
     candidates = []
     for bid, info in sorted(pricing["brand_prices"].items(), key=lambda kv: brand_names.get(kv[0], "")):
+        options = pricing["brand_price_options"].get(bid, [])
         candidates.append({
             "brandId": bid,
             "brandName": brand_names.get(bid, f"品牌{bid}"),
@@ -371,13 +372,16 @@ async def get_shared_allocations(request: Request = None, meterNo: str = None, m
             "taxRate": info.get("tax_rate", 0.01),
             "taxEnabled": bool(info.get("tax_enabled")),
             "hasContract": True,
+            "contracts": [{
+                "contractId": o.get("contract_id"), "entityId": o.get("entity_id"), "price": o.get("price"),
+                "entityName": next((e["entityName"] for e in all_entities if e["entityId"] == o.get("entity_id")), None),
+            } for o in options],
         })
 
     saved = shared_allocation_repo.list_allocations(address=meterNo, month_period=month_period) if month_period else []
     allocations = []
     for r in saved:
-        fallback = pricing["brand_price_options"].get(int(r["brand_id"]), [])
-        fallback = fallback[0] if fallback else None
+        fallback = brand_price_for(pricing, r["brand_id"], r.get("entity_id") or meter.get("entity_id"), r.get("brand_contract_id"))
         price, tax_rate, tax_enabled = _price_info(r.get("unit_price"), fallback)
         # ★应收电费可为 NULL（该品牌本月未计电费、只录了柜数/主体）→ 回填为空，不能显示成 0
         amount = float(r["collect_amount"]) if r.get("collect_amount") is not None else None
@@ -389,6 +393,7 @@ async def get_shared_allocations(request: Request = None, meterNo: str = None, m
         entity_id = r.get("entity_id")
         allocations.append({
             "brandId": r["brand_id"],
+            "brandContractId": r.get("brand_contract_id"),
             "brandName": r.get("brand_name") or brand_names.get(r["brand_id"], ""),
             "collectAmount": round(amount, 2) if amount is not None else None,
             "unitPrice": float(r["unit_price"]) if r.get("unit_price") is not None else None,
@@ -541,12 +546,22 @@ async def save_shared_allocations(data: dict, request: Request = None):
         else:
             entity_id = None
 
-        # 应收电费 / 柜数 / 报税主体 三项全空 = 空行，不保存
-        if amount is None and cabinet_count is None and entity_id is None:
+        brand_contract_id = r.get("brandContractId")
+        if brand_contract_id not in (None, ""):
+            try:
+                brand_contract_id = int(brand_contract_id)
+            except (TypeError, ValueError):
+                raise HTTPException(400, f"品牌合同格式无效：{brand_contract_id}")
+        else:
+            brand_contract_id = None
+
+        # 电费、柜数、报税主体和合同关联都为空 = 空行，不保存
+        if amount is None and cabinet_count is None and entity_id is None and brand_contract_id is None:
             continue
 
         rows.append({
             "brandId": brand_id,
+            "brandContractId": brand_contract_id,
             "entityId": entity_id,
             "collectAmount": amount,
             "unitPrice": unit_price,
@@ -583,6 +598,28 @@ async def save_shared_allocations(data: dict, request: Request = None):
     # ★V5：判定读 is_shared 列，与「电表大类」彻底解耦
     if not meter.get("is_shared"):
         raise HTTPException(400, "只有「所有品牌共用此电表」的电表才能按品牌录入分摊（请在电表档案里打开该开关）")
+
+    # 品牌合同必须与共享表所属场地及本行品牌一致，并覆盖所选月份；唯一有效合同自动关联。
+    conn = get_connection()
+    cur = get_dict_cursor(conn)
+    try:
+        for row in rows:
+            cur.execute("""
+                SELECT id FROM contracts
+                WHERE landlord_id = %s AND brand_id = %s AND contract_type = '品牌方合同'
+                  AND COALESCE(start_date, DATE '1970-01-01') < (to_date(%s || '01', 'YYYYMMDD') + INTERVAL '1 month')
+                  AND COALESCE(early_end_date, end_date, DATE '9999-12-31') >= to_date(%s || '01', 'YYYYMMDD')
+                ORDER BY id
+            """, (meter["landlord_id"], row["brandId"], month_period, month_period))
+            candidates = [int(item["id"]) for item in cur.fetchall()]
+            selected = row.get("brandContractId")
+            if selected is not None and selected not in candidates:
+                raise HTTPException(400, "共享表分摊所选合同必须属于同一场地、同一品牌且覆盖该月份")
+            if selected is None and len(candidates) == 1:
+                row["brandContractId"] = candidates[0]
+    finally:
+        cur.close()
+        conn.close()
 
     try:
         saved = shared_allocation_repo.replace_allocations(address, month_period, rows)

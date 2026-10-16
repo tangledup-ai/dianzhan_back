@@ -995,7 +995,7 @@ function MeterExpandPanel({ meter, period, periodFrom, periodTo }: {
     queryFn: () => getSharedAllocationForm({ meterNo: meter.meterNo, monthPeriod: allocPeriod }),
     enabled: isShared && !!meter?.meterNo && !!allocPeriod,
   });
-  type AllocRow = { brandId: string; collectAmount: string; unitPrice: string; cabinetCount: string; entityId: string };
+  type AllocRow = { brandId: string; brandContractId: string; collectAmount: string; unitPrice: string; cabinetCount: string; entityId: string };
   const [allocRows, setAllocRows] = useState<AllocRow[]>([]);
   const bindings = (allocForm.data?.bindings ?? []) as any[];
   const missingBrands = (allocForm.data?.missingBrands ?? []) as any[];
@@ -1009,6 +1009,7 @@ function MeterExpandPanel({ meter, period, periodFrom, periodTo }: {
     if ((d.allocations ?? []).length > 0) {
       setAllocRows(d.allocations.map((a: any) => ({
         brandId: String(a.brandId),
+        brandContractId: a.brandContractId != null ? String(a.brandContractId) : "",
         collectAmount: a.collectAmount != null ? String(a.collectAmount) : "",
         unitPrice: a.unitPrice != null ? String(a.unitPrice) : "",
         cabinetCount: a.cabinetCount != null ? String(a.cabinetCount) : "",
@@ -1017,7 +1018,7 @@ function MeterExpandPanel({ meter, period, periodFrom, periodTo }: {
     } else {
       const src = (bindings.length > 0 ? bindings : (d.brands ?? [])) as any[];
       setAllocRows(src.map((b: any) => ({
-        brandId: String(b.brandId), collectAmount: "", unitPrice: "",
+        brandId: String(b.brandId), brandContractId: String(b.contracts?.length === 1 ? b.contracts[0].contractId : ""), collectAmount: "", unitPrice: "",
         cabinetCount: cabDefault(String(b.brandId)), entityId: "",
       })));
     }
@@ -1026,7 +1027,8 @@ function MeterExpandPanel({ meter, period, periodFrom, periodTo }: {
     setAllocRows((prev) => prev.map((r, idx) => (idx === i ? { ...r, ...patch } : r)));
   const contractPriceOf = (bid: string) => {
     const b = ((allocForm.data?.brands ?? []) as any[]).find((x) => String(x.brandId) === bid);
-    return b?.unitPrice != null ? Number(b.unitPrice) : null;
+    const selected = b?.contracts?.find((c: any) => String(c.contractId) === allocRows.find((r) => r.brandId === bid)?.brandContractId);
+    return selected?.price ?? (b?.unitPrice != null ? Number(b.unitPrice) : null);
   };
   const priceOf = (r: AllocRow) => (r.unitPrice.trim() !== "" ? (parseFloat(r.unitPrice) || null) : contractPriceOf(r.brandId));
   const kwhOf = (r: AllocRow) => {
@@ -1037,7 +1039,7 @@ function MeterExpandPanel({ meter, period, periodFrom, periodTo }: {
   //   （共享表的柜数独立于电费：财务常只录柜数，此前只认金额 → 只填柜数的品牌行被静默丢弃，
   //    导致合同页该品牌「计费柜数」一直是 0）
   const allocFilled = allocRows.filter((r) => r.brandId && (
-    r.collectAmount.trim() !== "" || r.cabinetCount.trim() !== "" || r.entityId.trim() !== ""
+    r.brandContractId.trim() !== "" || r.collectAmount.trim() !== "" || r.cabinetCount.trim() !== "" || r.entityId.trim() !== ""
   ));
   const allocTotals = (() => {
     let amount = 0, kwh = 0, missPrice = 0, cabs = 0;
@@ -1052,21 +1054,23 @@ function MeterExpandPanel({ meter, period, periodFrom, periodTo }: {
   const tableKwh = curRow?.kwh != null ? Number(curRow.kwh) : null;
   const unAllocated = tableKwh != null && allocTotals.amount > 0 ? Math.round((tableKwh - allocTotals.kwh) * 100) / 100 : null;
   // 比较键：金额/柜数/主体统一规范化（空 = ""；金额保留 2 位），保证「只录柜数」的行也能判为已改动
-  const allocKeyOf = (brandId: any, amount: any, cabinet: any, entity: any) => {
+  const allocKeyOf = (brandId: any, amount: any, cabinet: any, entity: any, contract: any, price: any) => {
     const amt = amount == null || String(amount).trim() === "" || isNaN(Number(amount)) ? "" : Number(amount).toFixed(2);
     const cab = cabinet == null || String(cabinet).trim() === "" ? "" : String(parseInt(String(cabinet), 10));
     const ent = entity == null || String(entity).trim() === "" ? "" : String(parseInt(String(entity), 10));
-    return `${brandId}:${amt}:${cab}:${ent}`;
+    const p = price == null || String(price).trim() === "" || isNaN(Number(price)) ? "" : Number(price).toFixed(4);
+    return `${brandId}:${amt}:${cab}:${ent}:${contract || ""}:${p}`;
   };
   const savedAllocKey = ((allocForm.data?.allocations ?? []) as any[])
-    .map((a) => allocKeyOf(a.brandId, a.collectAmount, a.cabinetCount, a.entityId)).sort().join("|");
+    .map((a) => allocKeyOf(a.brandId, a.collectAmount, a.cabinetCount, a.entityId, a.brandContractId, a.unitPrice)).sort().join("|");
   const allocDirty = allocFilled
-    .map((r) => allocKeyOf(r.brandId, r.collectAmount, r.cabinetCount, r.entityId)).sort().join("|") !== savedAllocKey;
+    .map((r) => allocKeyOf(r.brandId, r.collectAmount, r.cabinetCount, r.entityId, r.brandContractId, r.unitPrice)).sort().join("|") !== savedAllocKey;
   const saveAlloc = useMutation({
     mutationFn: () => saveSharedAllocations({
       address: meter.meterNo, monthPeriod: allocPeriod,
       rows: allocFilled.map((r) => ({
         brandId: Number(r.brandId),
+        brandContractId: r.brandContractId ? Number(r.brandContractId) : null,
         // 金额留空 → 传 null（后端存 NULL = 本月不计电费，只保留柜数/主体）
         collectAmount: r.collectAmount.trim() === "" ? null : parseFloat(r.collectAmount),
         unitPrice: r.unitPrice.trim() === "" ? null : parseFloat(r.unitPrice),
@@ -1207,7 +1211,7 @@ function MeterExpandPanel({ meter, period, periodFrom, periodTo }: {
             )}
             <span className="ml-auto flex items-center gap-2">
               <button className="text-[11px] font-normal text-purple-600 hover:underline"
-                onClick={() => setAllocRows((prev) => [...prev, { brandId: "", collectAmount: "", unitPrice: "", cabinetCount: "", entityId: "" }])}>
+                onClick={() => setAllocRows((prev) => [...prev, { brandId: "", brandContractId: "", collectAmount: "", unitPrice: "", cabinetCount: "", entityId: "" }])}>
                 + 添加品牌
               </button>
               {allocDirty && (
@@ -1223,6 +1227,7 @@ function MeterExpandPanel({ meter, period, periodFrom, periodTo }: {
               <thead>
                 <tr>
                   <th style={{ width: 150 }}>品牌</th>
+                  <th style={{ width: 210 }}>关联品牌合同</th>
                   <th style={{ width: 110 }}>应收电费</th>
                   <th style={{ width: 96 }}>单价</th>
                   <th style={{ width: 96 }}>应收电量</th>
@@ -1242,12 +1247,24 @@ function MeterExpandPanel({ meter, period, periodFrom, periodTo }: {
                           onChange={(e) => {
                             const bid = e.target.value;
                             const d = allocForm.data?.cabinetDefaults?.[bid];
-                            setAllocRow(i, { brandId: bid, unitPrice: "", cabinetCount: d && d.count != null ? String(d.count) : "", entityId: "" });
+                            const b = ((allocForm.data?.brands ?? []) as any[]).find((x) => String(x.brandId) === bid);
+                            setAllocRow(i, { brandId: bid, brandContractId: b?.contracts?.length === 1 ? String(b.contracts[0].contractId) : "", unitPrice: "", cabinetCount: d && d.count != null ? String(d.count) : "", entityId: "" });
                           }}>
                           <option value="">选择品牌</option>
                           {brandOptions
                             .filter((o) => o.value === r.brandId || !allocRows.some((r2, j) => j !== i && r2.brandId === o.value))
                             .map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+                        </select>
+                      </td>
+                      <td>
+                        <select value={r.brandContractId}
+                          onChange={(e) => setAllocRow(i, { brandContractId: e.target.value, unitPrice: "" })}>
+                          <option value="">按品牌与主体自动匹配</option>
+                          {(((allocForm.data?.brands ?? []) as any[]).find((b) => String(b.brandId) === r.brandId)?.contracts ?? []).map((c: any) => (
+                            <option key={c.contractId} value={String(c.contractId)}>
+                              {c.price ?? "未设电价"} 元/度 · {c.entityName || "未指定主体"}
+                            </option>
+                          ))}
                         </select>
                       </td>
                       <td className="num">
@@ -1285,7 +1302,7 @@ function MeterExpandPanel({ meter, period, periodFrom, periodTo }: {
                   );
                 })}
                 {allocRows.length === 0 && (
-                  <tr><td colSpan={7} className="ctr" style={{ color: "#94a3b8", padding: 10 }}>
+                  <tr><td colSpan={8} className="ctr" style={{ color: "#94a3b8", padding: 10 }}>
                     暂无品牌分摊 —— 点右上「+ 添加品牌」录入（保存后自动更新品牌绑定）
                   </td></tr>
                 )}
@@ -1295,14 +1312,14 @@ function MeterExpandPanel({ meter, period, periodFrom, periodTo }: {
                   <td></td>
                   <td className="num">{fmtNum(allocTotals.kwh)}</td>
                   <td className="num">{allocTotals.cabs || ""}</td>
-                  <td colSpan={2}></td>
+                  <td colSpan={3}></td>
                 </tr>
                 {unAllocated != null && unAllocated !== 0 && (
                   <tr>
                     <td className="ctr" style={{ color: "#4f7a63" }}>表内未摊差额</td>
                     <td colSpan={2} className="ctr" style={{ color: "#94a3b8" }}>整表 {fmtNum(tableKwh!)} − 品牌合计 {fmtNum(allocTotals.kwh)}</td>
                     <td className="num xl-derived">{fmtNum(unAllocated)}</td>
-                    <td colSpan={3} className="ctr" style={{ color: "#94a3b8" }}>我方承担，不摊给品牌</td>
+                    <td colSpan={4} className="ctr" style={{ color: "#94a3b8" }}>我方承担，不摊给品牌</td>
                   </tr>
                 )}
               </tbody>
@@ -1361,7 +1378,7 @@ function MeterForm({ open, onClose, record }: { open: boolean; onClose: () => vo
   // ★V5：表单同时持有「大类（码值）」与「是否共用（布尔）」两个**互相独立**的字段
   const scopeCode = tagScope ? (TAG_TO_CODE[tagScope] || tagScope) : "";
   const blank = {
-    brandId: "", landlordId: "", entityId: "", meterNo: "", meterName: "",
+    brandId: "", brandContractId: "", landlordId: "", entityId: "", meterNo: "", meterName: "",
     collectorId: "", transformerRatio: "",
     categoryCode: scopeCode || "partner",   // 大类（码值）
     isShared: false,                        // 是不是"所有品牌共用一个表"
@@ -1372,6 +1389,7 @@ function MeterForm({ open, onClose, record }: { open: boolean; onClose: () => vo
   const queryClient = useQueryClient();
   const landlords = useQuery({ queryKey: ["landlords"], queryFn: listLandlords, enabled: open });
   const brands = useQuery({ queryKey: ["brands"], queryFn: listBrands, enabled: open });
+  const contracts = useQuery({ queryKey: ["contracts"], queryFn: () => listContracts(), enabled: open });
   const entities = useQuery({ queryKey: ["entities"], queryFn: listEntities, enabled: open });
   // 编号唯一校验用（与列表页共用缓存，不额外发请求）
   const meters = useQuery({ queryKey: ["meters"], queryFn: () => listMeters(), enabled: open });
@@ -1396,6 +1414,7 @@ function MeterForm({ open, onClose, record }: { open: boolean; onClose: () => vo
     if (record) {
       setF({
         brandId: record.brandId ? String(record.brandId) : "",
+        brandContractId: record.brandContractId ? String(record.brandContractId) : "",
         landlordId: record.landlordId ? String(record.landlordId) : "",
         entityId: record.entityId ? String(record.entityId) : "",
         meterNo: record.meterNo ?? "", meterName: record.meterName ?? "",
@@ -1409,6 +1428,14 @@ function MeterForm({ open, onClose, record }: { open: boolean; onClose: () => vo
       setRegenScope("all");
     } else setF(blank);
   }, [open, record]);
+
+  const brandContracts = (contracts.data ?? []).filter((c: any) =>
+    c.contractType === "品牌方合同" && c.landlordId === Number(f.landlordId) && c.brandId === Number(f.brandId)
+  );
+  useEffect(() => {
+    if (!open || isShared || !f.landlordId || !f.brandId || brandContracts.length !== 1) return;
+    if (f.brandContractId !== String(brandContracts[0].id)) setF((p) => ({ ...p, brandContractId: String(brandContracts[0].id) }));
+  }, [open, isShared, f.landlordId, f.brandId, f.brandContractId, brandContracts]);
 
   const set = (k: string) => (v: string) => setF((p) => ({ ...p, [k]: v }));
 
@@ -1446,6 +1473,7 @@ function MeterForm({ open, onClose, record }: { open: boolean; onClose: () => vo
     }
     save.mutate({
       brandId: !isShared && f.brandId ? Number(f.brandId) : null,
+      brandContractId: !isShared && f.brandContractId ? Number(f.brandContractId) : null,
       landlordId: f.landlordId ? Number(f.landlordId) : null,
       entityId: f.entityId ? Number(f.entityId) : null,
       ...(entityChanged ? {
@@ -1482,8 +1510,22 @@ function MeterForm({ open, onClose, record }: { open: boolean; onClose: () => vo
                   全部品牌方共用（无需选择）
                 </div>
               ) : (
-                <SearchSelect value={f.brandId} onChange={set("brandId")} placeholder="未指定（可搜索）"
+                <SearchSelect value={f.brandId} onChange={(v) => setF((p) => ({ ...p, brandId: v, brandContractId: "" }))} placeholder="未指定（可搜索）"
                   options={(brands.data ?? []).map((b: any) => ({ value: String(b.id), label: b.name }))} />
+              )}
+            </Field>
+            <Field label="关联品牌合同">
+              {isShared || !f.brandId ? (
+                <div className="rounded-md border border-slate-200 bg-slate-50 px-2.5 py-1.5 text-[12px] text-slate-400">共享表在品牌分摊中关联</div>
+              ) : brandContracts.length === 0 ? (
+                <div className="rounded-md border border-amber-200 bg-amber-50 px-2.5 py-1.5 text-[12px] text-amber-700">该场地品牌暂无合同</div>
+              ) : brandContracts.length === 1 ? (
+                <div className="rounded-md border border-emerald-200 bg-emerald-50 px-2.5 py-1.5 text-[12px] text-emerald-700">
+                  {brandContracts[0].contractName || `合同 #${brandContracts[0].id}`} · {brandContracts[0].electricityPrice ?? "未设电价"} 元/度（自动关联）
+                </div>
+              ) : (
+                <SearchSelect value={f.brandContractId} onChange={set("brandContractId")} placeholder="选择该场地该品牌的合同"
+                  options={brandContracts.map((c: any) => ({ value: String(c.id), label: `${c.startDate || "未设开始"} 至 ${c.earlyEndDate || c.endDate || "长期"} · ${c.electricityPrice ?? "未设电价"}元/度 · ${c.entityName || "未指定主体"}` }))} />
               )}
             </Field>
             <Field label="报税公司主体">

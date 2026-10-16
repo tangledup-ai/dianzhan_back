@@ -170,6 +170,9 @@ async def import_meters(request: Request, file: UploadFile = File(...)):
                     if entity_id and entity_id != meter.get("entity_id"):
                         updates.append("entity_id = %s"); vals.append(entity_id)
                         updates.append("entity_source = %s"); vals.append("manual")
+                    if brand_id:
+                        linked_contract = meter_repo._resolve_brand_contract_id(cur, landlord_id, brand_id)
+                        updates.append("brand_contract_id = %s"); vals.append(linked_contract)
                     if meter_name:
                         updates.append("meter_name = %s"); vals.append(meter_name)
                     if ratio:

@@ -97,7 +97,7 @@ def list_allocations_by_period(month_period: str) -> dict:
     cur = get_dict_cursor(conn)
     try:
         cur.execute("""
-            SELECT a.address, a.brand_id, a.entity_id, a.collect_amount, a.unit_price, a.remark,
+            SELECT a.address, a.brand_id, a.brand_contract_id, a.entity_id, a.collect_amount, a.unit_price, a.remark,
                    b.name AS brand_name
             FROM meter_shared_allocations a
             LEFT JOIN brands b ON a.brand_id = b.id
@@ -143,10 +143,10 @@ def replace_allocations(address: str, month_period: str, rows: list) -> int:
         for r in rows:
             cur.execute("""
                 INSERT INTO meter_shared_allocations
-                (meter_id, address, month_period, brand_id, entity_id, collect_amount, unit_price, cabinet_count, remark)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                (meter_id, address, month_period, brand_id, brand_contract_id, entity_id, collect_amount, unit_price, cabinet_count, remark)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (
-                meter_id, address, month_period, r["brandId"], r.get("entityId"),
+                meter_id, address, month_period, r["brandId"], r.get("brandContractId"), r.get("entityId"),
                 r["collectAmount"], r.get("unitPrice"), r.get("cabinetCount"), r.get("remark"),
             ))
         if meter_id is not None:

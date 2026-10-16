@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException, Request
 from ..repositories import meter_repo, electricity_repo, cabinet_repo
 from ..repositories.contract_schedule_repo import payment_due_months
-from ..infra.auth_scope import scope_landlord_ids
+from ..infra.auth_scope import scope_landlord_ids, scope_meter_tag
 from collections import defaultdict
 from .base import CamelJSONResponse
 
@@ -10,13 +10,14 @@ router = APIRouter(prefix="/api/stations", tags=["场地电表"], default_respon
 
 
 @router.get("/landlord-locations")
-async def get_landlord_locations():
+async def get_landlord_locations(request: Request = None):
     """v3：获取所有场地方的位置信息（用于地图标注）
 
     坐标来源优先级：场地方的场地合同地图选点（contracts.latitude/longitude）
     > landlords.latitude/longitude。合同上选了点，该场地及其电表均用该坐标。
     """
     from ..infra.database import get_connection, get_dict_cursor
+    tag_scope = scope_meter_tag(request) if request is not None else None
     conn = get_connection()
     cur = get_dict_cursor(conn)
     try:
@@ -37,17 +38,22 @@ async def get_landlord_locations():
             ORDER BY l.id
         """)
         rows = cur.fetchall()
+        visible_rows = []
         # 状态派生：有正常电表 → 运营中；有电表 → 筹建中；否则已关停
         for r in rows:
             cur.execute("""
                 SELECT COUNT(*) FILTER (WHERE status = 'active') as active, COUNT(*) as total
                 FROM meters WHERE landlord_id = %s AND meter_no NOT LIKE 'TEST%%'
-            """, (r["id"],))
+                  AND (%s IS NULL OR tag = %s)
+            """, (r["id"], tag_scope, tag_scope))
             m = cur.fetchone()
+            if tag_scope and not m["total"]:
+                continue
             r["status"] = "运营中" if m["active"] > 0 else ("筹建中" if m["total"] > 0 else "已关停")
             r["code"] = r.get("code") or ""
             r["region"] = ""
-        return rows
+            visible_rows.append(r)
+        return visible_rows
     finally:
         cur.close()
         conn.close()
@@ -72,9 +78,11 @@ async def get_landlord_meter_view(landlord_id: int, period: str = None, request:
     elec_period = to_compact(period)
 
     # 获取该场地所有电表（排除测试电表 + 空表：未关联 landlord/brand 的电表不参与计算）
+    tag_scope = scope_meter_tag(request) if request is not None else None
     meters = [m for m in meter_repo.list_landlord_meters(landlord_id)
               if not str(m.get("meter_no", "")).startswith("TEST")
-              and m.get("landlord_id") and m.get("brand_id")]
+              and m.get("landlord_id") and m.get("brand_id")
+              and (not tag_scope or m.get("tag") == tag_scope)]
     meter_ids = [m["id"] for m in meters]
 
     # 获取每个电表的柜子
@@ -110,6 +118,14 @@ async def get_landlord_meter_view(landlord_id: int, period: str = None, request:
     from ..repositories import contract_repo
     from ..domain.electricity_pricing import resolve_prices, split_tax, brand_price_for
     contracts = contract_repo.list_contracts(landlord_id=landlord_id) or []
+    if tag_scope:
+        allowed_brand_ids = {m.get("brand_id") for m in meters if m.get("brand_id") is not None}
+        contracts = [
+            ({**c, "monthly_rent": None, "rent_amount": None} if c.get("contract_type") == "场地合同" else c)
+            for c in contracts
+            if c.get("contract_type") == "场地合同"
+            or (c.get("contract_type") == "品牌方合同" and c.get("brand_id") in allowed_brand_ids)
+        ]
     pricing = resolve_prices(contracts, elec_period)
     pay_price = pricing["pay_price"]  # 场地合同唯一付款单价
 
@@ -192,6 +208,8 @@ async def get_landlord_meter_view(landlord_id: int, period: str = None, request:
     contract_rent = {"cost": [], "income": []}
     for c in contracts:
         if c.get("contract_type") == "场地合同":
+            if tag_scope:
+                continue
             contract_rent["cost"].append({
                 "id": c.get("id"),
                 "partner": c.get("partner") or c.get("landlord_name"),
@@ -293,7 +311,7 @@ async def get_landlord_meter_view(landlord_id: int, period: str = None, request:
             pay_kwh = this_month_kwh
             collect_kwh = this_month_kwh
             # v3.2：拆签合同按电表主体精确取收款单价
-            brand_info = brand_price_for(pricing, meter_brand_id, meter.get("entity_id")) if meter_brand_id is not None else None
+            brand_info = brand_price_for(pricing, meter_brand_id, meter.get("entity_id"), meter.get("brand_contract_id")) if meter_brand_id is not None else None
             collect_price = float(brand_info["price"]) if brand_info and brand_info.get("price") is not None else None
             tax_enabled_m = bool(brand_info["tax_enabled"]) if brand_info else False
             tax_rate_m = float(brand_info["tax_rate"]) if brand_info else None

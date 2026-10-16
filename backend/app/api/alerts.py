@@ -85,6 +85,10 @@ async def get_alerts(granularity: str = "monthly", days: int = 3, request: Reque
             eff_granularity = "monthly"
         contract_payments = _get_contract_alerts(cur, "场地合同", cfg["expireDaysVenue"], "pay", allowed)
         contract_collections = _get_contract_alerts(cur, "品牌方合同", cfg["expireDaysBrand"], "income", allowed)
+        if tag_scope:
+            # 合同应收/应付是合同级整体金额，无法安全拆给单一电表类别。
+            contract_payments = []
+            contract_collections = []
 
         return {
             "config": cfg,

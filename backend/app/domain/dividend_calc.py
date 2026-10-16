@@ -78,6 +78,7 @@ class DividendCalculator:
         rent_income = 0        # 品牌方合同月租金
         rent_refund_total = 0  # 场地费退款总额
         brand_elec_map = {}    # brand_id -> {pre_tax, post_tax, tax_enabled}
+        brand_elec_by_contract = {}
         brand_rent_map = {}    # brand_id -> {pre_tax, post_tax, tax_enabled, brand_name}
 
         if "-" in period:
@@ -98,12 +99,15 @@ class DividendCalculator:
                 if brand_id is not None and c_brand != brand_id:
                     continue  # 指定品牌时只算该品牌
                 if c_brand:
-                    brand_elec_map[(c_brand, c.get("entity_id"))] = {
+                    _brand_elec_info = {
+                        "contract_id": c.get("id"),
                         "pre_tax": float(c["electricity_price"] or 0),
                         "post_tax": float(c.get("post_tax_electricity_price") or 0),
                         "tax_rate": float(c.get("tax_rate") or 0.01),
                         "tax_enabled": bool(c.get("tax_enabled") and c.get("post_tax_electricity_price")),
                     }
+                    brand_elec_map[(c_brand, c.get("entity_id"))] = _brand_elec_info
+                    brand_elec_by_contract[c.get("id")] = _brand_elec_info
                     if c.get("rent_tax_enabled") and c.get("post_tax_rent_price"):
                         brand_rent_map[(c_brand, c.get("entity_id"))] = {
                             "pre_tax": float(c["monthly_rent"] or 0),
@@ -161,6 +165,8 @@ class DividendCalculator:
             """v3.2 主体感知：按 (品牌, 电表主体) 精确取拆签合同单价，逐级回退到未指定主体合同/全品牌合同"""
             bid = d.get("brand_id")
             eid = d.get("entity_id")
+            if d.get("brand_contract_id") in brand_elec_by_contract:
+                return brand_elec_by_contract[d["brand_contract_id"]]
             return (brand_elec_map.get((bid, eid))
                     or brand_elec_map.get((bid, None))
                     or brand_elec_map.get((None, None)))
@@ -388,7 +394,10 @@ class DividendCalculator:
         for d in meter_details:
             bid_d, eid_d = d.get("brand_id"), d.get("entity_id")
             kwh_d = float(d.get("kwh") or 0)
-            if bid_d is None:
+            linked_contract = d.get("brand_contract_id")
+            if linked_contract and any(c.get("id") == linked_contract and c.get("brand_id") == bid_d for c in contracts):
+                key = ("contract", linked_contract)
+            elif bid_d is None:
                 key = (None, None)
             elif (bid_d, eid_d) in brand_elec_map:
                 key = (bid_d, eid_d)
@@ -423,9 +432,9 @@ class DividendCalculator:
             for c in cs:
                 c_entity = c.get("entity_id")
                 brand_name = brand_name or c.get("brand_name") or ("全品牌共享" if bid is None else "")
-                kwh_c = meter_contract_kwh.get((bid, c_entity), 0.0)
-                alloc_kwh_c = meter_contract_alloc_kwh.get((bid, c_entity), 0.0)
-                alloc_amount_c = meter_contract_alloc_amount.get((bid, c_entity), 0.0)
+                kwh_c = meter_contract_kwh.get(("contract", c.get("id")), meter_contract_kwh.get((bid, c_entity), 0.0))
+                alloc_kwh_c = meter_contract_alloc_kwh.get(("contract", c.get("id")), meter_contract_alloc_kwh.get((bid, c_entity), 0.0))
+                alloc_amount_c = meter_contract_alloc_amount.get(("contract", c.get("id")), meter_contract_alloc_amount.get((bid, c_entity), 0.0))
                 b_info = brand_elec_map.get((bid, c_entity)) or {}
                 # 含税收入 = 普通电表（度数 × 合同单价）+ 共享电表品牌分摊（人工录入金额）
                 gross = round(alloc_amount_c + kwh_c * float(c.get("electricity_price") or 0), 2)
@@ -642,7 +651,7 @@ class DividendCalculator:
                 values = [landlord_id]
             where = " AND ".join(conditions)
             cur.execute(f"""
-                SELECT m.id, m.meter_no, m.meter_name, m.brand_id, m.entity_id, b.name as brand_name, m.transformer_ratio
+                SELECT m.id, m.meter_no, m.meter_name, m.brand_id, m.brand_contract_id, m.entity_id, b.name as brand_name, m.transformer_ratio
                 FROM meters m
                 LEFT JOIN brands b ON m.brand_id = b.id
                 WHERE {where}
@@ -691,7 +700,7 @@ class DividendCalculator:
                         for a in picked:
                             amount = round(float(a.get("collect_amount") or 0), 2)
                             alloc_entity = a.get("entity_id") or m.get("entity_id")
-                            info = brand_price_for(pricing, a["brand_id"], alloc_entity)
+                            info = brand_price_for(pricing, a["brand_id"], alloc_entity, a.get("brand_contract_id"))
                             unit_price = a.get("unit_price")
                             if unit_price is None:
                                 unit_price = info["price"] if info else None
@@ -704,6 +713,7 @@ class DividendCalculator:
                                 "meter_no": m["meter_no"],
                                 "meter_name": m.get("meter_name"),
                                 "brand_id": a["brand_id"],
+                                "brand_contract_id": a.get("brand_contract_id"),
                                 # 报税主体：分摊行人工指定优先，未指定退回共享电表自身主体
                                 "entity_id": alloc_entity,
                                 "brand_name": a.get("brand_name"),
@@ -726,6 +736,7 @@ class DividendCalculator:
                         "meter_no": m["meter_no"],
                         "meter_name": m.get("meter_name"),
                         "brand_id": m.get("brand_id"),
+                        "brand_contract_id": m.get("brand_contract_id"),
                         "entity_id": m.get("entity_id"),
                         "brand_name": m.get("brand_name") or ("全品牌共享" if m.get("brand_id") is None else None),
                         "kwh": kwh,

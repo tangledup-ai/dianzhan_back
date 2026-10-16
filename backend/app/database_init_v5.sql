@@ -162,6 +162,7 @@ CREATE TABLE IF NOT EXISTS meters (
         -- 非空 = 普通电表且归属某品牌；空 = 无品牌（民用电表）或共享表（品牌靠绑定清单，见 2.5）
     entity_id       INTEGER REFERENCES entities(id) ON DELETE SET NULL,
     entity_source   VARCHAR(10) DEFAULT 'manual' CHECK (entity_source IN ('auto','manual')),
+    brand_contract_id INTEGER,
 
     -- 分类与属性
     category_code   VARCHAR(24) NOT NULL DEFAULT 'partner' REFERENCES meter_categories(code) ON DELETE RESTRICT,
@@ -531,6 +532,15 @@ END $$;
 COMMENT ON CONSTRAINT ex_contract_no_overlap ON contracts IS
 '★V5：同一场地 + 同一品牌，合同生效期不得重叠（含 early_end_date 提前终止）';
 
+ALTER TABLE meters ADD COLUMN IF NOT EXISTS brand_contract_id INTEGER;
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_meters_brand_contract') THEN
+        ALTER TABLE meters ADD CONSTRAINT fk_meters_brand_contract
+            FOREIGN KEY (brand_contract_id) REFERENCES contracts(id) ON DELETE SET NULL;
+    END IF;
+END $$;
+
 CREATE TABLE IF NOT EXISTS contract_audit_log (
     id SERIAL PRIMARY KEY,
     contract_id INTEGER NOT NULL,
@@ -594,6 +604,7 @@ CREATE TABLE IF NOT EXISTS meter_shared_allocations (
     meter_id       INTEGER NOT NULL REFERENCES meters(id) ON DELETE CASCADE,
     month_period   CHAR(6) NOT NULL,
     brand_id       INTEGER NOT NULL REFERENCES brands(id) ON DELETE RESTRICT,
+    brand_contract_id INTEGER REFERENCES contracts(id) ON DELETE SET NULL,
     entity_id      INTEGER REFERENCES entities(id) ON DELETE SET NULL,   -- 只用于收入报税
 
     -- 录入：二选一，另一个按单价推导

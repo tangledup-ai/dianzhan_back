@@ -78,6 +78,7 @@ def resolve_prices(contracts: list, period: str = None) -> dict:
     for c in sorted(brand_contracts, key=lambda x: x.get("id") or 0):
         bid = c.get("brand_id")
         info = {
+            "contract_id": int(c["id"]) if c.get("id") is not None else None,
             "entity_id": c.get("entity_id"),
             "price": float(c.get("electricity_price")) if c.get("electricity_price") is not None else None,
             "tax_rate": float(c.get("tax_rate") or 0.01),
@@ -103,7 +104,7 @@ def resolve_prices(contracts: list, period: str = None) -> dict:
     }
 
 
-def brand_price_for(pricing: dict, brand_id, entity_id=None):
+def brand_price_for(pricing: dict, brand_id, entity_id=None, contract_id=None):
     """按 (品牌, 电表主体) 取收款单价信息（v3.2：拆签合同按主体精确匹配）。
 
     匹配规则：该品牌下 电表主体对应合同 优先；其次未指定主体的合同；再退第一份。
@@ -114,6 +115,10 @@ def brand_price_for(pricing: dict, brand_id, entity_id=None):
     opts = pricing.get("brand_price_options", {}).get(int(brand_id))
     if not opts:
         return None
+    if contract_id is not None:
+        for o in opts:
+            if o.get("contract_id") == int(contract_id):
+                return o
     if entity_id is not None:
         for o in opts:
             if o.get("entity_id") == entity_id:

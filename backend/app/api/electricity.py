@@ -21,7 +21,7 @@ def compute_landlord_ledger(cur, landlord_id: int, period: str):
     from ..domain.electricity_pricing import resolve_prices, brand_collect_price, brand_price_for
 
     cur.execute("""
-        SELECT m.id, m.meter_no, m.brand_id, m.entity_id, m.transformer_ratio,
+        SELECT m.id, m.meter_no, m.brand_id, m.brand_contract_id, m.entity_id, m.transformer_ratio,
                b.name as brand_name
         FROM meters m
         LEFT JOIN brands b ON m.brand_id = b.id
@@ -68,7 +68,7 @@ def compute_landlord_ledger(cur, landlord_id: int, period: str):
         total_collect_kwh += actual_kwh
 
         # 收款单价（v3.2 主体感知）：按电表品牌+主体匹配拆签合同；共享电表（无品牌）取「全品牌合同」单价，无合同 → 收入为 0
-        brand_info = brand_price_for(pricing, m.get("brand_id"), m.get("entity_id")) if m.get("brand_id") else pricing.get("shared_price")
+        brand_info = brand_price_for(pricing, m.get("brand_id"), m.get("entity_id"), m.get("brand_contract_id")) if m.get("brand_id") else pricing.get("shared_price")
         brand_price = brand_info["price"] if brand_info else None
         # 税费仅在启用税率且合同有税率时按「收入×税率」扣（税费 = 含税收入 × 税率）
         detail_rate = brand_info["tax_rate"] if (brand_info and brand_info.get("tax_enabled")) else None
@@ -490,7 +490,7 @@ def _alloc_unit_price(pricing: dict, alloc: dict, meter_entity_id=None):
     """
     from ..domain.electricity_pricing import brand_price_for
     entity_id = alloc.get("entity_id") or meter_entity_id
-    info = brand_price_for(pricing, alloc.get("brand_id"), entity_id)
+    info = brand_price_for(pricing, alloc.get("brand_id"), entity_id, alloc.get("brand_contract_id"))
     price = alloc.get("unit_price")
     if price is None:
         price = info["price"] if info else None
@@ -544,7 +544,7 @@ async def generate_electricity(data: dict):
         #    生成独立的 row_type='civil' 行（只有付款侧，无收款对象）。
         #    若不纳入，其耗电会被场地级「差额行」吞掉，损耗虚高。
         cur.execute("""
-            SELECT m.id, m.meter_no, m.landlord_id, m.brand_id, m.entity_id, m.transformer_ratio,
+            SELECT m.id, m.meter_no, m.landlord_id, m.brand_id, m.brand_contract_id, m.entity_id, m.transformer_ratio,
                    m.is_shared, m.category_code,
                    b.name as brand_name
             FROM meters m
@@ -765,7 +765,7 @@ async def generate_electricity(data: dict):
                 if rtype == "civil":
                     brand_info, brand_price = None, None
                 else:
-                    brand_info = brand_price_for(pricing, m.get("brand_id"), m.get("entity_id")) if m.get("brand_id") else pricing.get("shared_price")
+                    brand_info = brand_price_for(pricing, m.get("brand_id"), m.get("entity_id"), m.get("brand_contract_id")) if m.get("brand_id") else pricing.get("shared_price")
                     brand_price = brand_info["price"] if brand_info else None
                 # 税费仅在启用税率且合同有税率时按「收入×税率」扣（税费 = 含税收入 × 税率）
                 detail_rate = brand_info["tax_rate"] if (brand_info and brand_info.get("tax_enabled")) else None

@@ -11,6 +11,7 @@ import {
   ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Tooltip, Legend, CartesianGrid,
 } from "recharts";
 import { Link } from "react-router";
+import { useAuth } from "@/providers/auth";
 
 // 首页合同预警板块（默认展开，可点击收起）
 function DashboardAlertSection({ title, caption, items, side }: { title: string; caption: string; items: any[]; side: "pay" | "income" }) {
@@ -29,6 +30,8 @@ function DashboardAlertSection({ title, caption, items, side }: { title: string;
 }
 
 export default function Dashboard() {
+  const { user } = useAuth();
+  const tagScope = user?.meterTagScope || "";
   // 默认选中当月
   const now = new Date();
   const defaultMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
@@ -36,7 +39,7 @@ export default function Dashboard() {
 
   const { data, isLoading } = useQuery({ queryKey: ["overview"], queryFn: getOverview });
   // 合同预警（与预警页同源：应付/应收 + 逾期分期，按公司主体分组）
-  const alertsQ = useQuery({ queryKey: ["alerts", "monthly", 3], queryFn: () => getAlerts({ granularity: "monthly", days: 3 }) });
+  const alertsQ = useQuery({ queryKey: ["alerts", "monthly", 3], queryFn: () => getAlerts({ granularity: "monthly", days: 3 }), enabled: !tagScope });
   const alertPay = alertsQ.data?.contractPayments ?? [];
   const alertInc = alertsQ.data?.contractCollections ?? [];
   // 首页只展示「未处理」的预警；已处理的在预警页可见
@@ -77,17 +80,17 @@ export default function Dashboard() {
       {/* 顶部：月份选择器 */}
       <div className="flex items-center justify-between rounded-xl border bg-white p-4 shadow-sm">
         <div>
-          <div className="text-sm font-semibold text-slate-800">月度运营情况</div>
-          <div className="text-xs text-slate-400">选择月份查看该月整体经营数据，点击卡片可展开明细</div>
+          <div className="text-sm font-semibold text-slate-800">{tagScope ? `${tagScope}经营总览` : "月度运营情况"}</div>
+          <div className="text-xs text-slate-400">{tagScope ? "仅统计已关联场地的本类别电表；场租及场地级损耗不计入本类别利润" : "选择月份查看该月整体经营数据，点击卡片可展开明细"}</div>
         </div>
         <MonthPicker value={selectedMonth} onChange={setSelectedMonth} />
       </div>
 
       {/* 月度运营情况 */}
       {md && (
-        <div className="grid gap-4 lg:grid-cols-2">
+        <div className={`grid gap-4 ${tagScope ? "lg:grid-cols-1" : "lg:grid-cols-2"}`}>
           {/* 电费收支 */}
-          <ExpandRow
+          {!tagScope && <ExpandRow
             open={expanded.elec} onToggle={() => toggleExpand("elec")}
             title="电费收支"
             summary={`收入 ${fmtMoney(md.elec.income)} · 成本 ${fmtMoney(md.elec.cost)} · 利润 ${fmtMoney(md.elec.profit)}`}
@@ -122,10 +125,10 @@ export default function Dashboard() {
               )}
               {md.elec.details.length === 0 && <div className="py-4 text-center text-xs text-slate-400">该月暂无电费台账明细</div>}
             </div>
-          </ExpandRow>
+          </ExpandRow>}
 
           {/* 场租收支 */}
-          <ExpandRow
+          {!tagScope && <ExpandRow
             open={expanded.rent} onToggle={() => toggleExpand("rent")}
             title="场租收支"
             summary={`收入 ${fmtMoney(md.rent.income)} · 成本 ${fmtMoney(md.rent.cost)} · 利润 ${fmtMoney(md.rent.profit)}`}
@@ -165,10 +168,10 @@ export default function Dashboard() {
                 </div>
               </div>
             </div>
-          </ExpandRow>
+          </ExpandRow>}
 
           {/* 电量与运营费 */}
-          <ExpandRow
+          {!tagScope && <ExpandRow
             open={expanded.op} onToggle={() => toggleExpand("op")}
             title="电量与运营费"
             summary={`电量 ${fmtNum(md.totalKwh)} 度 · 运营费 ${fmtMoney(md.opExpense.total)}`}
@@ -189,10 +192,10 @@ export default function Dashboard() {
               )}
               {md.opExpense.details.length === 0 && <div className="py-3 text-center text-xs text-slate-400">该月暂无运营费用</div>}
             </div>
-          </ExpandRow>
+          </ExpandRow>}
 
           {/* 分红 */}
-          <ExpandRow
+          {!tagScope && <ExpandRow
             open={expanded.div} onToggle={() => toggleExpand("div")}
             title="分红情况"
             summary={`分红总额 ${fmtMoney(md.dividend.total)} · 未结算 ${md.dividend.pending} 条`}
@@ -202,25 +205,25 @@ export default function Dashboard() {
               <div className="rounded-lg bg-amber-50 p-2"><div className="text-[10px] text-amber-600">未结算</div><div className="text-sm font-bold text-amber-700">{md.dividend.pending} 条</div></div>
             </div>
             <div className="mt-2 text-[10px] text-slate-400">分红明细请到「股东分红」页查看</div>
-          </ExpandRow>
+          </ExpandRow>}
         </div>
       )}
 
       {/* 核心指标（全量累计） */}
       <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
         <StatCard label="品牌组合" value={`${data.stationCount}`} sub={`运营中 ${data.activeStations} · 电表 ${data.meterCount}`} icon={Building2} tone="blue" />
-        <StatCard label="净利润（元）" value={fmtMoney(totalProfit)} sub="电费+租金(已扣税)-运营费用" icon={TrendingUp} tone="green" />
+        <StatCard label={tagScope ? "本类别电费利润（元）" : "净利润（元）"} value={fmtMoney(totalProfit)} sub={tagScope ? "授权类别电表收款（不含税）－付款" : "电费+租金(已扣税)-运营费用"} icon={TrendingUp} tone="green" />
         <StatCard label="电费差价利润（元）" value={fmtMoney(data.elecProfit)} sub={`收款(不含税) ${fmtMoney(data.elecCollect)} / 付款 ${fmtMoney(data.elecPay)}`} icon={Zap} />
-        <StatCard label="场租差价利润（元）" value={fmtMoney(data.rentProfitTotal ?? (data.rentIncomeTotal - data.rentCostTotal))} sub={`收入 ${fmtMoney(data.rentIncomeTotal)} / 成本 ${fmtMoney(data.rentCostTotal)}（已扣税 ${fmtMoney(data.rentTaxTotal ?? 0)}）`} icon={Home} />
+        {!tagScope && <StatCard label="场租差价利润（元）" value={fmtMoney(data.rentProfitTotal ?? (data.rentIncomeTotal - data.rentCostTotal))} sub={`收入 ${fmtMoney(data.rentIncomeTotal)} / 成本 ${fmtMoney(data.rentCostTotal)}（已扣税 ${fmtMoney(data.rentTaxTotal ?? 0)}）`} icon={Home} />}
       </div>
 
       {/* 费用与预警 */}
       <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
-        <StatCard label="运营费用（元）" value={fmtMoney(data.opExpenseTotal)} icon={Wallet} />
-        <StatCard label="待收款项（元）" value={fmtMoney(data.elecUncollected + data.rentUncollected)} sub={`电费 ${fmtMoney(data.elecUncollected)} · 租金 ${fmtMoney(data.rentUncollected)}`} icon={Clock} tone="amber" />
+        {!tagScope && <StatCard label="运营费用（元）" value={fmtMoney(data.opExpenseTotal)} icon={Wallet} />}
+        <StatCard label="待收款项（元）" value={fmtMoney(data.elecUncollected + (tagScope ? 0 : data.rentUncollected))} sub={tagScope ? `电费 ${fmtMoney(data.elecUncollected)}` : `电费 ${fmtMoney(data.elecUncollected)} · 租金 ${fmtMoney(data.rentUncollected)}`} icon={Clock} tone="amber" />
         <StatCard label="待付款项（元）" value={fmtMoney(data.elecUnpaid)} icon={Wallet} tone="red" />
         {/* 预警口径：只计「未处理」的 临期 + 逾期分期；已到期（0天）与已处理的不计数，明细见预警页 */}
-        <Link to="/alerts?tab=contract" className="block rounded-xl transition-transform hover:scale-[1.02]">
+        {!tagScope && <Link to="/alerts?tab=contract" className="block rounded-xl transition-transform hover:scale-[1.02]">
           <StatCard
             label="合同预警"
             value={`${expiringCount + overdueOnlyCount}`}
@@ -228,7 +231,7 @@ export default function Dashboard() {
             icon={FileWarning}
             tone="red"
           />
-        </Link>
+        </Link>}
       </div>
 
       {/* 维度看板入口 */}
@@ -239,28 +242,28 @@ export default function Dashboard() {
             <div><div className="text-sm font-semibold text-slate-700">品牌方看板</div><div className="text-xs text-slate-400">{data.brandCount} 个品牌方</div></div>
           </div>
         </Link>
-        <Link to="/entities" className="rounded-xl border bg-white p-4 shadow-sm transition-colors hover:border-emerald-300 hover:bg-emerald-50/30">
+        {!tagScope && <Link to="/entities" className="rounded-xl border bg-white p-4 shadow-sm transition-colors hover:border-emerald-300 hover:bg-emerald-50/30">
           <div className="flex items-center gap-3">
             <div className="rounded-lg bg-purple-100 p-2"><Landmark className="h-5 w-5 text-purple-600" /></div>
             <div><div className="text-sm font-semibold text-slate-700">公司主体看板</div><div className="text-xs text-slate-400">{data.entityCount} 个主体</div></div>
           </div>
-        </Link>
+        </Link>}
         <Link to="/landlords" className="rounded-xl border bg-white p-4 shadow-sm transition-colors hover:border-emerald-300 hover:bg-emerald-50/30">
           <div className="flex items-center gap-3">
             <div className="rounded-lg bg-amber-100 p-2"><MapPin className="h-5 w-5 text-amber-600" /></div>
             <div><div className="text-sm font-semibold text-slate-700">场地方看板</div><div className="text-xs text-slate-400">{data.landlordCount} 个场地方</div></div>
           </div>
         </Link>
-        <Link to="/shareholders" className="rounded-xl border bg-white p-4 shadow-sm transition-colors hover:border-emerald-300 hover:bg-emerald-50/30">
+        {!tagScope && <Link to="/shareholders" className="rounded-xl border bg-white p-4 shadow-sm transition-colors hover:border-emerald-300 hover:bg-emerald-50/30">
           <div className="flex items-center gap-3">
             <div className="rounded-lg bg-emerald-100 p-2"><Users className="h-5 w-5 text-emerald-600" /></div>
             <div><div className="text-sm font-semibold text-slate-700">股东分红</div><div className="text-xs text-slate-400">{data.shareholderCount} 个股东 · {data.introducerCount} 个介绍人</div></div>
           </div>
-        </Link>
+        </Link>}
       </div>
 
       {/* 图表与预警 */}
-      <div className="grid gap-6 lg:grid-cols-3">
+      <div className={`grid gap-6 ${tagScope ? "lg:grid-cols-1" : "lg:grid-cols-3"}`}>
         <div className="rounded-xl border bg-white p-5 shadow-sm lg:col-span-2 flex flex-col min-w-0">
           <h3 className="mb-4 text-sm font-semibold text-slate-700">电费收付月度趋势</h3>
           <div className="min-h-[18rem] flex-1">
@@ -280,7 +283,7 @@ export default function Dashboard() {
         </div>
 
         {/* 合同预警：与预警页同源（应付/应收 + 逾期分期），按公司主体分组 */}
-        <div className="rounded-xl border bg-white p-5 shadow-sm min-w-0">
+        {!tagScope && <div className="rounded-xl border bg-white p-5 shadow-sm min-w-0">
           <div className="mb-3 flex items-center justify-between">
             <h3 className="flex items-center gap-1.5 text-sm font-semibold text-slate-700">
               <FileWarning className="h-4 w-4 text-rose-500" /> 合同预警
@@ -294,7 +297,7 @@ export default function Dashboard() {
             <DashboardAlertSection title="场地合同 · 应付预警" caption="公司 → 场地方" items={openAlertPay} side="pay" />
             <DashboardAlertSection title="品牌方合同 · 应收预警" caption="品牌方 → 公司" items={openAlertInc} side="income" />
           </div>
-        </div>
+        </div>}
       </div>
     </div>
   );

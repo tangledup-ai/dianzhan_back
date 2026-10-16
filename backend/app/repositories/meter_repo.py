@@ -36,7 +36,9 @@ def list_meters(station_id: int = None, brand_id: int = None, landlord_id: int =
             conditions.append("m.tag = %s"); values.append(allowed_tag)
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         cur.execute(f"""
-            SELECT m.*, l.name as station_name, b.name as brand_name, l.name as landlord_name,
+            SELECT m.*, bc.id AS linked_brand_contract_id, bc.electricity_price AS linked_contract_price,
+                   bc.start_date AS linked_contract_start_date, bc.end_date AS linked_contract_end_date,
+                   l.name as station_name, b.name as brand_name, l.name as landlord_name,
                    e.name as entity_name,
                    CASE WHEN EXISTS (SELECT 1 FROM meter_devices md WHERE md.address = m.meter_no)
                         THEN 'synced' ELSE 'manual' END AS source
@@ -44,6 +46,7 @@ def list_meters(station_id: int = None, brand_id: int = None, landlord_id: int =
             LEFT JOIN brands b ON m.brand_id = b.id
             LEFT JOIN landlords l ON m.landlord_id = l.id
             LEFT JOIN entities e ON m.entity_id = e.id
+            LEFT JOIN contracts bc ON bc.id = m.brand_contract_id
             {where}
             ORDER BY m.landlord_id, m.id
         """, values)
@@ -58,12 +61,15 @@ def get_meter(meter_id: int):
     cur = get_dict_cursor(conn)
     try:
         cur.execute("""
-            SELECT m.*, l.name as station_name, b.name as brand_name, l.name as landlord_name,
+            SELECT m.*, bc.id AS linked_brand_contract_id, bc.electricity_price AS linked_contract_price,
+                   bc.start_date AS linked_contract_start_date, bc.end_date AS linked_contract_end_date,
+                   l.name as station_name, b.name as brand_name, l.name as landlord_name,
                    e.name as entity_name
             FROM meters m
             LEFT JOIN brands b ON m.brand_id = b.id
             LEFT JOIN landlords l ON m.landlord_id = l.id
             LEFT JOIN entities e ON m.entity_id = e.id
+            LEFT JOIN contracts bc ON bc.id = m.brand_contract_id
             WHERE m.id = %s
         """, (meter_id,))
         return cur.fetchone()
@@ -108,6 +114,26 @@ def _venue_entity_id(cur, landlord_id) -> int | None:
     return row["entity_id"] if row else None
 
 
+def _resolve_brand_contract_id(cur, landlord_id, brand_id, contract_id=None):
+    """选择同一场地、同一品牌的品牌合同；唯一合同自动绑定。"""
+    if not landlord_id or not brand_id:
+        if contract_id:
+            raise ValueError("电表没有关联品牌，不能关联品牌合同")
+        return None
+    cur.execute("""
+        SELECT id FROM contracts
+        WHERE landlord_id = %s AND brand_id = %s AND contract_type = '品牌方合同'
+        ORDER BY start_date NULLS FIRST, id
+    """, (landlord_id, brand_id))
+    ids = [int(r["id"]) for r in cur.fetchall()]
+    if contract_id not in (None, ""):
+        contract_id = int(contract_id)
+        if contract_id not in ids:
+            raise ValueError("所选品牌合同必须属于该场地和该品牌")
+        return contract_id
+    return ids[0] if len(ids) == 1 else None
+
+
 def sync_landlord_meter_entities(landlord_id: int, entity_id: int | None) -> int:
     """场地合同主体保存/变更后级联：该场地下「默认跟随」的电表（非 manual）同步主体。
 
@@ -149,17 +175,20 @@ def create_meter(data: dict):
         #   均由人工指定、互不推导。tag 作为遗留列同步写中文，供旧的范围校验继续可用。
         category_code = normalize_category(data.get("categoryCode"), data.get("tag"))
         is_shared = bool(data.get("isShared"))
+        brand_id = None if is_shared else data.get("brandId")
+        brand_contract_id = None if is_shared else _resolve_brand_contract_id(
+            cur, landlord_id, brand_id, data.get("brandContractId"))
         device_address = (str(data.get("deviceAddress")).strip() or None) if data.get("deviceAddress") else None
 
         cur.execute("""
-            INSERT INTO meters (brand_id, landlord_id, entity_id, entity_source, meter_no, meter_name,
+            INSERT INTO meters (brand_id, landlord_id, entity_id, entity_source, brand_contract_id, meter_no, meter_name,
                                 collector_id, transformer_ratio, tag, category_code, is_shared,
                                 device_address, initial_reading, remark)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING *
         """, (
-            data.get("brandId"), landlord_id,
-            entity_id, entity_source,
+            brand_id, landlord_id,
+            entity_id, entity_source, brand_contract_id,
             data.get("meterNo"), data.get("meterName"), data.get("collectorId"),
             data.get("transformerRatio", 1), CATEGORY_CODE_TO_TAG[category_code], category_code, is_shared,
             device_address, data.get("initialReading"), data.get("remark")
@@ -175,7 +204,7 @@ def update_meter(meter_id: int, data: dict):
     conn = get_connection()
     cur = get_dict_cursor(conn)
     try:
-        cur.execute("SELECT landlord_id, entity_id, entity_source FROM meters WHERE id = %s", (meter_id,))
+        cur.execute("SELECT landlord_id, brand_id, entity_id, entity_source, brand_contract_id, is_shared FROM meters WHERE id = %s", (meter_id,))
         cur_row = cur.fetchone()
 
         # 场地变更 → 电表默认跟随新场地的公司主体（场地合同 entity_id）。
@@ -185,6 +214,22 @@ def update_meter(meter_id: int, data: dict):
             if "entityId" not in data or incoming is None or incoming == cur_row.get("entity_id"):
                 inherited = _venue_entity_id(cur, data["landlordId"])
                 data = {**data, "entityId": inherited, "entitySource": "auto"}
+
+        new_landlord_id = data.get("landlordId", cur_row.get("landlord_id") if cur_row else None)
+        new_brand_id = data.get("brandId", cur_row.get("brand_id") if cur_row else None)
+        new_shared = bool(data.get("isShared", cur_row.get("is_shared") if cur_row else False))
+        brand_contract_id = None
+        if not new_shared:
+            # Respect an explicit null from the form (clear an ambiguous link).
+            # Only reuse the saved value when the field was omitted entirely.
+            if "brandContractId" in data:
+                selected_contract = data.get("brandContractId")
+            elif "brandId" in data or "landlordId" in data:
+                selected_contract = None
+            else:
+                selected_contract = cur_row.get("brand_contract_id") if cur_row else None
+            brand_contract_id = _resolve_brand_contract_id(
+                cur, new_landlord_id, new_brand_id, selected_contract)
 
         # 一电表一主体：meters.entity_id 是单列，换主体 = 直接替换（仍是一电表一主体）。
         # 不做"已关联其他主体"拦截——否则编辑电表时无法切换报税主体（2026-09 用户确认按替换处理）。
@@ -213,6 +258,10 @@ def update_meter(meter_id: int, data: dict):
             elif data[key] is not None:
                 updates.append(f"{db_field} = %s")
                 values.append(data[key])
+
+        if "brandContractId" in data or "brandId" in data or "landlordId" in data or "isShared" in data:
+            updates.append("brand_contract_id = %s")
+            values.append(brand_contract_id)
 
         # ★V5：大类码值 → 写权威列 category_code，并镜像写遗留列 tag（旧范围校验仍读 tag）
         if "categoryCode" in data or "tag" in data:

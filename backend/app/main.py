@@ -51,10 +51,11 @@ class AdminAuthMiddleware(BaseHTTPMiddleware):
                     return JSONResponse(status_code=403, content={"detail": "股东账号仅可查看，不能修改数据"})
                 role = user.get("role")
                 is_write = request.method not in ("GET", "HEAD", "OPTIONS")
-                # 经营看板含跨电表类别的场地汇总，目前不能安全裁成单一类别视图。
-                # 财务类别账号通过电费/电表专页查看其授权数据，避免从总览反推出其他类别经营额。
-                if role in ("finance", "finance_supervisor") and user.get("meter_tag_scope") in ("共享电表", "民用电表", "合作商电表") and path.startswith("/api/overview"):
-                    return JSONResponse(status_code=403, content={"detail": "该看板包含授权电表类别以外的汇总数据"})
+                scoped_meter_user = role in ("finance", "finance_supervisor") and user.get("meter_tag_scope") in ("共享电表", "民用电表", "合作商电表")
+                if scoped_meter_user and path.startswith("/api/overview/") and path not in ("/api/overview/monthly-detail",):
+                    return JSONResponse(status_code=403, content={"detail": "此明细看板尚未按电表类别拆分，请使用首页类别经营总览"})
+                if scoped_meter_user and path.startswith("/api/contract-schedules"):
+                    return JSONResponse(status_code=403, content={"detail": "合同收付款分期属于场地/合同整体数据，当前账号无权查看"})
                 if is_write and path.startswith("/api/directory/") and not path.startswith(("/api/directory/platform-users", "/api/directory/third-party-configs")) and role != "boss":
                     return JSONResponse(status_code=403, content={"detail": "仅老板可维护基础档案"})
                 # 用户、平台凭据和系统密钥属于管理配置，不开放给普通财务账号。
@@ -64,6 +65,8 @@ class AdminAuthMiddleware(BaseHTTPMiddleware):
                     return JSONResponse(status_code=403, content={"detail": "仅老板可管理第三方接口配置"})
                 if path.startswith("/api/system-config") and role != "boss":
                     return JSONResponse(status_code=403, content={"detail": "仅老板可管理系统配置"})
+                if path == "/api/alerts/config" and is_write and role != "boss":
+                    return JSONResponse(status_code=403, content={"detail": "仅老板可修改全局预警设置"})
                 if is_write and path.startswith("/api/contracts") and role not in ("boss", "finance_supervisor"):
                     return JSONResponse(status_code=403, content={"detail": "仅老板或财务主管可维护合同"})
                 if is_write and path.startswith("/api/approvals/flows") and role != "boss":

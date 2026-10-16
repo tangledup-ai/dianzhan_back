@@ -11,6 +11,126 @@ def _entity_group_name(c: dict) -> str:
     return c.get("entity_name") or (c.get("pay_entity") or "").strip() or "未指定主体"
 
 
+def _meter_category_overview(cur, tag_scope: str) -> dict:
+    """财务类别账号的电表范围总览；只按已关联场地的授权类别电表明细汇总。"""
+    from ..infra.period import to_display
+    tag_to_code = {"合作商电表": "partner", "民用电表": "civil", "共享电表": "shared"}
+    code = tag_to_code[tag_scope]
+    cur.execute("""
+        SELECT COUNT(*) AS meter_count,
+               COUNT(DISTINCT (m.landlord_id, COALESCE(m.brand_id, 0))) AS station_count,
+               COUNT(DISTINCT m.landlord_id) AS landlord_count,
+               COUNT(DISTINCT m.brand_id) FILTER (WHERE m.brand_id IS NOT NULL) AS brand_count,
+               COALESCE(SUM(GREATEST(1, cab.cnt)), 0) AS cabinet_count,
+               COUNT(DISTINCT (m.landlord_id, COALESCE(m.brand_id, 0))) FILTER (WHERE m.status = 'active') AS active_station_count
+        FROM meters m
+        LEFT JOIN LATERAL (SELECT COUNT(*) AS cnt FROM cabinets c WHERE c.meter_id = m.id) cab ON TRUE
+        WHERE m.tag = %s AND m.landlord_id IS NOT NULL AND m.meter_no NOT LIKE 'TEST%%'
+    """, (tag_scope,))
+    counts = cur.fetchone() or {}
+
+    cur.execute("""
+        SELECT e.period, e.pay_status, e.collect_status, b.name AS brand_name,
+               d.kwh, d.pay_amount, d.collect_net
+        FROM electricity_meter_details d
+        JOIN meters m ON m.id = d.meter_id AND m.landlord_id IS NOT NULL
+        JOIN electricity_records e ON e.id = d.electricity_id AND e.landlord_id = m.landlord_id
+        LEFT JOIN brands b ON b.id = COALESCE(e.brand_id, m.brand_id)
+        WHERE m.tag = %s AND m.meter_no NOT LIKE 'TEST%%' AND COALESCE(d.row_type, 'normal') <> 'loss'
+    """, (tag_scope,))
+    ledger_rows = cur.fetchall()
+    pay = sum(float(r.get("pay_amount") or 0) for r in ledger_rows)
+    collect = sum(float(r.get("collect_net") or 0) for r in ledger_rows)
+    unpaid = sum(float(r.get("pay_amount") or 0) for r in ledger_rows if r.get("pay_status") == "未付款")
+    uncollected = sum(float(r.get("collect_net") or 0) for r in ledger_rows if r.get("collect_status") == "未到账")
+    by_month = {}
+    by_brand_pay, by_brand_collect = {}, {}
+    for r in ledger_rows:
+        mp = str(r.get("period") or "")
+        brand = r.get("brand_name") or "未指定品牌"
+        month = by_month.setdefault(mp, {"period": mp, "kwh": 0.0, "pay": 0.0, "collect": 0.0})
+        month["kwh"] += float(r.get("kwh") or 0)
+        month["pay"] += float(r.get("pay_amount") or 0)
+        month["collect"] += float(r.get("collect_net") or 0)
+        bp = by_brand_pay.setdefault(brand, {"count": 0, "amount": 0.0})
+        bc = by_brand_collect.setdefault(brand, {"count": 0, "amount": 0.0})
+        if r.get("pay_status") == "未付款" and float(r.get("pay_amount") or 0) > 0:
+            bp["count"] += 1; bp["amount"] += float(r["pay_amount"])
+        if r.get("collect_status") == "未到账" and float(r.get("collect_net") or 0) > 0:
+            bc["count"] += 1; bc["amount"] += float(r["collect_net"])
+
+    cur.execute("""
+        SELECT COALESCE(SUM(COALESCE(mm.actual_kwh,
+                   ROUND(mm.kwh * COALESCE(mm.transformer_ratio_snapshot, m.transformer_ratio, 1), 2))), 0) AS kwh
+        FROM meter_readings mm JOIN meters m ON m.id = mm.meter_id
+        WHERE m.tag = %s AND m.landlord_id IS NOT NULL AND m.meter_no NOT LIKE 'TEST%%'
+    """, (tag_scope,))
+    total_kwh = float((cur.fetchone() or {}).get("kwh") or 0)
+    months = []
+    for mp, val in sorted(by_month.items(), reverse=True)[:12]:
+        months.append({"period": to_display(mp) if len(mp) == 6 else mp,
+                       "kwh": val["kwh"], "elecPay": val["pay"], "elecCollect": val["collect"],
+                       "elecProfit": val["collect"] - val["pay"]})
+
+    def bill_group(items):
+        rows = [{"brand": k, "count": v["count"], "amount": round(v["amount"], 2)} for k, v in items.items()]
+        return {"count": sum(r["count"] for r in rows), "amount": round(sum(r["amount"] for r in rows), 2),
+                "byBrand": sorted(rows, key=lambda r: -r["amount"])}
+
+    return {
+        "scopeMode": True, "scopeLabel": tag_scope,
+        "stationCount": int(counts.get("station_count") or 0),
+        "activeStations": int(counts.get("active_station_count") or 0),
+        "meterCount": int(counts.get("meter_count") or 0), "cabinetCount": int(counts.get("cabinet_count") or 0),
+        "brandCount": int(counts.get("brand_count") or 0), "entityCount": 0,
+        "landlordCount": int(counts.get("landlord_count") or 0), "shareholderCount": 0, "introducerCount": 0,
+        "bills": {"payable": {"elec": bill_group(by_brand_pay), "site": bill_group({})},
+                  "receivable": {"elec": bill_group(by_brand_collect), "site": bill_group({})}},
+        "elecPay": round(pay, 2), "elecCollect": round(collect, 2), "elecProfit": round(collect - pay, 2),
+        "elecUnpaid": round(unpaid, 2), "elecUncollected": round(uncollected, 2),
+        "rentCostTotal": 0, "rentIncomeTotal": 0, "rentTaxTotal": 0, "rentProfitTotal": 0,
+        "netProfitTotal": round(collect - pay, 2), "rentUncollected": 0, "opExpenseTotal": 0,
+        "pendingDividends": 0, "bizDividendTotal": 0, "shareholderDividendTotal": 0,
+        "contractCount": 0, "expiringContracts": 0, "expiredContracts": 0, "overdueContracts": 0,
+        "pendingApprovals": 0, "totalKwh": total_kwh, "monthly": months,
+    }
+
+
+def _meter_category_monthly_detail(cur, tag_scope: str, period: str) -> dict:
+    from ..infra.period import to_compact
+    mp = to_compact(period)
+    cur.execute("""
+        SELECT d.kwh, d.pay_amount, d.collect_amount, d.collect_net,
+               m.meter_no, b.name AS brand_name, l.name AS landlord_name
+        FROM electricity_meter_details d
+        JOIN meters m ON m.id = d.meter_id AND m.landlord_id IS NOT NULL
+        JOIN electricity_records e ON e.id = d.electricity_id AND e.landlord_id = m.landlord_id
+        LEFT JOIN landlords l ON l.id = m.landlord_id
+        LEFT JOIN brands b ON b.id = COALESCE(e.brand_id, m.brand_id)
+        WHERE m.tag = %s AND e.period = %s AND m.meter_no NOT LIKE 'TEST%%'
+          AND COALESCE(d.row_type, 'normal') <> 'loss'
+    """, (tag_scope, mp))
+    rows = cur.fetchall()
+    income = sum(float(r.get("collect_net") or 0) for r in rows)
+    cost = sum(float(r.get("pay_amount") or 0) for r in rows)
+    details = [{"landlordName": r.get("landlord_name") or "", "brandName": r.get("brand_name"),
+                "meterNo": r.get("meter_no"), "kwh": float(r.get("kwh") or 0),
+                "payAmount": float(r.get("pay_amount") or 0), "collectAmount": float(r.get("collect_amount") or 0),
+                "collectNet": float(r.get("collect_net") or 0)} for r in rows]
+    cur.execute("""
+        SELECT COALESCE(SUM(COALESCE(mm.actual_kwh,
+                   ROUND(mm.kwh * COALESCE(mm.transformer_ratio_snapshot, m.transformer_ratio, 1), 2))), 0) AS kwh
+        FROM meter_readings mm JOIN meters m ON m.id = mm.meter_id
+        WHERE m.tag = %s AND m.landlord_id IS NOT NULL AND m.meter_no NOT LIKE 'TEST%%' AND mm.period = %s
+    """, (tag_scope, mp))
+    total_kwh = float((cur.fetchone() or {}).get("kwh") or 0)
+    return {"period": period, "scopeMode": True, "totalKwh": total_kwh,
+            "elec": {"income": round(income, 2), "cost": round(cost, 2),
+                     "profit": round(income - cost, 2), "details": details},
+            "rent": {"income": 0, "cost": 0, "profit": 0, "incomeDetails": [], "costDetails": []},
+            "opExpense": {"total": 0, "details": []}, "dividend": {"total": 0, "pending": 0}}
+
+
 def _shared_cab_weights(period: str, brand_entity_map: dict = None, allowed=None) -> tuple:
     """共享电表「已按品牌录柜数」的柜数权重：((landlord, brand) -> {entity_id: cabs}, landlord -> {entity_id: cabs})
 
@@ -48,12 +168,15 @@ def _shared_cab_weights(period: str, brand_entity_map: dict = None, allowed=None
 @router.get("")
 async def overview(request: Request):
     """经营总览 API（股东账号只统计其关联场地的数据）- 热重载测试"""
-    from ..infra.auth_scope import scope_landlord_ids
+    from ..infra.auth_scope import scope_landlord_ids, scope_meter_tag
     allowed = scope_landlord_ids(request)
+    tag_scope = scope_meter_tag(request)
     user = getattr(request.state, "current_user", None)
     conn = get_connection()
     cur = get_dict_cursor(conn)
     try:
+        if tag_scope:
+            return _meter_category_overview(cur, tag_scope)
         # 品牌组合统计（v3：站点 → 场地×品牌 组合数；active = 组合内有正常电表）
         if allowed is not None:
             cur.execute("""
@@ -454,8 +577,9 @@ async def overview(request: Request):
 @router.get("/monthly-detail")
 async def monthly_detail(request: Request, period: str = None):
     """某月的运营情况明细（电费/场租/电量/运营费/分红），供首页月份选择器使用"""
-    from ..infra.auth_scope import scope_landlord_ids
+    from ..infra.auth_scope import scope_landlord_ids, scope_meter_tag
     allowed = scope_landlord_ids(request)
+    tag_scope = scope_meter_tag(request)
     if not period:
         from datetime import date
         today = date.today()
@@ -465,6 +589,8 @@ async def monthly_detail(request: Request, period: str = None):
     conn = get_connection()
     cur = get_dict_cursor(conn)
     try:
+        if tag_scope:
+            return _meter_category_monthly_detail(cur, tag_scope, period)
         # 1) 总电量（v3：电表挂 landlord_id）
         if allowed is not None:
             cur.execute("""
@@ -803,7 +929,7 @@ async def station_board(request: Request, landlordId: int = None, keyword: str =
 
             # 获取该场地方下的所有电表（排除测试电表）
             cur.execute("""
-                SELECT m.id, m.meter_no, m.meter_name, m.brand_id, b.name as brand_name,
+            SELECT m.id, m.meter_no, m.meter_name, m.brand_id, m.brand_contract_id, b.name as brand_name,
                        m.transformer_ratio, m.status
                 FROM meters m
                 LEFT JOIN brands b ON m.brand_id = b.id
@@ -850,14 +976,14 @@ async def station_board(request: Request, landlordId: int = None, keyword: str =
                 month_period = period.replace("-", "")
                 placeholders = ",".join(["%s"] * len(meter_ids))
                 cur.execute(f"""
-                    SELECT m.brand_id, b.name as brand_name,
+                SELECT m.brand_id, m.brand_contract_id, m.entity_id, b.name as brand_name,
                            COALESCE(SUM(COALESCE(mm.actual_kwh, ROUND(mm.kwh * COALESCE(mm.transformer_ratio_snapshot, m.transformer_ratio, 1), 2))), 0) as kwh,
                            COUNT(DISTINCT m.id) as meter_count
                     FROM meter_readings mm
                     JOIN meters m ON m.id = mm.meter_id AND m.landlord_id IS NOT NULL AND m.brand_id IS NOT NULL
                     LEFT JOIN brands b ON m.brand_id = b.id
                     WHERE mm.meter_id IN ({placeholders}) AND mm.period = %s
-                    GROUP BY m.brand_id, b.name
+                    GROUP BY m.brand_id, m.brand_contract_id, m.entity_id, b.name
                     ORDER BY kwh DESC
                 """, (*meter_ids, month_period))
                 rows = cur.fetchall()
@@ -866,6 +992,8 @@ async def station_board(request: Request, landlordId: int = None, keyword: str =
                     bid = r["brand_id"]
                     station_breakdown.append({
                         "brand_id": bid,
+                        "brand_contract_id": r.get("brand_contract_id"),
+                        "entity_id": r.get("entity_id"),
                         "brand_name": r["brand_name"] or f"品牌#{bid}",
                         "kwh": float(r["kwh"] or 0),
                         "meter_count": int(r["meter_count"] or 0),
@@ -878,10 +1006,11 @@ async def station_board(request: Request, landlordId: int = None, keyword: str =
             #   付款侧：付场地方 = 整表读数 × 场地单价（亏空/线损由我方承担，与台账/分红同口径）
             #   收款侧：已录品牌分摊 → 人工录入应收电费；未录分摊 → 整表读数 × 全品牌合同单价
             # 同一品牌若既有自有电表又在共享表有分摊，两处电量合并成一行，不产生重复品牌行。
-            _sb_index = {a.get("brand_id"): a for a in station_breakdown}
+            _sb_index = {(a.get("brand_id"), a.get("brand_contract_id"), a.get("entity_id")): a for a in station_breakdown}
 
-            def _merge_brand_row(bid, brand_name, entity_id, kwh_add, alloc_amount=None):
-                row = _sb_index.get(bid)
+            def _merge_brand_row(bid, brand_name, entity_id, kwh_add, alloc_amount=None, brand_contract_id=None):
+                row_key = (bid, brand_contract_id, entity_id)
+                row = _sb_index.get(row_key)
                 if row is None:
                     row = {
                         "brand_id": bid,
@@ -890,9 +1019,10 @@ async def station_board(request: Request, landlordId: int = None, keyword: str =
                         "kwh": 0.0,
                         "meter_count": 0,
                         "alloc_amount": None,
+                        "brand_contract_id": brand_contract_id,
                     }
                     station_breakdown.append(row)
-                    _sb_index[bid] = row
+                    _sb_index[row_key] = row
                 row["kwh"] = round(float(row["kwh"]) + float(kwh_add), 2)
                 if alloc_amount is not None:
                     row["alloc_amount"] = round(float(row.get("alloc_amount") or 0) + float(alloc_amount), 2)
@@ -922,14 +1052,14 @@ async def station_board(request: Request, landlordId: int = None, keyword: str =
                             eid_a = a.get("entity_id") or sm.get("entity_id")
                             price_a = a.get("unit_price")
                             if price_a is None:
-                                info_a = brand_price_for(pricing, a["brand_id"], eid_a)
+                                info_a = brand_price_for(pricing, a["brand_id"], eid_a, a.get("brand_contract_id"))
                                 price_a = info_a["price"] if info_a else None
                             kwh_a = round(float(a.get("collect_amount") or 0) / float(price_a), 2) if price_a else 0.0
                             picked.append((a, eid_a, kwh_a))
                         for a, eid_a, kwh_a in picked:
                             _merge_brand_row(a["brand_id"], a.get("brand_name"), eid_a,
                                              kwh_a,
-                                             float(a.get("collect_amount") or 0))
+                                             float(a.get("collect_amount") or 0), a.get("brand_contract_id"))
                     else:
                         # 未录分摊：整表电量归「全品牌共享」行，收款走全品牌合同单价
                         _merge_brand_row(None, "全品牌共享", sm.get("entity_id"), full)
@@ -952,7 +1082,7 @@ async def station_board(request: Request, landlordId: int = None, keyword: str =
             def _station_collect(sb):
                 eid = sb.get("entity_id")
                 bid = sb.get("brand_id")
-                info = brand_price_for(pricing, bid, eid)
+                info = brand_price_for(pricing, bid, eid, sb.get("brand_contract_id"))
                 if sb.get("alloc_amount") is not None:
                     gross = round(float(sb["alloc_amount"]), 2)
                 else:
@@ -1371,7 +1501,7 @@ async def landlord_station_monthly(request: Request, landlordId: int, months: in
                 picked = []
                 for a in allocs:
                     eid_a = a.get("entity_id") or shared_meta.get(addr)
-                    info_a = _brand_price_for(_pricing_for_month(mp), a["brand_id"], eid_a)
+                    info_a = _brand_price_for(_pricing_for_month(mp), a["brand_id"], eid_a, a.get("brand_contract_id"))
                     price_a = a.get("unit_price") or (info_a["price"] if info_a else None)
                     kwh_a = round(float(a.get("collect_amount") or 0) / float(price_a), 2) if price_a else 0.0
                     picked.append((a, kwh_a))

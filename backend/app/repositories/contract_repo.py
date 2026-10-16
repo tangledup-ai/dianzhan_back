@@ -62,7 +62,7 @@ def list_contracts(brand_id: int = None, landlord_id: int = None, station_id: in
         if allowed_landlord_ids is not None:
             conditions.append("c.landlord_id = ANY(%s::int[])"); values.append(allowed_landlord_ids)
         if meter_tag_scope:
-            conditions.append("EXISTS (SELECT 1 FROM meters sm WHERE sm.landlord_id = c.landlord_id AND sm.tag = %s AND (c.contract_type = '场地合同' OR sm.brand_id IS NOT DISTINCT FROM c.brand_id OR (c.brand_id IS NULL AND sm.is_shared = TRUE)))")
+            conditions.append("c.contract_type = '品牌方合同' AND EXISTS (SELECT 1 FROM meters sm WHERE sm.landlord_id = c.landlord_id AND sm.tag = %s AND (sm.brand_id = c.brand_id OR (c.brand_id IS NULL AND sm.is_shared = TRUE)))")
             values.append(meter_tag_scope)
         if keyword:
             conditions.append("(l.name ILIKE %s OR b.name ILIKE %s)")
