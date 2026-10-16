@@ -52,3 +52,18 @@ def get_current_user(authorization: str = Header(None)) -> dict:
     finally:
         cur.close()
         conn.close()
+
+
+def get_unscoped_finance_user(authorization: str = Header(None)) -> dict:
+    """小程序汇总接口仅对全局财务/管理账号开放。
+
+    小程序现有报表尚未按 meter_tag_scope 拆分，受限账号必须由服务端拒绝，
+    不能因其拥有有效登录 token 就返回全类别聚合数据。
+    """
+    user = get_current_user(authorization)
+    if user.get("role") == "shareholder" or (
+        user.get("role") in ("finance", "finance_supervisor")
+        and user.get("meter_tag_scope") in ("共享电表", "民用电表", "合作商电表")
+    ):
+        raise HTTPException(403, "小程序财务总览尚未按当前账号的数据范围隔离，当前账号无权访问")
+    return user

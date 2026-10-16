@@ -5,14 +5,14 @@
 """
 
 from fastapi import APIRouter, Depends
-from ..middleware.mp_auth import get_current_user
+from ..middleware.mp_auth import get_unscoped_finance_user
 from ..infra.database import get_connection, get_dict_cursor
 
 router = APIRouter(prefix="/finance", tags=["📱 小程序 - 财务数据"])
 
 
 @router.get("/stations")
-async def finance_stations(user: dict = Depends(get_current_user)):
+async def finance_stations(user: dict = Depends(get_unscoped_finance_user)):
     """站点维度财务数据（v3：按 场地×品牌 返回；保留 station 键名兼容小程序）"""
     conn = get_connection()
     cur = get_dict_cursor(conn)
@@ -92,7 +92,7 @@ async def finance_stations(user: dict = Depends(get_current_user)):
 
 
 @router.get("/brands")
-async def finance_brands(user: dict = Depends(get_current_user)):
+async def finance_brands(user: dict = Depends(get_unscoped_finance_user)):
     """品牌方维度财务数据（v3：以 场地×品牌 组合为基数，台账按 landlord_id/brand_id 关联）"""
     conn = get_connection()
     cur = get_dict_cursor(conn)
@@ -172,7 +172,7 @@ async def finance_brands(user: dict = Depends(get_current_user)):
 
 
 @router.get("/entities")
-async def finance_entities(user: dict = Depends(get_current_user)):
+async def finance_entities(user: dict = Depends(get_unscoped_finance_user)):
     """公司主体维度财务数据（v3：按 场地×品牌 组合统计，保留原有整体口径）"""
     conn = get_connection()
     cur = get_dict_cursor(conn)
@@ -226,7 +226,7 @@ async def finance_entities(user: dict = Depends(get_current_user)):
 
 
 @router.get("/landlords")
-async def finance_landlords(user: dict = Depends(get_current_user)):
+async def finance_landlords(user: dict = Depends(get_unscoped_finance_user)):
     """场地方维度财务数据（v3：直接按 landlord_id 统计）"""
     conn = get_connection()
     cur = get_dict_cursor(conn)
@@ -297,7 +297,7 @@ async def finance_landlords(user: dict = Depends(get_current_user)):
 
 
 @router.get("/shareholders")
-async def finance_shareholders(user: dict = Depends(get_current_user)):
+async def finance_shareholders(user: dict = Depends(get_unscoped_finance_user)):
     """股东分红数据（v3：分红台账挂 landlord_id）"""
     conn = get_connection()
     cur = get_dict_cursor(conn)

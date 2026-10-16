@@ -570,6 +570,9 @@ async def yearly_payment_schedule(request: Request, landlordId: int = Query(...)
     """年度付款计划：场地合同的当年付款分期明细 + 审批状态"""
     from ..infra.database import get_connection, get_dict_cursor
 
+    if scope_meter_tag(request):
+        raise HTTPException(403, "年度场租收付款计划属于场地全口径数据，当前账号不能查看")
+
     # 股东账号：只能查看关联场地的付款计划
     allowed = scope_landlord_ids(request)
     if allowed is not None and landlordId not in allowed:

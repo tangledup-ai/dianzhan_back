@@ -52,6 +52,8 @@ class AdminAuthMiddleware(BaseHTTPMiddleware):
                 role = user.get("role")
                 is_write = request.method not in ("GET", "HEAD", "OPTIONS")
                 scoped_meter_user = role in ("finance", "finance_supervisor") and user.get("meter_tag_scope") in ("共享电表", "民用电表", "合作商电表")
+                if (role == "shareholder" or scoped_meter_user) and (path == "/api/approvals" or path.startswith("/api/approvals/")):
+                    return JSONResponse(status_code=403, content={"detail": "审批记录可能包含其他场地或未按电表类别拆分的财务金额，当前账号无权查看或处理"})
                 if scoped_meter_user and path.startswith("/api/overview/") and path not in ("/api/overview/monthly-detail",):
                     return JSONResponse(status_code=403, content={"detail": "此明细看板尚未按电表类别拆分，请使用首页类别经营总览"})
                 if scoped_meter_user and path.startswith("/api/contract-schedules"):

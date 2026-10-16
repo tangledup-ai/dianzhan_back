@@ -243,7 +243,7 @@ async def submit_dividend(record_id: int, data: dict, request: Request):
             "title": f"{record.get('landlord_name', '')} {record['period']} 分红",
             "reason": data.get("reason"),
             "amount": amount,
-            "applicant": data.get("applicant", "系统"),
+            "applicant": (getattr(request.state, "current_user", None) or {}).get("name") or "",
             "dividendRecordId": record_id,
             "landlordId": record.get("landlord_id"),
             "period": record.get("period"),

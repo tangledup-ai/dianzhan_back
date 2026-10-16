@@ -3,14 +3,14 @@
 import json
 from datetime import date, datetime
 from fastapi import APIRouter, Depends
-from ..middleware.mp_auth import get_current_user
+from ..middleware.mp_auth import get_unscoped_finance_user
 from ..infra.database import get_connection, get_dict_cursor
 
 router = APIRouter(tags=["📱 小程序 - 数据快照"])
 
 
 @router.get("/snapshot")
-async def snapshot(user: dict = Depends(get_current_user)):
+async def snapshot(user: dict = Depends(get_unscoped_finance_user)):
     """经营数据快照（首页/地图/站点/利润/审批共用）
     v3：台账/电表已直接挂 landlord_id（brand_id），站点列表按 场地×品牌 组合返回，
     不再经 stations 关联；stations/stationCount 等键名保留兼容小程序。"""

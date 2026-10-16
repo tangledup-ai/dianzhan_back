@@ -12,9 +12,14 @@ async def list_flows():
 
 @router.post("/flows", status_code=201)
 async def save_flow(data: dict):
+    nodes = data.get("nodes")
+    if not isinstance(nodes, list) or not nodes:
+        raise HTTPException(400, "审批流程至少需要一个审批节点")
+    if any(not isinstance(node, dict) or not node.get("name") or not node.get("approver") for node in nodes):
+        raise HTTPException(400, "每个审批节点都必须配置节点名称和审批人")
     return approval_repo.save_flow(
         biz_type=data.get("bizType", ""),
-        nodes=data.get("nodes", []),
+        nodes=nodes,
     )
 
 
@@ -38,18 +43,13 @@ async def get_request(request_id: int):
 
 
 @router.post("", status_code=201)
-async def create_request(data: dict):
-    # 如果指定了审批人，动态构建审批流程
-    approvers = data.get("approvers")
-    if approvers and data.get("bizType") == "分红审批":
-        import json
-        nodes = []
-        if approvers.get("finance_supervisor"):
-            nodes.append({"name": "财务主管审核", "approver": approvers["finance_supervisor"]})
-        if approvers.get("boss"):
-            nodes.append({"name": "老板审批", "approver": approvers["boss"]})
-        if nodes:
-            data["flowNodes"] = nodes
+async def create_request(data: dict, request: Request):
+    # 审批节点必须来自老板维护的服务端流程配置，不能信任客户端传入的
+    # flowNodes/approvers，否则申请人可把自己伪造成最终审批人。
+    data.pop("flowNodes", None)
+    data.pop("approvers", None)
+    current_user = getattr(request.state, "current_user", None) or {}
+    data["applicant"] = current_user.get("name") or ""
     try:
         return approval_repo.create_request(data)
     except ValueError as e:

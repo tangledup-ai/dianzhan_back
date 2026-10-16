@@ -3,27 +3,29 @@
 from fastapi import APIRouter, HTTPException, Depends
 from ..middleware.mp_auth import create_token, get_current_user
 from ..infra.database import get_connection, get_dict_cursor
+from ..infra.password import verify_password
 
 router = APIRouter(prefix="/auth", tags=["📱 小程序 - 认证"])
 
 
 @router.post("/login")
 async def login(data: dict):
-    """用户登录（按 name 匹配，无密码）"""
-    username = data.get("username", "").strip()
-    if not username:
-        raise HTTPException(400, "用户名不能为空")
+    """小程序用户登录，复用管理后台账号密码。"""
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+    if not username or not password:
+        raise HTTPException(400, "用户名和密码不能为空")
 
     conn = get_connection()
     cur = get_dict_cursor(conn)
     try:
         cur.execute(
-            "SELECT id, name, role, phone FROM platform_users WHERE name = %s",
+            "SELECT id, name, role, phone, password FROM platform_users WHERE name = %s",
             (username,)
         )
         user = cur.fetchone()
-        if not user:
-            raise HTTPException(401, "用户不存在")
+        if not user or not verify_password(password, user.get("password") or ""):
+            raise HTTPException(401, "用户名或密码错误")
 
         token = create_token(user["id"], user["name"], user["role"])
         return {

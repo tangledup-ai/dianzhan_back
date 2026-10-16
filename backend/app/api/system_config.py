@@ -101,9 +101,6 @@ async def update_system_config(data: SystemConfigPayload):
 
 @mp_router.get("/config")
 async def read_mp_config(user: dict = Depends(get_current_user)):
-    """小程序端读取配置（mapKey 供地图/位置服务使用；deepseekApiKey 备用）"""
+    """小程序端只读取可公开使用的地图配置；AI Key 由后端代为调用，不能下发给客户端。"""
     ensure_table()
-    return {
-        "mapKey": get_config_value("map_key", DEFAULT_MAP_KEY),
-        "deepseekApiKey": get_config_value("deepseek_api_key", DEFAULT_DEEPSEEK_API_KEY),
-    }
+    return {"mapKey": get_config_value("map_key", DEFAULT_MAP_KEY)}

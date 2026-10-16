@@ -106,21 +106,23 @@ def create_request(data: dict):
     conn = get_connection()
     cur = get_dict_cursor(conn)
     try:
-        # 如果传入了自定义 flowNodes 则使用，否则从数据库获取
-        if data.get("flowNodes"):
-            flow_nodes = data["flowNodes"]
+        # 审批节点只允许读取服务端维护的流程，绝不接受请求体内的自定义节点。
+        cur.execute("SELECT nodes FROM approval_flows WHERE biz_type = %s", (data.get("bizType"),))
+        flow = cur.fetchone()
+        if flow:
+            flow_nodes = json.loads(flow["nodes"])
         else:
-            cur.execute("SELECT nodes FROM approval_flows WHERE biz_type = %s", (data.get("bizType"),))
-            flow = cur.fetchone()
-            if flow:
-                flow_nodes = json.loads(flow["nodes"])
-            else:
-                # 未配置流程：默认交老板审批，绝不允许申请人自审（资金安全）
-                cur.execute("SELECT name FROM platform_users WHERE role = 'boss' ORDER BY id LIMIT 1")
-                boss = cur.fetchone()
-                if not boss:
-                    raise ValueError("该业务类型未配置审批流程，且平台没有老板账号，请先在审批中心配置流程")
-                flow_nodes = [{"name": "老板审批", "approver": boss["name"]}]
+            # 未配置流程：默认交老板审批，绝不允许申请人自审（资金安全）
+            cur.execute("SELECT name FROM platform_users WHERE role = 'boss' ORDER BY id LIMIT 1")
+            boss = cur.fetchone()
+            if not boss:
+                raise ValueError("该业务类型未配置审批流程，且平台没有老板账号，请先在审批中心配置流程")
+            flow_nodes = [{"name": "老板审批", "approver": boss["name"]}]
+        if not isinstance(flow_nodes, list) or not flow_nodes or any(
+            not isinstance(node, dict) or not node.get("name") or not node.get("approver")
+            for node in flow_nodes
+        ):
+            raise ValueError("审批流程存在空节点或未配置审批人，请先由老板修复审批流程")
 
         cur.execute("""
             INSERT INTO approval_requests
@@ -259,15 +261,21 @@ def act_on_request(request_id: int, action: str, approver: str, comment: str = N
         flow_nodes = json.loads(request["flow_nodes"]) if isinstance(request["flow_nodes"], str) else request["flow_nodes"]
         current_node = request["current_node"]
 
-        # 审批人身份校验：通过/驳回必须由当前节点配置的审批人执行
-        # （节点未配置审批人时允许任何登录用户操作，兼容历史流程）
-        if action in ("通过", "驳回") and current_node < len(flow_nodes):
+        # 审批人身份校验：通过/驳回必须由当前节点配置的审批人执行。
+        # 历史空节点不再允许任何登录用户代批，需先修复流程配置。
+        if action in ("通过", "驳回"):
+            if current_node >= len(flow_nodes):
+                raise PermissionError("审批流程节点无效，请联系管理员修复")
             node_approver = str((flow_nodes[current_node] or {}).get("approver") or "").strip()
-            if node_approver and approver.strip() != node_approver:
+            if not node_approver:
+                raise PermissionError("当前审批节点未配置审批人，不能审批")
+            if approver.strip() != node_approver:
                 raise PermissionError(
                     f"该节点应由「{node_approver}」审批，当前操作人「{approver}」无权审批；"
                     f"如需改派他人请使用转办，或调整审批流程配置"
                 )
+            if (request.get("applicant") or "").strip() == approver.strip():
+                raise PermissionError("申请人不能审批自己的申请")
 
         # 获取关联的所有分红记录（含兼容单条的 dividend_record_id）
         def _linked_dividend_ids():

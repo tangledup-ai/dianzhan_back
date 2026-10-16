@@ -47,11 +47,14 @@ async def update_cabinet(cabinet_id: int, request: Request, data: dict):
     old = cabinet_repo.get_cabinet(cabinet_id)
     if old:
         _ensure_meter_writable(request, old.get("meter_id"))
+    # 先校验目标挂载电表，再落库；不能先完成跨范围换挂、之后才返回 403。
+    target_meter_id = data.get("meterId", old.get("meter_id") if old else None)
+    if target_meter_id:
+        _ensure_meter_writable(request, target_meter_id)
     result = cabinet_repo.update_cabinet(cabinet_id, data)
     if not result:
         raise HTTPException(404, "柜子不存在")
     # 换挂电表会同时影响新旧两个场地的分摊
-    _ensure_meter_writable(request, result.get("meter_id"))
     _refresh_dividends_for_meter(old.get("meter_id") if old else None)
     _refresh_dividends_for_meter(result.get("meter_id"))
     return result

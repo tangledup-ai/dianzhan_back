@@ -111,7 +111,10 @@ async def handle_contract_alert(contract_id: int, request: Request):
     出现新的逾期分期或状态变化（如临期→已到期）后，特征改变，会再次预警。
     """
     from ..infra.database import get_connection, get_dict_cursor
-    from ..infra.auth_scope import scope_landlord_ids
+    from ..infra.auth_scope import scope_landlord_ids, scope_meter_tag
+
+    if scope_meter_tag(request):
+        raise HTTPException(403, "合同预警属于场地/合同整体信息，当前账号不能处理")
 
     conn = get_connection()
     cur = get_dict_cursor(conn)

@@ -3,10 +3,22 @@
 import json
 from datetime import datetime
 from fastapi import APIRouter, HTTPException, Depends
-from ..middleware.mp_auth import get_current_user
+from ..middleware.mp_auth import get_unscoped_finance_user
 from ..infra.database import get_connection, get_dict_cursor
 
 router = APIRouter(prefix="/approvals", tags=["📱 小程序 - 审批管理"])
+
+
+def _validate_approval_actor(flow_nodes, current_node, user, applicant):
+    if current_node >= len(flow_nodes):
+        raise HTTPException(400, "审批流程节点无效，请联系管理员修复")
+    node_approver = str((flow_nodes[current_node] or {}).get("approver") or "").strip()
+    if not node_approver:
+        raise HTTPException(403, "当前审批节点未配置审批人，不能审批")
+    if str(user.get("name") or "").strip() != node_approver:
+        raise HTTPException(403, f"该节点应由「{node_approver}」审批，您无权操作")
+    if (applicant or "").strip() == str(user.get("name") or "").strip():
+        raise HTTPException(403, "申请人不能审批自己的申请")
 
 
 def _format_approval(cur, row):
@@ -86,7 +98,7 @@ async def list_approvals(
     type: str = None,
     status: str = None,
     keyword: str = None,
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(get_unscoped_finance_user),
 ):
     """审批列表"""
     conn = get_connection()
@@ -121,7 +133,7 @@ async def list_approvals(
 
 
 @router.post("")
-async def create_approval(data: dict, user: dict = Depends(get_current_user)):
+async def create_approval(data: dict, user: dict = Depends(get_unscoped_finance_user)):
     """创建审批单"""
     conn = get_connection()
     cur = get_dict_cursor(conn)
@@ -139,6 +151,11 @@ async def create_approval(data: dict, user: dict = Depends(get_current_user)):
             if not boss:
                 raise HTTPException(400, "该业务类型未配置审批流程，且平台没有老板账号")
             flow_nodes = [{"name": "老板审批", "approver": boss["name"]}]
+        if not isinstance(flow_nodes, list) or not flow_nodes or any(
+            not isinstance(node, dict) or not node.get("name") or not node.get("approver")
+            for node in flow_nodes
+        ):
+            raise HTTPException(400, "审批流程存在空节点或未配置审批人，请先由老板修复审批流程")
 
         applicant = user["name"]
 
@@ -180,7 +197,7 @@ async def create_approval(data: dict, user: dict = Depends(get_current_user)):
 
 
 @router.post("/{request_id}/approve")
-async def approve(request_id: int, data: dict, user: dict = Depends(get_current_user)):
+async def approve(request_id: int, data: dict, user: dict = Depends(get_unscoped_finance_user)):
     """审批通过"""
     conn = get_connection()
     cur = get_dict_cursor(conn)
@@ -197,11 +214,7 @@ async def approve(request_id: int, data: dict, user: dict = Depends(get_current_
         current_node = request["current_node"]
         comment = data.get("comment", "同意")
 
-        # 审批人身份校验：须与当前节点配置的审批人一致（节点未配置审批人时放行，兼容历史流程）
-        if current_node < len(flow_nodes):
-            node_approver = str((flow_nodes[current_node] or {}).get("approver") or "").strip()
-            if node_approver and str(user["name"]).strip() != node_approver:
-                raise HTTPException(403, f"该节点应由「{node_approver}」审批，您无权审批")
+        _validate_approval_actor(flow_nodes, current_node, user, request.get("applicant"))
 
         next_node = current_node + 1
         if next_node >= len(flow_nodes):
@@ -209,6 +222,14 @@ async def approve(request_id: int, data: dict, user: dict = Depends(get_current_
                 "UPDATE approval_requests SET current_node = %s, status = '已通过', finished_at = NOW() WHERE id = %s",
                 (next_node, request_id)
             )
+            # 移动端最终审批与管理后台保持一致：同步关联分红记录状态。
+            dividend_ids = set()
+            if request.get("dividend_record_id"):
+                dividend_ids.add(request["dividend_record_id"])
+            cur.execute("SELECT dividend_record_id FROM approval_dividend_records WHERE approval_id = %s", (request_id,))
+            dividend_ids.update(r["dividend_record_id"] for r in cur.fetchall())
+            for dividend_id in dividend_ids:
+                cur.execute("UPDATE dividend_records SET status = '已通过', updated_at = NOW() WHERE id = %s", (dividend_id,))
             # 审批通过后同步对应场租/电费收付款状态（不发起实际资金操作）。
             from ..repositories.approval_repo import apply_payment_links
             apply_payment_links(cur, request)
@@ -232,7 +253,7 @@ async def approve(request_id: int, data: dict, user: dict = Depends(get_current_
 
 
 @router.post("/{request_id}/reject")
-async def reject(request_id: int, data: dict, user: dict = Depends(get_current_user)):
+async def reject(request_id: int, data: dict, user: dict = Depends(get_unscoped_finance_user)):
     """审批驳回"""
     conn = get_connection()
     cur = get_dict_cursor(conn)
@@ -249,16 +270,19 @@ async def reject(request_id: int, data: dict, user: dict = Depends(get_current_u
         current_node = request["current_node"]
         comment = data.get("comment", "驳回")
 
-        # 审批人身份校验：须与当前节点配置的审批人一致（节点未配置审批人时放行，兼容历史流程）
-        if current_node < len(flow_nodes):
-            node_approver = str((flow_nodes[current_node] or {}).get("approver") or "").strip()
-            if node_approver and str(user["name"]).strip() != node_approver:
-                raise HTTPException(403, f"该节点应由「{node_approver}」审批，您无权审批")
+        _validate_approval_actor(flow_nodes, current_node, user, request.get("applicant"))
 
         cur.execute(
             "UPDATE approval_requests SET status = '已驳回', finished_at = NOW() WHERE id = %s",
             (request_id,)
         )
+        dividend_ids = set()
+        if request.get("dividend_record_id"):
+            dividend_ids.add(request["dividend_record_id"])
+        cur.execute("SELECT dividend_record_id FROM approval_dividend_records WHERE approval_id = %s", (request_id,))
+        dividend_ids.update(r["dividend_record_id"] for r in cur.fetchall())
+        for dividend_id in dividend_ids:
+            cur.execute("UPDATE dividend_records SET status = '已驳回', updated_at = NOW() WHERE id = %s", (dividend_id,))
 
         node_name = flow_nodes[current_node]["name"] if current_node < len(flow_nodes) else ""
         cur.execute("""
@@ -274,7 +298,7 @@ async def reject(request_id: int, data: dict, user: dict = Depends(get_current_u
 
 
 @router.post("/{request_id}/transfer")
-async def transfer(request_id: int, data: dict, user: dict = Depends(get_current_user)):
+async def transfer(request_id: int, data: dict, user: dict = Depends(get_unscoped_finance_user)):
     """审批转办"""
     conn = get_connection()
     cur = get_dict_cursor(conn)
@@ -288,7 +312,13 @@ async def transfer(request_id: int, data: dict, user: dict = Depends(get_current
 
         flow_nodes = json.loads(request["flow_nodes"]) if isinstance(request["flow_nodes"], str) else request["flow_nodes"]
         current_node = request["current_node"]
-        to_person = data.get("to", "")
+        to_person = (data.get("to") or "").strip()
+        if not to_person:
+            raise HTTPException(400, "转办人不能为空")
+        _validate_approval_actor(flow_nodes, current_node, user, request.get("applicant"))
+        cur.execute("SELECT COUNT(*) AS total FROM platform_users WHERE name = %s", (to_person,))
+        if cur.fetchone()["total"] != 1:
+            raise HTTPException(400, "转办人不存在或姓名重复，请先维护唯一账号姓名")
 
         # 更新当前节点的审批人为转办目标
         if current_node < len(flow_nodes):
