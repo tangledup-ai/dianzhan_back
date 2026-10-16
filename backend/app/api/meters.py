@@ -143,6 +143,14 @@ async def import_meters(request: Request, file: UploadFile = File(...)):
                 results["errors"].append(f"第{row_idx}行: 电表编号 {meter_no} 不存在")
                 continue
 
+            # Excel 导入会更新读数，也可能把未关联电表挂到场地；每行都必须遵守
+            # 与单表编辑相同的类别/场地权限，不能让批量导入绕过数据隔离。
+            try:
+                ensure_meter_in_scope(request, meter.get("tag"), meter.get("landlord_id"))
+            except HTTPException:
+                results["errors"].append(f"第{row_idx}行: 无权导入该电表或电表尚未关联场地")
+                continue
+
             landlord_id = meter["landlord_id"]
             brand_id = meter["brand_id"]
             is_linked = bool(landlord_id)
@@ -151,6 +159,10 @@ async def import_meters(request: Request, file: UploadFile = File(...)):
             if not is_linked:
                 if not landlord_name:
                     results["errors"].append(f"第{row_idx}行: 电表 {meter_no} 未关联场地且 Excel 未填场地方")
+                    continue
+                # 受限类别账号不能认领未归属电表；该账号只能为已在授权场地内的电表录入数据。
+                if scope_meter_tag(request):
+                    results["errors"].append(f"第{row_idx}行: 受限类别账号不能通过导入关联未归属电表")
                     continue
                 landlord_id = _get_or_create_landlord(landlord_name)
                 if landlord_name not in results["created_landlords"]:
