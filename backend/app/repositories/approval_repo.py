@@ -172,11 +172,75 @@ def create_request(data: dict):
 
 
 def apply_payment_links(cur, request: dict):
-    """兼容旧调用点：审批通过不代表已经收付款，收付款状态必须由用户手动标注。
+    """审批通过 → 联动回写付款状态（Web 端 act_on_request 与小程序端 approve 共用）。
 
-    审批模块只记录审批状态，不再更新场租分期、电费台账或退款金额。
+    - 场地费付款审批 → 把覆盖该月份分期的 rent_payment_schedule 置为已付款
+      （区间匹配 [period_start, period_end]，兼容月付/季付/半年付/年付）
+    - 电费付款审批 → 把该场地×月的 electricity_records.pay_status 置为已付款
     """
-    return None
+    biz = request.get("biz_type") or ""
+    landlord_id = request.get("landlord_id")
+    period = request.get("period")  # YYYY-MM 或 YYYYMM
+
+    # ── 场地费退款 → 只回写合同押金退还，绝不联动租金分期/电费台账 ──
+    # （退款是业主退钱给公司，不能因为子串匹配"场地费"而误把分期标成已付款）
+    if biz == "场地费退款":
+        if request.get("contract_id"):
+            try:
+                deposit_part = float(request.get("amount") or 0) - float(request.get("rent_amount") or 0)
+            except (TypeError, ValueError):
+                deposit_part = 0
+            cur.execute("""
+                UPDATE contracts
+                SET deposit_refund_amount = %s, deposit_refund_date = CURRENT_DATE, deposit_refund_approval_id = %s
+                WHERE id = %s
+            """, (deposit_part, request["id"], request["contract_id"]))
+        return
+
+    # ── 场地费付款 → 联动付款分期 ──
+    if "场地费" in biz and landlord_id and period:
+        month_key = str(period).replace("-", "")  # 2026-08 -> 202608
+        if len(month_key) == 6 and month_key.isdigit():
+            month_start = f"{month_key[:4]}-{month_key[4:]}-01"  # 2026-08-01
+            cur.execute("""
+                SELECT id FROM contracts
+                WHERE landlord_id = %s AND contract_type = '场地合同'
+            """, (landlord_id,))
+            contracts = cur.fetchall()
+            for c in contracts:
+                # 覆盖该月份的分期（period_start <= 月末 AND period_end >= 月初）
+                cur.execute("""
+                    SELECT id FROM rent_payment_schedule
+                    WHERE contract_id = %s AND status != '已付款'
+                      AND period_start <= (DATE %s + INTERVAL '1 month' - INTERVAL '1 day')::date
+                      AND period_end >= %s::date
+                    ORDER BY seq
+                    LIMIT 1
+                """, (c["id"], month_start, month_start))
+                row = cur.fetchone()
+                if row:
+                    cur.execute("""
+                        UPDATE rent_payment_schedule
+                        SET status = '已付款', pay_date = NOW()::date
+                        WHERE id = %s
+                    """, (row["id"],))
+                    # 同步合同付款状态：全部分期已付=已付款 / 部分已付=部分付款 / 否则未付款
+                    cur.execute("""
+                        UPDATE contracts SET pay_status = CASE
+                            WHEN NOT EXISTS (SELECT 1 FROM rent_payment_schedule s WHERE s.contract_id = %s AND s.status <> '已付款') THEN '已付款'
+                            WHEN EXISTS (SELECT 1 FROM rent_payment_schedule s WHERE s.contract_id = %s AND s.status = '已付款') THEN '部分付款'
+                            ELSE '未付款'
+                        END
+                        WHERE id = %s
+                    """, (c["id"], c["id"], c["id"]))
+
+    # ── 电费付款 → 联动电费台账付款状态（v3：台账挂 landlord_id，按 场地×月 更新）──
+    if "电费" in biz and landlord_id and period:
+        cur.execute("""
+            UPDATE electricity_records
+            SET pay_status = '已付款', updated_at = NOW()
+            WHERE landlord_id = %s AND period = %s
+        """, (landlord_id, str(period).replace("-", "")))
 
 
 def act_on_request(request_id: int, action: str, approver: str, comment: str = None, **kwargs):
@@ -229,7 +293,7 @@ def act_on_request(request_id: int, action: str, approver: str, comment: str = N
                         "UPDATE dividend_records SET status = '已通过', updated_at = NOW() WHERE id = %s",
                         (rid,)
                     )
-                # 保留旧调用兼容；审批结果不改变手动维护的收付款状态。
+                # 场地费/电费付款审批 → 联动回写付款状态（付款分期 + 电费台账）
                 apply_payment_links(cur, request)
             else:
                 cur.execute(

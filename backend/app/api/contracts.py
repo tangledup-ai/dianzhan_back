@@ -14,12 +14,27 @@ router = APIRouter(prefix="/api/contracts", tags=["合同管理"], default_respo
 async def list_contracts(request: Request, brandId: int = None, landlordId: int = None, stationId: int = None, contractType: str = None, keyword: str = None):
     # 股东：只能看到关联场地的合同
     allowed = scope_landlord_ids(request)
-    return contract_repo.list_contracts(
+    tag_scope = scope_meter_tag(request)
+    rows = contract_repo.list_contracts(
         brand_id=brandId, landlord_id=landlordId, station_id=stationId,
         contract_type=contractType, keyword=keyword,
         allowed_landlord_ids=allowed,
-        meter_tag_scope=scope_meter_tag(request),
+        meter_tag_scope=tag_scope,
     )
+    if tag_scope:
+        # 类别财务需要读取品牌电价/税率用于电费计算，不需要品牌租金和全场柜数。
+        rent_fields = (
+            "rent_amount", "monthly_rent", "rent_calc_method", "unit_monthly_rent", "cabinets_count",
+            "pay_method", "rent_advance_days", "deposit", "deposit_refund_amount", "deposit_refund_date",
+            "deposit_refund_approval_id", "first_month_rent", "rent_refund", "rent_tax_enabled",
+            "post_tax_rent_price", "pay_status", "live_cabinets_count", "total_brand_cabinets",
+            "venue_monthly_rent", "income_cabinets_total", "venue_cost",
+        )
+        for row in rows:
+            for field in rent_fields:
+                if field in row:
+                    row[field] = None
+    return rows
 
 
 @router.post("", status_code=201)
@@ -547,6 +562,8 @@ async def delete_contract(contract_id: int, request: Request):
 
 
 @router.get("/{contract_id}/audit")
-async def get_contract_audit(contract_id: int):
+async def get_contract_audit(contract_id: int, request: Request):
     """合同变更审计记录（倒序，最多 50 条）"""
+    if scope_meter_tag(request):
+        raise HTTPException(403, "类别财务无权查看合同变更审计")
     return contract_repo.list_audit(contract_id)

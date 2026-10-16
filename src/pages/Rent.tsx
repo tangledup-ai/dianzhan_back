@@ -830,6 +830,7 @@ export default function Rent() {
   const [fStatus, setFStatus] = useState("");
   const [keyword, setKeyword] = useState("");
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [reconcileRow, setReconcileRow] = useState<any>(null);
   // 行内「整年收支」小节：默认展开（信息就在那儿），按行可收起（记 row.key）
   const [yearHidden, setYearHidden] = useState<Set<string>>(new Set());
   // ★「年度付款计划」「整年场地收支」已合并进台账每一行的展开区 —— 不再需要页面级折叠开关与搜索框：
@@ -1162,12 +1163,13 @@ export default function Rent() {
               <th className="xl-num" style={{ width: 104 }}>{rangeCycles.income ? `${rangeCycles.income}场地费未收` : "未收(按周期)"}</th>
               <th className="xl-num" style={{ width: 104 }}>{rangeCycles.pay ? `${rangeCycles.pay}场地费已付` : "已付(按周期)"}</th>
               <th className="xl-num" style={{ width: 104 }}>{rangeCycles.pay ? `${rangeCycles.pay}场地费应付` : "未付(按周期)"}</th>
+              <th className="xl-ctr" style={{ width: 72 }}>核对</th>
             </tr>
           </thead>
           <tbody>
             {rows.length === 0 && (
               <tr>
-                <td colSpan={14} className="xl-ctr xl-muted" style={{ padding: "28px 8px" }}>
+                <td colSpan={15} className="xl-ctr xl-muted" style={{ padding: "28px 8px" }}>
                   {q.isLoading ? "加载中…" : "所选筛选条件下没有场地费台账数据"}
                 </td>
               </tr>
@@ -1220,10 +1222,15 @@ export default function Rent() {
                       {!rangeCycles.pay && r.cyc.pay && <span className="mr-1 text-[9px] text-slate-400">{r.cyc.pay}</span>}
                       {fmtMoney(r.unpaidAmount)}
                     </td>
+                    <td className="xl-ctr">
+                      <Button size="sm" variant="outline" className="h-7 px-2 text-[11px]" onClick={() => setReconcileRow(r)}>
+                        <CheckCircle2 className="mr-1 h-3 w-3" />核对
+                      </Button>
+                    </td>
                   </tr>
                   {open && canExpand && (
                     <tr className="xl-detail">
-                      <td colSpan={14} className="p-0">
+                      <td colSpan={15} className="p-0">
                         <div className="p-2 pt-1.5">
 
                           {/* ① 本月口径指标条：这个月的钱一眼看完（口径与上方主表列一致） */}
@@ -1384,6 +1391,7 @@ export default function Rent() {
                 <td className="xl-num text-amber-600">{fmtMoney(totals.uncollectedAmount)}</td>
                 <td className="xl-num text-slate-600">{fmtMoney(totals.paidAmount)}</td>
                 <td className="xl-num xl-neg">{fmtMoney(totals.unpaidAmount)}</td>
+                <td></td>
               </tr>
             </tfoot>
           )}
@@ -1400,6 +1408,51 @@ export default function Rent() {
         · 点行首 ▶ 展开：<b>本月指标条</b> → <b>年度付款计划</b>（左付款 / 右收款，并排 · 逾期标红 · 每期可提交审批或标记）→ <b>本月合同明细</b> → <b>整年收支</b>。
         <br />· 「年度付款计划」按该行月份的年份取数；「整年收支」按起始月所处年份构建，其「逐年」列只显示该年。
       </p>
+
+      <Dialog open={!!reconcileRow} onOpenChange={(open) => !open && setReconcileRow(null)}>
+        <DialogContent className="!max-w-4xl">
+          <DialogHeader>
+            <DialogTitle>场地费核对 · {reconcileRow?.landlordName} · {reconcileRow ? toDisplay(reconcileRow.period) : ""}</DialogTitle>
+          </DialogHeader>
+          {reconcileRow && <div className="space-y-4">
+            <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+              <StatCard label="品牌方应收（月）" value={reconcileRow.rentIncome} tone="emerald" />
+              <StatCard label="场地方应付（月）" value={reconcileRow.rentCost} tone="rose" />
+              <StatCard label="税费（月）" value={reconcileRow.rentTax} />
+              <StatCard label="经营差额（月）" value={reconcileRow.rentProfit} tone="blue" />
+              <StatCard label="已收（合同周期）" value={reconcileRow.collectedAmount} tone="emerald" />
+              <StatCard label="待收（合同周期）" value={reconcileRow.uncollectedAmount} />
+              <StatCard label="已付（合同周期）" value={reconcileRow.paidAmount} />
+              <StatCard label="待付（合同周期）" value={reconcileRow.unpaidAmount} tone="rose" />
+            </div>
+            <div className="overflow-x-auto rounded-lg border">
+              <table className="w-full min-w-[760px] text-xs">
+                <thead><tr className="border-b bg-slate-50 text-left text-slate-500">
+                  <th className="px-3 py-2">收/付方向</th><th className="px-3 py-2">合同/品牌</th>
+                  <th className="px-3 py-2">公司主体</th><th className="px-3 py-2 text-right">本月应收/应付</th>
+                  <th className="px-3 py-2 text-right">已收/已付</th><th className="px-3 py-2 text-right">待收/待付</th>
+                  <th className="px-3 py-2">合同周期</th>
+                </tr></thead>
+                <tbody>{(reconcileRow.contracts ?? []).map((c: any, i: number) => {
+                  const venue = c.contractType === "场地合同";
+                  const paid = venue ? c.paidAmount : c.collectedAmount;
+                  const unpaid = venue ? c.unpaidAmount : c.uncollectedAmount;
+                  return <tr key={`${c.contractId ?? i}`} className="border-b last:border-0">
+                    <td className={venue ? "px-3 py-2 text-rose-600" : "px-3 py-2 text-emerald-600"}>{venue ? "我方应付场地方" : "品牌方应付我方"}</td>
+                    <td className="px-3 py-2">{c.brandName || (venue ? reconcileRow.landlordName : "全品牌合同")}</td>
+                    <td className="px-3 py-2">{c.entityName || "未指定主体"}</td>
+                    <td className="px-3 py-2 text-right tabular-nums">{fmtMoney(c.monthlyRent)}</td>
+                    <td className="px-3 py-2 text-right tabular-nums">{fmtMoney(paid)}</td>
+                    <td className="px-3 py-2 text-right tabular-nums">{fmtMoney(unpaid)}</td>
+                    <td className="px-3 py-2">{c.startDate ? `${String(c.startDate).slice(0, 10)} ~ ${c.endDate ? String(c.endDate).slice(0, 10) : "长期"}` : "未设置"}</td>
+                  </tr>;
+                })}</tbody>
+              </table>
+            </div>
+            <p className="text-[11px] text-slate-400">应收/应付为所选月份合同口径；已收/待收/已付/待付按合同付款周期展示。此核对窗仅供与双方财务核对，不会修改账单或状态。</p>
+          </div>}
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

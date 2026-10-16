@@ -175,24 +175,25 @@ async def get_landlord_meter_view(landlord_id: int, period: str = None, request:
     for c in contracts:
         if c.get("contract_type") != "场地合同":
             continue
-        leases.append({
-            "id": c.get("id"),
-            "landlord_id": c.get("landlord_id"),
-            "contract_start": c.get("start_date"),
-            "contract_end": c.get("end_date"),
-            "annual_rent": c.get("rent_amount"),
-            "pay_method": c.get("pay_method"),
-            "pay_amount": c.get("rent_amount"),
-            "deposit": c.get("deposit"),
-            "pay_status": c.get("pay_status"),
-            "monthly_rent": c.get("monthly_rent"),
-        })
+        if not tag_scope:
+            leases.append({
+                "id": c.get("id"),
+                "landlord_id": c.get("landlord_id"),
+                "contract_start": c.get("start_date"),
+                "contract_end": c.get("end_date"),
+                "annual_rent": c.get("rent_amount"),
+                "pay_method": c.get("pay_method"),
+                "pay_amount": c.get("rent_amount"),
+                "deposit": c.get("deposit"),
+                "pay_status": c.get("pay_status"),
+                "monthly_rent": c.get("monthly_rent"),
+            })
 
     # 租金收款（品牌方合同 → 收款分期，筛选覆盖该月的）
     from ..repositories import contract_schedule_repo
     rent_receipts = []
     for c in contracts:
-        if c.get("contract_type") != "品牌方合同":
+        if tag_scope or c.get("contract_type") != "品牌方合同":
             continue
         if c.get("brand_id") and c["brand_id"] not in station_brand_ids:
             continue
@@ -306,7 +307,7 @@ async def get_landlord_meter_view(landlord_id: int, period: str = None, request:
                     prev_month_kwh = float(mm["kwh"])
 
             meter_brand_id = meter.get("brand_id")
-            meter_receipts = [r for r in rent_receipts if r.get("brand_id") == meter_brand_id]
+            meter_receipts = [] if tag_scope else [r for r in rent_receipts if r.get("brand_id") == meter_brand_id]
 
             pay_kwh = this_month_kwh
             collect_kwh = this_month_kwh
@@ -408,18 +409,18 @@ async def get_landlord_meter_view(landlord_id: int, period: str = None, request:
         "landlordName": landlord_name,
         "period": period,
         "brandGroups": result_groups,
-        "leases": leases,
-        "elecRecords": list(records_by_brand.values()),
-        "contractRent": contract_rent,
+        "leases": [] if tag_scope else leases,
+        "elecRecords": [] if tag_scope else list(records_by_brand.values()),
+        "contractRent": {"cost": [], "income": []} if tag_scope else contract_rent,
         "summary": {
             "totalKwh": total_kwh,
             "totalPayAmount": total_pay_amount,
             "totalCollectAmount": total_collect_amount,
             "totalCollectNet": total_collect_net,
             "totalElecProfit": total_elec_profit,
-            "totalRentCost": total_rent_cost,
-            "totalRentIncome": total_rent_income,
-            "totalRentTax": round(rent_tax, 2),
-            "totalRentProfit": total_rent_profit,
+            "totalRentCost": 0 if tag_scope else total_rent_cost,
+            "totalRentIncome": 0 if tag_scope else total_rent_income,
+            "totalRentTax": 0 if tag_scope else round(rent_tax, 2),
+            "totalRentProfit": 0 if tag_scope else total_rent_profit,
         },
     }

@@ -209,7 +209,7 @@ async def approve(request_id: int, data: dict, user: dict = Depends(get_current_
                 "UPDATE approval_requests SET current_node = %s, status = '已通过', finished_at = NOW() WHERE id = %s",
                 (next_node, request_id)
             )
-            # 审批状态与实际收付款分离；收付款状态由用户在台账手动标记。
+            # 审批通过后同步对应场租/电费收付款状态（不发起实际资金操作）。
             from ..repositories.approval_repo import apply_payment_links
             apply_payment_links(cur, request)
         else:

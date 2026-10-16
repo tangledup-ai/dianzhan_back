@@ -236,24 +236,24 @@ export default function Dashboard() {
 
       {/* 维度看板入口 */}
       <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
-        <Link to="/brands" className="rounded-xl border bg-white p-4 shadow-sm transition-colors hover:border-emerald-300 hover:bg-emerald-50/30">
+        {!tagScope && <Link to="/brands" className="rounded-xl border bg-white p-4 shadow-sm transition-colors hover:border-emerald-300 hover:bg-emerald-50/30">
           <div className="flex items-center gap-3">
             <div className="rounded-lg bg-blue-100 p-2"><Tag className="h-5 w-5 text-blue-600" /></div>
             <div><div className="text-sm font-semibold text-slate-700">品牌方看板</div><div className="text-xs text-slate-400">{data.brandCount} 个品牌方</div></div>
           </div>
-        </Link>
+        </Link>}
         {!tagScope && <Link to="/entities" className="rounded-xl border bg-white p-4 shadow-sm transition-colors hover:border-emerald-300 hover:bg-emerald-50/30">
           <div className="flex items-center gap-3">
             <div className="rounded-lg bg-purple-100 p-2"><Landmark className="h-5 w-5 text-purple-600" /></div>
             <div><div className="text-sm font-semibold text-slate-700">公司主体看板</div><div className="text-xs text-slate-400">{data.entityCount} 个主体</div></div>
           </div>
         </Link>}
-        <Link to="/landlords" className="rounded-xl border bg-white p-4 shadow-sm transition-colors hover:border-emerald-300 hover:bg-emerald-50/30">
+        {!tagScope && <Link to="/landlords" className="rounded-xl border bg-white p-4 shadow-sm transition-colors hover:border-emerald-300 hover:bg-emerald-50/30">
           <div className="flex items-center gap-3">
             <div className="rounded-lg bg-amber-100 p-2"><MapPin className="h-5 w-5 text-amber-600" /></div>
             <div><div className="text-sm font-semibold text-slate-700">场地方看板</div><div className="text-xs text-slate-400">{data.landlordCount} 个场地方</div></div>
           </div>
-        </Link>
+        </Link>}
         {!tagScope && <Link to="/shareholders" className="rounded-xl border bg-white p-4 shadow-sm transition-colors hover:border-emerald-300 hover:bg-emerald-50/30">
           <div className="flex items-center gap-3">
             <div className="rounded-lg bg-emerald-100 p-2"><Users className="h-5 w-5 text-emerald-600" /></div>
