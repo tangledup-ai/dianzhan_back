@@ -839,16 +839,16 @@ async def station_board(request: Request, landlordId: int = None, keyword: str =
             for c in contracts:
                 if c["contract_type"] == "场地合同" and c["monthly_rent"]:
                     rent_cost += float(c["monthly_rent"])
-            pricing = resolve_prices(contracts)
+            pricing = resolve_prices(contracts, period)
             elec_pay_price = pricing["pay_price"] or 0   # 场地合同唯一付款单价
 
             # 从电表月度数据计算总度数（按 品牌 拆分，供按品牌计收；v3：不再按站点）
-            meter_nos = [m["meter_no"] for m in meters if m.get("meter_no")]
+            meter_ids = [m["id"] for m in meters]
             total_kwh = 0
             station_breakdown = []  # 按品牌拆分的数据（含各品牌度数）
-            if meter_nos and period:
+            if meter_ids and period:
                 month_period = period.replace("-", "")
-                placeholders = ",".join(["%s"] * len(meter_nos))
+                placeholders = ",".join(["%s"] * len(meter_ids))
                 cur.execute(f"""
                     SELECT m.brand_id, b.name as brand_name,
                            COALESCE(SUM(COALESCE(mm.actual_kwh, ROUND(mm.kwh * COALESCE(mm.transformer_ratio_snapshot, m.transformer_ratio, 1), 2))), 0) as kwh,
@@ -856,10 +856,10 @@ async def station_board(request: Request, landlordId: int = None, keyword: str =
                     FROM meter_readings mm
                     JOIN meters m ON m.id = mm.meter_id AND m.landlord_id IS NOT NULL AND m.brand_id IS NOT NULL
                     LEFT JOIN brands b ON m.brand_id = b.id
-                    WHERE mm.address IN ({placeholders}) AND mm.month_period = %s
+                    WHERE mm.meter_id IN ({placeholders}) AND mm.period = %s
                     GROUP BY m.brand_id, b.name
                     ORDER BY kwh DESC
-                """, (*meter_nos, month_period))
+                """, (*meter_ids, month_period))
                 rows = cur.fetchall()
                 # 品牌聚合（保留各品牌度数）
                 for r in rows:
@@ -1158,8 +1158,12 @@ async def landlord_trends(request: Request, landlordId: int, months: int = 6):
 
         # #2 统一口径：付款=场地合同唯一单价；收款=按品牌各自单价（无对应品牌合同 → 收入 0）
         from ..domain.electricity_pricing import resolve_prices, rent_income_for_period, rent_refund_for_period
-        pricing = resolve_prices(contracts)
-        elec_pay_price = pricing["pay_price"] or 0
+        pricing_cache = {}
+        def _pricing_for_month(month):
+            key = str(month).replace("-", "")[:6]
+            if key not in pricing_cache:
+                pricing_cache[key] = resolve_prices(contracts, key)
+            return pricing_cache[key]
         rent_cost = 0
         brand_contracts = []
         for c in contracts:
@@ -1209,16 +1213,22 @@ async def landlord_trends(request: Request, landlordId: int, months: int = 6):
         trends = []
         for row in monthly_kwh:
             kwh = float(row["kwh"])
-            ep = round(kwh * elec_pay_price, 2)
+            month_pricing = resolve_prices(contracts, row["month_period"])
+            month_pay_price = month_pricing["pay_price"] or 0
+            month_rent_cost = sum(float(c["monthly_rent"] or 0) for c in contracts
+                                  if c["contract_type"] == "场地合同"
+                                  and (not c.get("start_date") or str(c["start_date"])[:7].replace("-", "") <= row["month_period"])
+                                  and (not (c.get("early_end_date") or c.get("end_date")) or str(c.get("early_end_date") or c.get("end_date"))[:7].replace("-", "") >= row["month_period"]))
+            ep = round(kwh * month_pay_price, 2)
             ec = round(sum(
-                float(kwh_b) * (pricing["brand_prices"].get(bid, {}).get("price") or 0)
+                float(kwh_b) * (month_pricing["brand_prices"].get(bid, {}).get("price") or 0)
                 for bid, kwh_b in row.get("brand_kwh", {}).items()
             ), 2)
             eprofit = round(ec - ep, 2)
             # #6：租金收入按当月口径（首月用 first_month_rent，提前结束月扣退款），与分红一致
             rent_income_m = sum(rent_income_for_period(c, row["month_period"]) for c in brand_contracts)
             rent_refund_m = sum(rent_refund_for_period(c, row["month_period"]) for c in brand_contracts)
-            rprofit = round((rent_income_m - rent_refund_m) - rent_cost, 2)
+            rprofit = round((rent_income_m - rent_refund_m) - month_rent_cost, 2)
             period = row["month_period"]
             # 格式化period: "202607" -> "2026-07"
             if len(period) == 6:
@@ -1231,7 +1241,7 @@ async def landlord_trends(request: Request, landlordId: int, months: int = 6):
                 "elecPay": ep,
                 "elecCollect": ec,
                 "elecProfit": eprofit,
-                "rentCost": round(rent_cost, 2),
+                "rentCost": round(month_rent_cost, 2),
                 "rentIncome": round(rent_income_m - rent_refund_m, 2),
                 "rentProfit": rprofit,
                 "opExpense": round(op, 2),
@@ -1291,8 +1301,12 @@ async def landlord_station_monthly(request: Request, landlordId: int, months: in
 
         # #2 统一口径：付款=场地合同唯一单价；收款=按品牌各自单价（无对应品牌合同 → 收入 0）
         from ..domain.electricity_pricing import resolve_prices, rent_income_for_period, rent_refund_for_period
-        pricing = resolve_prices(contracts)
-        elec_pay_price = pricing["pay_price"] or 0
+        pricing_cache = {}
+        def _pricing_for_month(month):
+            key = str(month).replace("-", "")[:6]
+            if key not in pricing_cache:
+                pricing_cache[key] = resolve_prices(contracts, key)
+            return pricing_cache[key]
         rent_cost = 0
         brand_contracts = []
         for c in contracts:
@@ -1357,7 +1371,7 @@ async def landlord_station_monthly(request: Request, landlordId: int, months: in
                 picked = []
                 for a in allocs:
                     eid_a = a.get("entity_id") or shared_meta.get(addr)
-                    info_a = _brand_price_for(pricing, a["brand_id"], eid_a)
+                    info_a = _brand_price_for(_pricing_for_month(mp), a["brand_id"], eid_a)
                     price_a = a.get("unit_price") or (info_a["price"] if info_a else None)
                     kwh_a = round(float(a.get("collect_amount") or 0) / float(price_a), 2) if price_a else 0.0
                     picked.append((a, kwh_a))
@@ -1378,6 +1392,8 @@ async def landlord_station_monthly(request: Request, landlordId: int, months: in
 
         for mp in recent_months:
             period = f"{mp[:4]}-{mp[4:]}" if len(mp) == 6 else mp
+            month_pricing = _pricing_for_month(mp)
+            elec_pay_price = month_pricing["pay_price"] or 0
             brand_data = month_map.get(mp, {})
             rent_income_m = sum(rent_income_for_period(c, mp) for c in brand_contracts)
             rent_refund_m = sum(rent_refund_for_period(c, mp) for c in brand_contracts)
@@ -1389,7 +1405,7 @@ async def landlord_station_monthly(request: Request, landlordId: int, months: in
                 kwh = float(cell.get("kwh") or 0)          # 付款口径电量（含共享表摊入）
                 own_kwh = float(cell.get("own_kwh") or 0)  # 自有电表电量
                 ep = round(kwh * elec_pay_price, 2)
-                own_price = (pricing["brand_prices"].get(int(bid)) or {}).get("price") if bid is not None else None
+                own_price = (month_pricing["brand_prices"].get(int(bid)) or {}).get("price") if bid is not None else None
                 ec = round(own_kwh * float(own_price or 0), 2)
                 if cell.get("alloc_amount") is not None:
                     # 共享表品牌分摊：收入以人工录入应收为准（与台账一致）

@@ -115,7 +115,7 @@ def get_meter_details(electricity_id: int):
         # 品牌口径：优先取台账行的品牌（共享电表按品牌分摊后，一行台账对应一个品牌，
         # 而电表自身 brand_id 为空），其次回退到电表品牌。
         cur.execute("""
-            SELECT d.*, m.meter_no, m.meter_name, m.landlord_id,
+            SELECT d.*, m.meter_no, m.meter_name, m.landlord_id, m.tag,
                    COALESCE(e.brand_id, m.brand_id) AS brand_id,
                    m.entity_id,
                    b.name as brand_name, ent.name as entity_name

@@ -222,7 +222,7 @@ async def save_meter_reading(data: dict, request: Request = None):
     try:
         cur.execute(
             """
-            SELECT id FROM meters
+            SELECT id, transformer_ratio FROM meters
             WHERE meter_no = %s OR device_address = %s
             ORDER BY (meter_no = %s) DESC NULLS LAST, id
             LIMIT 1
@@ -236,6 +236,7 @@ async def save_meter_reading(data: dict, request: Request = None):
     if not mid_row:
         raise HTTPException(404, f"电表档案不存在，无法录入读数：{address}")
     meter_id = mid_row["id"]
+    transformer_ratio = float(mid_row.get("transformer_ratio") or 1)
 
     # 如果提供了起始度数和抄表度数，自动计算区间度数
     if kwh is None and prev_reading is not None and curr_reading is not None:
@@ -251,7 +252,8 @@ async def save_meter_reading(data: dict, request: Request = None):
     prev_actual_reading = float(prev_actual_reading) if prev_actual_reading is not None and str(prev_actual_reading).strip() != "" else None
     curr_actual_reading = float(curr_actual_reading) if curr_actual_reading is not None and str(curr_actual_reading).strip() != "" else None
     if actual_kwh is None and prev_actual_reading is not None and curr_actual_reading is not None:
-        actual_kwh = round(curr_actual_reading - prev_actual_reading, 2)
+        # 人工填写的“实际用电量”已含倍率；表码差需乘当前倍率。
+        actual_kwh = round((curr_actual_reading - prev_actual_reading) * transformer_ratio, 2)
 
     conn = get_connection()
     cur = conn.cursor()
@@ -358,7 +360,7 @@ async def get_shared_allocations(request: Request = None, meterNo: str = None, m
         cur.close()
         conn.close()
 
-    pricing = resolve_prices(contracts)
+    pricing = resolve_prices(contracts, month_period)
     # 候选品牌：该场地方已签品牌方合同的品牌（默认单价 = 合同单价）
     candidates = []
     for bid, info in sorted(pricing["brand_prices"].items(), key=lambda kv: brand_names.get(kv[0], "")):

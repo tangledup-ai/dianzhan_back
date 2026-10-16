@@ -16,13 +16,20 @@
 """
 
 
-def resolve_prices(contracts: list) -> dict:
+def _compact_month(value) -> str | None:
+    if value is None:
+        return None
+    return str(value)[:10].replace("-", "")[:6]
+
+
+def resolve_prices(contracts: list, period: str = None) -> dict:
     """从合同列表解析付款/收款单价。
 
     Args:
         contracts: 该场地下所有合同行（dict，需含 contract_type / brand_id /
                    electricity_price / tax_rate / tax_enabled / post_tax_electricity_price；
                    缺字段视为 0/False/None）。
+        period: 可选账期 YYYYMM；提供后仅选择该月有效合同，避免续签后历史账单套用旧/新错价。
 
     Returns:
         {
@@ -38,8 +45,18 @@ def resolve_prices(contracts: list) -> dict:
             },
         }
     """
-    site_contracts = [c for c in contracts if (c.get("contract_type") or "") == "场地合同"]
-    brand_contracts = [c for c in contracts if (c.get("contract_type") or "") == "品牌方合同"]
+    period = str(period or "").replace("-", "")[:6]
+    effective_contracts = []
+    for c in contracts:
+        if period:
+            start = _compact_month(c.get("start_date"))
+            end = _compact_month(c.get("early_end_date") or c.get("end_date"))
+            if (start and start > period) or (end and end < period):
+                continue
+        effective_contracts.append(c)
+
+    site_contracts = [c for c in effective_contracts if (c.get("contract_type") or "") == "场地合同"]
+    brand_contracts = [c for c in effective_contracts if (c.get("contract_type") or "") == "品牌方合同"]
 
     # ── 付款单价：唯一单价；多份不同 → 取 id 最小并标记冲突 ──
     site_prices = []

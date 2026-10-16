@@ -1,42 +1,60 @@
 from fastapi import APIRouter, HTTPException, Request
 from ..repositories import dividend_repo, approval_repo
 from ..domain.dividend_calc import dividend_calculator
-from ..infra.auth_scope import scope_landlord_ids
+from ..infra.auth_scope import scope_landlord_ids, scope_meter_tag, ensure_landlord_in_scope
 from .base import CamelJSONResponse
 
 router = APIRouter(prefix="/api/dividends", tags=["分红管理"], default_response_class=CamelJSONResponse)
 
 
+def _ensure_dividend_scope(request: Request, landlord_id: int | None = None):
+    # 分红是场地全口径利润，不能把跨电表类别的完整金额暴露给单一类别财务。
+    if scope_meter_tag(request):
+        raise HTTPException(403, "分红为场地全口径数据，当前账号的电表类别权限不足")
+    if landlord_id is not None:
+        ensure_landlord_in_scope(request, int(landlord_id))
+
+
 # ─── 分红配置（v3：挂 场地 landlord_id，brand_id 空=整场地 / 非空=指定品牌）───────────────
 
 @router.get("/configs/shareholder")
-async def list_shareholder_configs(landlordId: int = None):
-    return dividend_repo.list_shareholder_configs(landlord_id=landlordId)
+async def list_shareholder_configs(request: Request, landlordId: int = None):
+    _ensure_dividend_scope(request, landlordId)
+    rows = dividend_repo.list_shareholder_configs(landlord_id=landlordId)
+    allowed = scope_landlord_ids(request)
+    return [r for r in rows if r.get("landlord_id") in allowed] if allowed is not None else rows
 
 
 @router.post("/configs/shareholder", status_code=201)
-async def save_shareholder_config(data: dict):
+async def save_shareholder_config(data: dict, request: Request):
+    _ensure_dividend_scope(request, data.get("landlordId"))
     return dividend_repo.save_shareholder_config(data)
 
 
 @router.delete("/configs/shareholder/{config_id}")
-async def delete_shareholder_config(config_id: int):
+async def delete_shareholder_config(config_id: int, request: Request):
+    _ensure_dividend_scope(request)
     dividend_repo.delete_shareholder_config(config_id)
     return {"ok": True}
 
 
 @router.get("/configs/introducer")
-async def list_introducer_configs(landlordId: int = None):
-    return dividend_repo.list_introducer_configs(landlord_id=landlordId)
+async def list_introducer_configs(request: Request, landlordId: int = None):
+    _ensure_dividend_scope(request, landlordId)
+    rows = dividend_repo.list_introducer_configs(landlord_id=landlordId)
+    allowed = scope_landlord_ids(request)
+    return [r for r in rows if r.get("landlord_id") in allowed] if allowed is not None else rows
 
 
 @router.post("/configs/introducer", status_code=201)
-async def save_introducer_config(data: dict):
+async def save_introducer_config(data: dict, request: Request):
+    _ensure_dividend_scope(request, data.get("landlordId"))
     return dividend_repo.save_introducer_config(data)
 
 
 @router.delete("/configs/introducer/{config_id}")
-async def delete_introducer_config(config_id: int):
+async def delete_introducer_config(config_id: int, request: Request):
+    _ensure_dividend_scope(request)
     dividend_repo.delete_introducer_config(config_id)
     return {"ok": True}
 
@@ -56,9 +74,7 @@ async def calculate_dividend(data: dict, request: Request):
         raise HTTPException(400, "landlordId 和 period 必填")
 
     # 股东：只能计算关联场地的分红
-    allowed = scope_landlord_ids(request)
-    if allowed is not None and int(landlord_id) not in allowed:
-        raise HTTPException(403, "无权查看该场地分红")
+    _ensure_dividend_scope(request, landlord_id)
 
     result = dividend_calculator.calculate(int(landlord_id), brand_id, period, estimate=estimate)
     if not result:
@@ -76,9 +92,7 @@ async def refresh_dividends(data: dict, request: Request):
         raise HTTPException(400, "landlordId 必填")
 
     # 股东：只能重算关联场地的分红
-    allowed = scope_landlord_ids(request)
-    if allowed is not None and int(landlord_id) not in allowed:
-        raise HTTPException(403, "无权重算该场地分红")
+    _ensure_dividend_scope(request, landlord_id)
 
     period = to_compact(data["period"]) if data.get("period") else None
     return refresh_dividend_records(int(landlord_id), [period] if period else None)
@@ -89,6 +103,7 @@ async def refresh_dividends(data: dict, request: Request):
 @router.get("")
 async def list_dividends(request: Request, landlordId: int = None, brandId: int = None, stationId: int = None,
                          period: str = None, type: str = None, status: str = None):
+    _ensure_dividend_scope(request, landlordId)
     records = dividend_repo.list_records(station_id=stationId, landlord_id=landlordId, brand_id=brandId,
                                          period=period, type_=type, status=status)
     # 股东：只能看到关联场地的分红记录
@@ -107,10 +122,7 @@ async def get_dividend(record_id: int, request: Request):
     record = dividend_repo.get_record(record_id)
     if not record:
         raise HTTPException(404, "分红记录不存在")
-    # 股东：只能查看关联场地的分红记录
-    allowed = scope_landlord_ids(request)
-    if allowed is not None and (record.get("landlord_id") not in allowed):
-        raise HTTPException(403, "无权查看该分红记录")
+    _ensure_dividend_scope(request, record.get("landlord_id"))
     shares = dividend_repo.get_shares(record_id)
 
     # 获取数据来源明细（v3.1 主源：电费台账(landlord×brand×entity) + contracts 租金 + 运营费用）
@@ -142,7 +154,7 @@ async def get_dividend(record_id: int, request: Request):
 
 
 @router.post("", status_code=201)
-async def create_dividend(data: dict):
+async def create_dividend(data: dict, request: Request):
     """创建分红记录（v3：按 场地×品牌）"""
     from ..infra.period import to_compact
     landlord_id = data.get("landlordId")
@@ -151,6 +163,7 @@ async def create_dividend(data: dict):
 
     if not landlord_id or not period:
         raise HTTPException(400, "landlordId 和 period 必填")
+    _ensure_dividend_scope(request, landlord_id)
 
     # 计算分红
     calc = dividend_calculator.calculate(int(landlord_id), brand_id, period)
@@ -206,7 +219,7 @@ async def create_dividend(data: dict):
 
 
 @router.post("/{record_id}/submit")
-async def submit_dividend(record_id: int, data: dict):
+async def submit_dividend(record_id: int, data: dict, request: Request):
     """提交分红审批（关联分红记录，审核人员可展开查看详细分红核算信息）
 
     允许从未结算提交，也允许被驳回后重新提交。
@@ -214,6 +227,7 @@ async def submit_dividend(record_id: int, data: dict):
     record = dividend_repo.get_record(record_id)
     if not record:
         raise HTTPException(404, "分红记录不存在")
+    _ensure_dividend_scope(request, record.get("landlord_id"))
     if record["status"] not in ("未结算", "已驳回"):
         raise HTTPException(400, f"当前状态 {record['status']} 不允许提交")
 
@@ -248,11 +262,12 @@ async def submit_dividend(record_id: int, data: dict):
 #   → 已通过 → settle 标记已结算（打款完成）。
 # 不提供任意改状态的接口；settle 仅允许「已通过 → 已结算」，防止绕过审批直接放款。
 @router.post("/{record_id}/settle")
-async def settle_dividend(record_id: int, data: dict):
+async def settle_dividend(record_id: int, data: dict, request: Request):
     """标记已结算（仅限审批已通过的记录，表示分红款已实际发放）"""
     record = dividend_repo.get_record(record_id)
     if not record:
         raise HTTPException(404, "分红记录不存在")
+    _ensure_dividend_scope(request, record.get("landlord_id"))
     if record["status"] != "已通过":
         raise HTTPException(400, f"只有审批「已通过」的分红才能标记已结算，当前状态为「{record['status']}」")
     dividend_repo.update_status(record_id, "已结算")
@@ -260,10 +275,11 @@ async def settle_dividend(record_id: int, data: dict):
 
 
 @router.delete("/{record_id}")
-async def delete_dividend(record_id: int):
+async def delete_dividend(record_id: int, request: Request):
     record = dividend_repo.get_record(record_id)
     if not record:
         raise HTTPException(404, "分红记录不存在")
+    _ensure_dividend_scope(request, record.get("landlord_id"))
     # 已进入审批或已发放的分红记录是财务凭证，不允许直接删除
     if record["status"] in ("申报中", "已通过", "已结算"):
         raise HTTPException(400, f"当前状态「{record['status']}」不允许删除（已进入审批/发放流程）")
@@ -275,6 +291,7 @@ async def delete_dividend(record_id: int):
 
 @router.get("/summary/shareholder")
 async def shareholder_summary(request: Request, shareholderId: int = None, period: str = None, periodStart: str = None, periodEnd: str = None):
+    _ensure_dividend_scope(request)
     # 股东账号：只能汇总自己 + 只看关联场地的分红
     user = getattr(request.state, "current_user", None)
     if user and user.get("role") == "shareholder":
@@ -309,8 +326,12 @@ async def shareholder_summary(request: Request, shareholderId: int = None, perio
 
 
 @router.get("/summary/introducer")
-async def introducer_summary(introducerId: int = None, period: str = None):
+async def introducer_summary(request: Request, introducerId: int = None, period: str = None):
+    _ensure_dividend_scope(request)
     rows = dividend_repo.get_introducer_summary(introducer_id=introducerId, period=period)
+    allowed = scope_landlord_ids(request)
+    if allowed is not None:
+        rows = [r for r in rows if r.get("landlord_id") in allowed]
     intros = {}
     for r in rows:
         iid = r["introducer_id"]

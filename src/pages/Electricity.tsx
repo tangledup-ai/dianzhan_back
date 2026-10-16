@@ -696,7 +696,7 @@ function LandlordMonthlyDialog({ open, period: initialPeriod, onClose }: { open:
             <div className="py-10 text-center text-sm text-slate-400">该月没有电表数据</div>
           ) : (
             <div className="xl-wrap rounded-md">
-              <table className="xl-table min-w-[860px]">
+              <table className="xl-table min-w-[1020px]">
                 <thead>
                   <tr>
                     <th className="xl-ctr" style={{ minWidth: 140 }}>场地方</th>
@@ -706,6 +706,7 @@ function LandlordMonthlyDialog({ open, period: initialPeriod, onClose }: { open:
                     <th className="xl-num">最终金额(元) ✏️</th>
                     <th className="xl-num">损耗(度)</th>
                     <th className="xl-num">损耗金额</th>
+                    <th className="xl-num">共享表未分摊(度/元)</th>
                     <th className="xl-ctr"></th>
                   </tr>
                 </thead>
@@ -715,7 +716,7 @@ function LandlordMonthlyDialog({ open, period: initialPeriod, onClose }: { open:
                     const dirty = r.landlordId in edits;
                     const loss = r.lossKwh ?? 0;
                     return (
-                      <tr key={r.landlordId} className={loss !== 0 ? "bg-amber-50/60" : ""}>
+                      <tr key={r.landlordId} className={loss !== 0 || r.sharedUnallocatedKwh !== 0 ? "bg-amber-50/60" : ""}>
                         <td className="px-2 py-1 font-medium">{r.landlordName}</td>
                         <td className="xl-num text-slate-600">{r.refKwh != null ? fmtNum(r.refKwh) : "—"}</td>
                         <td className="xl-num text-slate-500">{r.unitPrice != null ? r.unitPrice : "—"}</td>
@@ -724,20 +725,23 @@ function LandlordMonthlyDialog({ open, period: initialPeriod, onClose }: { open:
                             placeholder={r.refKwh != null ? String(r.refKwh) : "—"}
                             title="最终付给场地方老板的电量（默认 = 参考电量）"
                             value={e.kwh}
-                            onChange={(ev) => setEdits((p) => ({ ...p, [r.landlordId]: { ...e, kwh: ev.target.value } }))} />
+                            onChange={(ev) => setEdits((p) => ({ ...p, [r.landlordId]: { kwh: ev.target.value, amount: "" } }))} />
                         </td>
                         <td className="px-1 py-1">
                           <input type="number" step="0.01" min="0" className={`${inputCls} h-7 w-24 text-xs`}
                             placeholder="账单金额"
                             title="账单只给钱不给度数时直接填金额（系统按场地单价反推电量）"
                             value={e.amount}
-                            onChange={(ev) => setEdits((p) => ({ ...p, [r.landlordId]: { ...e, amount: ev.target.value } }))} />
+                            onChange={(ev) => setEdits((p) => ({ ...p, [r.landlordId]: { kwh: "", amount: ev.target.value } }))} />
                         </td>
                         <td className={`xl-num font-medium ${loss > 0 ? "text-amber-700" : loss < 0 ? "text-rose-600" : "text-slate-400"}`}>
                           {r.lossKwh != null ? fmtNum(r.lossKwh) : "—"}
                         </td>
                         <td className={`xl-num ${loss > 0 ? "text-amber-700" : "text-slate-400"}`}>
                           {r.lossAmount != null ? fmtMoney(r.lossAmount) : "—"}
+                        </td>
+                        <td className="xl-num text-amber-700">
+                          {fmtNum(r.sharedUnallocatedKwh ?? 0)} / {fmtMoney(r.sharedUnallocatedAmount ?? 0)}
                         </td>
                         <td className="xl-ctr">
                           <Button size="sm" variant="outline" className="h-7 px-2 text-[11px]"
@@ -754,8 +758,8 @@ function LandlordMonthlyDialog({ open, period: initialPeriod, onClose }: { open:
             </div>
           )}
           <p className="text-[11px] leading-relaxed text-slate-400">
-            · 只填电量或只填金额都可以：只填金额时系统按「场地合同单价」反推电量。<br />
-            · 保存后该月台账自动重算：各品牌行的付款金额<b>不变</b>（品牌不承担损耗），差额进独立的<b className="text-amber-700">「损耗行」</b>（利润 = −损耗金额）。<br />
+            · 只填电量或只填金额都可以：只填金额时按场地合同单价估算电量，但最终应付仍以账单金额为准。<br />
+            · 场地损耗 = 最终结算电量 − 已关联电表实际用量；共享表未分摊差额单独列示，两项都由我方承担。<br />
             · 没填的场地按「最终 = 参考」处理（损耗 0）。已保存过的行会在下次生成时保留人工值（不被同步覆盖）。
           </p>
         </div>
@@ -815,16 +819,13 @@ export default function Electricity() {
 
   const months: any[] = q.data ?? [];
 
-  // ── 平铺台账行：一行 = 一块电表 × 月份 ──
+  // ── 平铺台账行：先按电表展开，最终汇总为每场地一行 ──
   //   共用表：付款只有一整笔（整表读数 × 场地单价）、收款按品牌分摊。
-  //   ★场地级损耗（row_type=loss：我方承担、不归主体、不摊品牌）**不再单独成行**，
-  //     而是并入「该场地当月的第一行」—— 因为那一行代表的是"这块表付给场地方的钱"，
-  //     损耗正是这笔钱里品牌没承担的那一段 ⇒ 合并后 电量 / 付款 / 利润 才是"付场地方"的真实口径。
-  //     损耗仅在行内用小字标注（含损耗 XX 度 / XX 元），展开行里也仍能看到明细。
+  //   场地级最终账单与分表应付的平衡调整并入场地汇总；实际场地损耗、共享表未分摊量分别标注。
   const flatRows = useMemo(() => {
     const out: any[] = [];
     const r2 = (x: number) => Math.round(x * 100) / 100;
-    const lossByGroup = new Map<string, { kwh: number; pay: number; rows: any[] }>();
+    const lossByGroup = new Map<string, { kwh: number; pay: number; siteLossKwh: number; siteLossPay: number; sharedKwh: number; sharedPay: number; rows: any[] }>();
     const firstIdxOfGroup = new Map<string, number>();   // `${月份}|${场地}` → 该组第一行在 out 的下标
 
     for (const m of months) {
@@ -842,13 +843,20 @@ export default function Electricity() {
           isLoss: rowType === "loss",
           lossKwh: 0,
           lossPay: 0,
+          sharedUnallocatedKwh: 0,
+          sharedUnallocatedPay: 0,
           hasLoss: false,
           rowG: g,
         };
         if (mgs.length === 0) {
           if (rowType === "loss") {
             // 场地级损耗：暂存，稍后并入同场地同月第一行
-            const cur = lossByGroup.get(gk) ?? { kwh: 0, pay: 0, rows: [] as any[] };
+            const cur = lossByGroup.get(gk) ?? {
+              kwh: 0, pay: 0, siteLossKwh: Number(g.siteLossKwh ?? 0),
+              siteLossPay: Number(g.siteLossAmount ?? 0),
+              sharedKwh: Number(g.sharedUnallocatedKwh ?? 0),
+              sharedPay: Number(g.sharedUnallocatedAmount ?? 0), rows: [] as any[],
+            };
             cur.kwh = r2(cur.kwh + Number(g.kwh ?? 0));
             cur.pay = r2(cur.pay + Number(g.payAmount ?? 0));
             cur.rows.push(g);
@@ -911,7 +919,9 @@ export default function Electricity() {
           period: (gk.split("|")[0]) || g0.period,
           landlordKey: g0.key, landlordName: g0.name,
           entityId: null, entityName: "—（我方承担）",
-          rowType: "loss", isLoss: true, lossKwh: L.kwh, lossPay: L.pay, hasLoss: true, rowG: g0,
+          rowType: "loss", isLoss: true, lossKwh: L.siteLossKwh, lossPay: L.siteLossPay,
+          sharedUnallocatedKwh: L.sharedKwh, sharedUnallocatedPay: L.sharedPay,
+          adjustmentKwh: L.kwh, adjustmentPay: L.pay, hasLoss: true, rowG: g0,
           key: `${gk}|loss-only`, meterNo: "", meterName: "场地级损耗（我方承担）",
           transformerRatio: null, brands: [], brandIds: [],
           kwh: L.kwh, payUnitPrice: null, payAmount: L.pay, payStatus: g0.payStatus,
@@ -922,9 +932,13 @@ export default function Electricity() {
         continue;
       }
       const row = out[idx];
-      row.hasLoss = true;
-      row.lossKwh = L.kwh;
-      row.lossPay = L.pay;
+      row.hasLoss = L.siteLossKwh !== 0 || L.siteLossPay !== 0;
+      row.lossKwh = L.siteLossKwh;
+      row.lossPay = L.siteLossPay;
+      row.sharedUnallocatedKwh = L.sharedKwh;
+      row.sharedUnallocatedPay = L.sharedPay;
+      row.adjustmentKwh = L.kwh;
+      row.adjustmentPay = L.pay;
       row.kwh = r2(Number(row.kwh ?? 0) + L.kwh);
       row.payAmount = r2(Number(row.payAmount ?? 0) + L.pay);
       row.profit = r2(Number(row.profit ?? 0) - L.pay);
@@ -968,25 +982,25 @@ export default function Electricity() {
     });
   }, [flatRows, fLandlord, fBrand, fEntity, fRowType, fPay, fCollect, keyword]);
 
-  /* ══ 两级聚合（★多月份改造）══
-     L1 月级行：一行 = 场地 × 主体 × 类型 × 月份（把「电表×月」级行合并；损耗已并入其中的品牌行）
-     L0 场地块：一行 = 场地 × 主体 × 类型，数值 = 所选区间合计，展开后是各月（L1）
-     筛选在「电表×月」级先做（rows），所以聚合后天然只含命中筛选的月份。 */
+  /* ══ 两级聚合 ══
+     L1 月级行：一行 = 场地 × 月份；L0 场地块：一行 = 场地 × 所选区间。
+     主体、类型和品牌差异保留在明细里，不把同一场地拆成多个汇总行。
+     筛选在电表明细层先做，因此汇总数只包含筛选命中的数据。 */
   const periodRows = useMemo(() => {
     const map = new Map<string, any>();
     const r2 = (x: number) => Math.round(x * 100) / 100;
     for (const r of rows) {
-      const k = `${r.landlordKey}|${r.entityId ?? "x"}|${r.rowType}|${r.period}`;
+      const k = `${r.landlordKey}|${r.period}`;
       let g = map.get(k);
       if (!g) {
         g = {
           key: `L1|${k}`,
           period: r.period,
           landlordKey: r.landlordKey, landlordName: r.landlordName,
-          entityId: r.entityId ?? null, entityName: r.entityName,
-          rowType: r.rowType, isLoss: !!r.isLoss, rowG: r.rowG,
+          entityIds: new Set<number>(), entityNames: new Set<string>(), rowTypes: new Set<string>(),
+          rowType: r.rowType, isLoss: false, rowG: r.rowG,
           kwh: 0, payAmount: 0, collectAmount: 0, collectNet: 0, elecTax: 0, profit: 0,
-          lossKwh: 0, lossPay: 0, hasLoss: false,
+          lossKwh: 0, lossPay: 0, sharedUnallocatedKwh: 0, sharedUnallocatedPay: 0, hasLoss: false,
           details: [] as any[],
           _payPrices: new Set<number>(), _collectPrices: new Set<number>(), _ratios: new Set<number>(),
           _payStatus: new Set<string>(), _collectStatus: new Set<string>(),
@@ -997,6 +1011,9 @@ export default function Electricity() {
         };
         map.set(k, g);
       }
+      if (r.entityId != null) g.entityIds.add(Number(r.entityId));
+      if (r.entityName) g.entityNames.add(String(r.entityName));
+      g.rowTypes.add(r.rowType || "normal");
       g.kwh = r2(g.kwh + Number(r.kwh ?? 0));
       g.payAmount = r2(g.payAmount + Number(r.payAmount ?? 0));
       g.collectAmount = r2(g.collectAmount + Number(r.collectAmount ?? 0));
@@ -1020,9 +1037,19 @@ export default function Electricity() {
         g.lossKwh = r2(g.lossKwh + Number(r.lossKwh ?? 0));
         g.lossPay = r2(g.lossPay + Number(r.lossPay ?? 0));
       }
+      g.sharedUnallocatedKwh = r2(g.sharedUnallocatedKwh + Number(r.sharedUnallocatedKwh ?? 0));
+      g.sharedUnallocatedPay = r2(g.sharedUnallocatedPay + Number(r.sharedUnallocatedPay ?? 0));
     }
     return [...map.values()].map((g) => ({
       ...g,
+      entityId: g.entityIds.size === 1 ? [...g.entityIds][0] : null,
+      entityName: g.entityNames.size === 1 ? [...g.entityNames][0] : g.entityNames.size > 1 ? "多个报税主体" : "未指定主体",
+      rowType: g.rowTypes.size === 1 ? [...g.rowTypes][0] : "summary",
+      rowG: {
+        ...(g.rowG ?? {}), landlord_id: g.landlordKey, period: g.period,
+        payAmount: g.payAmount, collectNet: g.collectNet, profit: g.profit,
+        kwh: g.kwh, details: g.details,
+      },
       brands: [...g.brands] as string[],
       brandIds: [...g.brandIds] as number[],
       recordIds: [...g.recordIds] as number[],
@@ -1042,16 +1069,16 @@ export default function Electricity() {
     const map = new Map<string, any>();
     const r2 = (x: number) => Math.round(x * 100) / 100;
     for (const p of periodRows) {
-      const k = `L0|${p.landlordKey}|${p.entityId ?? "x"}|${p.rowType}`;
+      const k = `L0|${p.landlordKey}`;
       let g = map.get(k);
       if (!g) {
         g = {
           key: k,
           landlordKey: p.landlordKey, landlordName: p.landlordName,
-          entityId: p.entityId, entityName: p.entityName,
-          rowType: p.rowType, isLoss: p.isLoss,
+          entityIds: new Set<number>(), entityNames: new Set<string>(), rowTypes: new Set<string>(),
+          rowType: p.rowType, isLoss: false,
           kwh: 0, payAmount: 0, collectAmount: 0, collectNet: 0, elecTax: 0, profit: 0,
-          lossKwh: 0, lossPay: 0, hasLoss: false,
+          lossKwh: 0, lossPay: 0, sharedUnallocatedKwh: 0, sharedUnallocatedPay: 0, hasLoss: false,
           months: [] as any[],
           brands: new Set<string>(), meterNos: new Set<string>(),
           paid: 0, paidTotal: 0, collected: 0, collectedTotal: 0,
@@ -1059,6 +1086,9 @@ export default function Electricity() {
         };
         map.set(k, g);
       }
+      if (p.entityId != null) g.entityIds.add(Number(p.entityId));
+      if (p.entityName) g.entityNames.add(String(p.entityName));
+      g.rowTypes.add(p.rowType || "normal");
       g.kwh = r2(g.kwh + Number(p.kwh ?? 0));
       g.payAmount = r2(g.payAmount + Number(p.payAmount ?? 0));
       g.collectAmount = r2(g.collectAmount + Number(p.collectAmount ?? 0));
@@ -1070,6 +1100,8 @@ export default function Electricity() {
         g.lossKwh = r2(g.lossKwh + Number(p.lossKwh ?? 0));
         g.lossPay = r2(g.lossPay + Number(p.lossPay ?? 0));
       }
+      g.sharedUnallocatedKwh = r2(g.sharedUnallocatedKwh + Number(p.sharedUnallocatedKwh ?? 0));
+      g.sharedUnallocatedPay = r2(g.sharedUnallocatedPay + Number(p.sharedUnallocatedPay ?? 0));
       for (const b of p.brands ?? []) g.brands.add(b);
       for (const n of p.meterNos ?? []) g.meterNos.add(n);
       for (const s of p._sources ?? []) if (s) g._sources.add(s);
@@ -1079,6 +1111,9 @@ export default function Electricity() {
     }
     return [...map.values()].map((g) => ({
       ...g,
+      entityId: g.entityIds.size === 1 ? [...g.entityIds][0] : null,
+      entityName: g.entityNames.size === 1 ? [...g.entityNames][0] : g.entityNames.size > 1 ? "多个报税主体" : "未指定主体",
+      rowType: g.rowTypes.size === 1 ? [...g.rowTypes][0] : "summary",
       brands: [...g.brands] as string[],
       meterCount: g.meterNos.size,
       dataSource: g._sources.size === 1 ? [...g._sources][0] : (g._sources.size > 1 ? "mixed" : null),
@@ -1309,7 +1344,7 @@ export default function Electricity() {
               const colMixed = L0.collectedTotal > 1 && L0.collected > 0 && L0.collected < L0.collectedTotal;
               return (
                 <Fragment key={L0.key}>
-                  {/* ── L0：场地 × 主体 × 类型（数值 = 所选区间合计；展开看逐月）── */}
+                  {/* ── L0：每个场地一行（数值 = 所选区间合计；展开看逐月）── */}
                   <tr className={`${open0 ? "xl-open" : ""} font-medium`}>
                     <td className="xl-freeze xl-ctr" style={{ left: 0 }}>
                       <button className="text-slate-500 hover:text-slate-700" onClick={() => toggle(L0.key)} title="展开该场地在该区间内的各月份">
@@ -1332,7 +1367,9 @@ export default function Electricity() {
                           : <span className="font-medium text-purple-600">{L0.brands.length} 个品牌</span>}
                     </td>
                     <td className="xl-ctr">
-                      {L0.isLoss ? (
+                      {L0.rowType === "summary" ? (
+                        <span className="rounded-full bg-blue-50 px-1.5 py-0.5 text-[10px] text-blue-700">场地汇总</span>
+                      ) : L0.isLoss ? (
                         <span className="rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700">损耗</span>
                       ) : L0.rowType === "civil" ? (
                         <span className="rounded-full bg-slate-200 px-1.5 py-0.5 text-[10px] font-medium text-slate-600"
@@ -1351,15 +1388,17 @@ export default function Electricity() {
                     <td className="xl-num text-slate-700">
                       {fmtNum(L0.kwh)}
                       {L0.hasLoss && !L0.isLoss && (
-                        <div className="text-[9px] font-normal text-amber-600" title="付给场地方的电量 = 各品牌分摊电量 + 场地级损耗">含损耗 {fmtNum(L0.lossKwh)}</div>
+                        <div className="text-[9px] font-normal text-amber-600" title="场地损耗 = 最终结算电量 − 已关联电表实际用量">场地损耗 {fmtNum(L0.lossKwh)}</div>
                       )}
+                      {L0.sharedUnallocatedKwh !== 0 && <div className="text-[9px] font-normal text-orange-600">共享表未分摊 {fmtNum(L0.sharedUnallocatedKwh)}</div>}
                     </td>
                     <td className="xl-num"><span className="xl-muted">—</span></td>
                     <td className="xl-num xl-neg">
                       {fmtMoney(L0.payAmount)}
                       {L0.hasLoss && !L0.isLoss && (
-                        <div className="text-[9px] font-normal text-amber-600" title="场地级损耗（我方承担）：最终付场地方电量 − 已入台账的各品牌电量">含损耗 {fmtMoney(L0.lossPay)}</div>
+                        <div className="text-[9px] font-normal text-amber-600" title="场地损耗金额 = 场地损耗电量 × 场地单价">场地损耗 {fmtMoney(L0.lossPay)}</div>
                       )}
+                      {L0.sharedUnallocatedPay !== 0 && <div className="text-[9px] font-normal text-orange-600">表内未分摊 {fmtMoney(L0.sharedUnallocatedPay)}</div>}
                     </td>
                     <td className="xl-ctr">
                       <span title="付款状态按月记账（主表只汇总，点开逐月查看/修改）"
@@ -1437,7 +1476,9 @@ export default function Electricity() {
                           : <span className="font-medium text-purple-600">{r.brands.length} 个品牌</span>}
                     </td>
                     <td className="xl-ctr">
-                      {r.isLoss ? (
+                      {r.rowType === "summary" ? (
+                        <span className="rounded-full bg-blue-50 px-1.5 py-0.5 text-[10px] text-blue-700">场地汇总</span>
+                      ) : r.isLoss ? (
                         <span className="rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700"
                           title="该场地当月只有损耗、没有电表行（退化显示）">
                           损耗
@@ -1459,15 +1500,17 @@ export default function Electricity() {
                     <td className="xl-num text-slate-600">
                       {r.kwh != null ? fmtNum(r.kwh) : <span className="xl-muted">—</span>}
                       {r.hasLoss && !r.isLoss && (
-                        <div className="text-[9px] font-normal text-amber-600" title="付给场地方的电量 = 各品牌分摊电量 + 场地级损耗">含损耗 {fmtNum(r.lossKwh)}</div>
+                        <div className="text-[9px] font-normal text-amber-600" title="场地损耗 = 最终结算电量 − 已关联电表实际用量">场地损耗 {fmtNum(r.lossKwh)}</div>
                       )}
+                      {r.sharedUnallocatedKwh !== 0 && <div className="text-[9px] font-normal text-orange-600">共享表未分摊 {fmtNum(r.sharedUnallocatedKwh)}</div>}
                     </td>
                     <td className="xl-num">{Number(r.payUnitPrice ?? 0) > 0 ? fmtNum(r.payUnitPrice) : <span className="xl-muted">—</span>}</td>
                     <td className="xl-num xl-neg" title={Number(r.payUnitPrice ?? 0) > 0 ? undefined : "场地合同未填电费单价（付款金额按 0 计）"}>
                       {fmtMoney(r.payAmount)}
                       {r.hasLoss && !r.isLoss && (
-                        <div className="text-[9px] font-normal text-amber-600" title="场地级损耗（我方承担）：最终付场地方电量 − 已入台账的各品牌电量">含损耗 {fmtMoney(r.lossPay)}</div>
+                        <div className="text-[9px] font-normal text-amber-600" title="场地损耗金额 = 场地损耗电量 × 场地单价">场地损耗 {fmtMoney(r.lossPay)}</div>
                       )}
+                      {r.sharedUnallocatedPay !== 0 && <div className="text-[9px] font-normal text-orange-600">表内未分摊 {fmtMoney(r.sharedUnallocatedPay)}</div>}
                     </td>
                     <td className="xl-ctr">
                       {statusEdit?.key === payKey && statusEdit.field === "pay" ? (
@@ -1586,23 +1629,43 @@ export default function Electricity() {
                               {r.hasLoss && !r.isLoss && (
                                 <tr className="bg-amber-50/70">
                                   <td className="font-medium text-amber-700"
-                                    title="场地级损耗 = 最终付场地方电量 − 已入台账的各品牌电量。由我方承担：不摊给品牌、不归报税主体（已并入本行付款金额，不单独占一行）">
-                                    场地级损耗（我方承担）
+                                    title="场地损耗 = 最终结算电量 − 已关联电表实际用量；这是经营指标，不重复计入付款调整">
+                                    场地损耗（经营指标）
                                   </td>
                                   <td className="num">{fmtNum(r.lossKwh)}</td>
-                                  <td className="num">{Number(r.payUnitPrice ?? 0) > 0 ? fmtNum(r.payUnitPrice) : ""}</td>
+                                  <td className="num">—</td>
                                   <td className="num">{fmtMoney(r.lossPay)}</td>
                                   <td className="num">—</td>
                                   <td className="num">—</td>
                                   <td className="num">—</td>
-                                  <td className="num">{fmtMoney(-Number(r.lossPay ?? 0))}</td>
+                                  <td className="num">—</td>
                                   <td className="ctr">—</td>
                                   <td className="ctr"></td>
                                 </tr>
                               )}
-                              {/* 合计 = 各品牌明细 + 场地级损耗，应与主表该行的 电量/付款/收款/利润 完全一致 */}
+                              {r.sharedUnallocatedKwh !== 0 && (
+                                <tr className="bg-orange-50/70">
+                                  <td className="font-medium text-orange-700">共享表未分摊（经营指标）</td>
+                                  <td className="num">{fmtNum(r.sharedUnallocatedKwh)}</td>
+                                  <td className="num">—</td>
+                                  <td className="num">{fmtMoney(r.sharedUnallocatedPay)}</td>
+                                  <td className="num">—</td><td className="num">—</td><td className="num">—</td>
+                                  <td className="num">—</td><td className="ctr">—</td><td className="ctr"></td>
+                                </tr>
+                              )}
+                              {Number(r.adjustmentPay ?? 0) !== 0 && (
+                                <tr className="bg-slate-50">
+                                  <td className="font-medium text-slate-700">场地账单平衡调整（计入应付）</td>
+                                  <td className="num">{fmtNum(r.adjustmentKwh)}</td>
+                                  <td className="num">—</td>
+                                  <td className="num">{fmtMoney(r.adjustmentPay)}</td>
+                                  <td className="num">—</td><td className="num">—</td><td className="num">—</td>
+                                  <td className="num">{fmtMoney(-Number(r.adjustmentPay))}</td><td className="ctr">—</td><td className="ctr"></td>
+                                </tr>
+                              )}
+                              {/* 合计 = 各电表分摊 + 场地账单平衡调整；损耗/未分摊只展示经营指标，不重复入账 */}
                               <tr className="xl-dtotal">
-                                <td>合计（{r.brands.length || 1} 个品牌{r.hasLoss && !r.isLoss ? " + 损耗" : ""}）</td>
+                                <td>合计（{r.meterCount || 0} 块电表）</td>
                                 <td className="num">{fmtNum(r.kwh)}</td>
                                 <td className="num"></td>
                                 <td className="num">{fmtMoney(r.payAmount)}</td>

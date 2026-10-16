@@ -11,6 +11,27 @@ def _log_contract_audit(cur, contract_id: int, action: str, changes: dict, opera
     )
 
 
+def _check_contract_period_overlap(cur, contract_type, landlord_id, brand_id, entity_id,
+                                  start_date, end_date, excluding_id=None):
+    """Reject overlapping versions in the same commercial lane; sequential renewals are valid."""
+    if not landlord_id:
+        return
+    clauses = ["contract_type = %s", "landlord_id = %s"]
+    params = [contract_type, landlord_id]
+    if contract_type == "品牌方合同":
+        clauses.extend(["brand_id IS NOT DISTINCT FROM %s", "entity_id IS NOT DISTINCT FROM %s"])
+        params.extend([brand_id, entity_id])
+    if excluding_id is not None:
+        clauses.append("id <> %s")
+        params.append(excluding_id)
+    clauses.append("daterange(COALESCE(start_date, DATE '1970-01-01'), COALESCE(early_end_date, end_date, DATE '9999-12-31'), '[]') && daterange(COALESCE(%s::date, DATE '1970-01-01'), COALESCE(%s::date, DATE '9999-12-31'), '[]')")
+    params.extend([start_date, end_date])
+    cur.execute("SELECT id FROM contracts WHERE " + " AND ".join(clauses) + " LIMIT 1", params)
+    if cur.fetchone():
+        lane = "场地方" if contract_type == "场地合同" else "该品牌及报税主体"
+        raise ValueError(f"{lane}已有生效期重叠的合同，请调整起止日期")
+
+
 def list_audit(contract_id: int, limit: int = 50):
     conn = get_connection()
     cur = get_dict_cursor(conn)
@@ -26,7 +47,7 @@ def list_audit(contract_id: int, limit: int = 50):
 
 
 def list_contracts(brand_id: int = None, landlord_id: int = None, station_id: int = None, contract_type: str = None, keyword: str = None,
-                   allowed_landlord_ids: list = None):
+                   allowed_landlord_ids: list = None, meter_tag_scope: str = None):
     conn = get_connection()
     cur = get_dict_cursor(conn)
     try:
@@ -40,6 +61,9 @@ def list_contracts(brand_id: int = None, landlord_id: int = None, station_id: in
             conditions.append("c.contract_type = %s"); values.append(contract_type)
         if allowed_landlord_ids is not None:
             conditions.append("c.landlord_id = ANY(%s::int[])"); values.append(allowed_landlord_ids)
+        if meter_tag_scope:
+            conditions.append("EXISTS (SELECT 1 FROM meters sm WHERE sm.landlord_id = c.landlord_id AND sm.tag = %s AND (c.contract_type = '场地合同' OR sm.brand_id IS NOT DISTINCT FROM c.brand_id OR (c.brand_id IS NULL AND sm.is_shared = TRUE)))")
+            values.append(meter_tag_scope)
         if keyword:
             conditions.append("(l.name ILIKE %s OR b.name ILIKE %s)")
             values.extend([f"%{keyword}%", f"%{keyword}%"])
@@ -267,16 +291,10 @@ def create_contract(data: dict, operator: str = None):
     conn = get_connection()
     cur = get_dict_cursor(conn)
     try:
-        # 唯一场地合同校验：同一个场地方只能有一个场地合同
         contract_type = data.get("contractType", "场地合同")
         landlord_id = data.get("landlordId")
-        if contract_type == "场地合同" and landlord_id:
-            cur.execute("""
-                SELECT id FROM contracts
-                WHERE contract_type = '场地合同' AND landlord_id = %s
-            """, (landlord_id,))
-            if cur.fetchone():
-                raise ValueError("该场地方已存在场地合同，一个场地方只能有一份场地合同")
+        _check_contract_period_overlap(cur, contract_type, landlord_id, data.get("brandId"), data.get("entityId"),
+                                       data.get("startDate"), data.get("earlyEndDate") or data.get("endDate"))
 
         cur.execute("""
             INSERT INTO contracts
@@ -341,7 +359,7 @@ def update_contract(contract_id: int, data: dict, operator: str = None):
     conn = get_connection()
     cur = get_dict_cursor(conn)
     try:
-        # 读取更新前的合同（用于唯一场地合同校验、提前结束/退款的合并校验、变更审计）
+        # 读取更新前的合同（用于生效期校验、提前结束/退款的合并校验、变更审计）
         cur.execute("SELECT * FROM contracts WHERE id = %s", (contract_id,))
         before = cur.fetchone()
         if not before:
@@ -397,16 +415,15 @@ def update_contract(contract_id: int, data: dict, operator: str = None):
         if not updates:
             return None
 
-        # 唯一场地合同校验：若更新后是场地合同（或保持场地合同），同 landlord 只能有一份
         new_type = data.get("contractType", before["contract_type"])
         new_landlord = data.get("landlordId", before["landlord_id"])
-        if new_type == "场地合同" and new_landlord:
-            cur.execute("""
-                SELECT id FROM contracts
-                WHERE contract_type = '场地合同' AND landlord_id = %s AND id != %s
-            """, (new_landlord, contract_id))
-            if cur.fetchone():
-                raise ValueError("该场地方已存在场地合同，一个场地方只能有一份场地合同")
+        _check_contract_period_overlap(
+            cur, new_type, new_landlord,
+            data.get("brandId", before.get("brand_id")), data.get("entityId", before.get("entity_id")),
+            data.get("startDate", before.get("start_date")),
+            data.get("earlyEndDate", before.get("early_end_date")) or data.get("endDate", before.get("end_date")),
+            excluding_id=contract_id,
+        )
 
         values.append(contract_id)
         cur.execute(f"UPDATE contracts SET {', '.join(updates)} WHERE id = %s RETURNING *", values)

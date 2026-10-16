@@ -266,16 +266,11 @@ def delete_meter(meter_id: int):
     cur = conn.cursor()
     try:
         # 修复 #9：按依赖顺序清理外键引用，避免带柜子/设备的电表删除报 500
-        cur.execute("SELECT meter_no FROM meters WHERE id = %s", (meter_id,))
-        row = cur.fetchone()
-        meter_no = row[0] if row else None
-
         cur.execute("DELETE FROM electricity_meter_details WHERE meter_id = %s", (meter_id,))
         cur.execute("DELETE FROM meter_shared_allocations WHERE meter_id = %s", (meter_id,))  # 共享电表品牌分摊
         cur.execute("DELETE FROM cabinets WHERE meter_id = %s", (meter_id,))          # 柜子挂在电表下
         cur.execute("UPDATE meter_devices SET meter_id = NULL WHERE meter_id = %s", (meter_id,))  # 第三方设备解除关联
-        if meter_no:
-            cur.execute("DELETE FROM meter_readings WHERE address = %s", (meter_no,))   # 清理孤儿月度读数
+        cur.execute("DELETE FROM meter_readings WHERE meter_id = %s", (meter_id,))
         cur.execute("DELETE FROM meters WHERE id = %s", (meter_id,))
         conn.commit()
         return True
@@ -300,11 +295,11 @@ def get_meter_status(meter_no: str):
             SELECT device_id, address,
                    c0 as total_kwh, c1 as peak_kwh, c2 as sharp_kwh,
                    c3 as flat_kwh, c4 as valley_kwh, remain_money, synced_at
-            FROM meter_status_cache
-            WHERE address = %s OR device_id = %s
-            ORDER BY synced_at DESC NULLS LAST
-            LIMIT 1
-        """, (meter_no, meter_no))
+            FROM meter_status_cache s
+            WHERE s.address = COALESCE((SELECT device_address FROM meters WHERE meter_no = %s), %s)
+               OR s.device_id = %s
+            ORDER BY synced_at DESC NULLS LAST LIMIT 1
+        """, (meter_no, meter_no, meter_no))
         row = cur.fetchone()
         if row:
             row["updated_at"] = row["synced_at"]
@@ -315,15 +310,15 @@ def get_meter_status(meter_no: str):
 
 
 def get_meter_monthly_usage(meter_no: str, limit: int = 12):
-    """获取电表月度用电量（读 meter_readings，period 统一 6 位；返回原始度数+实际度数）"""
+    """获取电表月度用电量（以 meter_id 关联，业务表号可独立修改）。"""
     conn = get_connection()
     cur = get_dict_cursor(conn)
     try:
         cur.execute("""
-            SELECT address, month_period as period, kwh, actual_kwh
-            FROM meter_readings
-            WHERE address = %s
-            ORDER BY month_period DESC
+            SELECT m.meter_no AS address, mr.period, mr.kwh, mr.actual_kwh
+            FROM meter_readings mr JOIN meters m ON m.id = mr.meter_id
+            WHERE m.meter_no = %s
+            ORDER BY mr.period DESC
             LIMIT %s
         """, (meter_no, limit))
         return cur.fetchall()

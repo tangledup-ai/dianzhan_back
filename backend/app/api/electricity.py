@@ -2,7 +2,10 @@ from fastapi import APIRouter, HTTPException, Request
 from ..repositories import electricity_repo, shared_allocation_repo
 from ..domain.electricity_calc import calc_electricity
 from ..domain.electricity_pricing import split_tax
-from ..infra.auth_scope import scope_landlord_ids, ensure_meter_in_scope
+from ..infra.auth_scope import (
+    scope_landlord_ids, scope_meter_tag, ensure_meter_in_scope, ensure_landlord_in_scope,
+    ensure_electricity_record_in_scope,
+)
 from ..infra.period import to_compact
 from .base import CamelJSONResponse
 
@@ -28,16 +31,16 @@ def compute_landlord_ledger(cur, landlord_id: int, period: str):
     """, (landlord_id,))
     meters = cur.fetchall()
 
-    meter_nos = [m["meter_no"] for m in meters if m.get("meter_no")]
+    meter_ids = [m["id"] for m in meters]
     readings = {}
-    if meter_nos:
-        placeholders = ",".join(["%s"] * len(meter_nos))
+    if meter_ids:
+        placeholders = ",".join(["%s"] * len(meter_ids))
         cur.execute(
-            f"SELECT address, kwh, actual_kwh FROM meter_readings WHERE month_period = %s AND address IN ({placeholders})",
-            (period, *meter_nos),
+            f"SELECT meter_id, kwh, actual_kwh FROM meter_readings WHERE period = %s AND meter_id IN ({placeholders})",
+            (period, *meter_ids),
         )
         for r in cur.fetchall():
-            readings[r["address"]] = {"kwh": r["kwh"], "actual": r["actual_kwh"]}
+            readings[r["meter_id"]] = {"kwh": r["kwh"], "actual": r["actual_kwh"]}
 
     # 场地合同（与 generate 同一条匹配链路；v3：contracts 直接挂 landlord_id）
     cur.execute("""
@@ -48,14 +51,14 @@ def compute_landlord_ledger(cur, landlord_id: int, period: str):
     """, (landlord_id,))
     contracts = cur.fetchall()
 
-    pricing = resolve_prices(contracts)
+    pricing = resolve_prices(contracts, period)
     pay_price = pricing["pay_price"]
 
     meter_details = []
     total_pay_kwh = 0.0
     total_collect_kwh = 0.0
     for m in meters:
-        row = readings.get(m["meter_no"]) or {}
+        row = readings.get(m["id"]) or {}
         kwh = float(row.get("kwh") or 0)
         if row.get("actual") is not None:
             actual_kwh = round(float(row["actual"]), 2)
@@ -110,8 +113,28 @@ async def list_electricity(request: Request, landlordId: int = None, period: str
     if allowed is not None:
         records = [r for r in records if r.get("landlord_id") in allowed]
     result = []
+    tag_scope = scope_meter_tag(request)
     for r in records:
         details = electricity_repo.get_meter_details(r["id"])
+        details = [
+            d for d in details
+            if d.get("landlord_id") is not None and d.get("landlord_id") == r.get("landlord_id")
+        ]
+        if not details:
+            continue
+        if tag_scope:
+            details = [d for d in details if (d.get("tag") or "") == tag_scope]
+            if not details:
+                continue
+            # 受限财务只看本类别金额，不能从账单表头反推出其他类别的金额。
+            r = {
+                **r,
+                "pay_kwh": sum(float(d.get("kwh") or 0) for d in details),
+                "pay_amount": sum(float(d.get("pay_amount") or 0) for d in details),
+                "collect_amount": sum(float(d.get("collect_amount") or 0) for d in details),
+                "collect_net": sum(float(d.get("collect_net") or 0) for d in details),
+            }
+            r["profit"] = round(float(r["collect_net"]) - float(r["pay_amount"]), 2)
         result.append({**r, "meterDetails": details})
     return result
 
@@ -122,8 +145,9 @@ async def list_periods():
 
 
 @router.put("/{record_id}/status")
-async def update_electricity_status(record_id: int, data: dict):
+async def update_electricity_status(record_id: int, data: dict, request: Request):
     """只更新付款/收款状态（点击状态徽章编辑；不影响金额与 data_source 标记）"""
+    ensure_electricity_record_in_scope(request, record_id)
     pay = data.get("payStatus")
     collect = data.get("collectStatus")
     if pay is None and collect is None:
@@ -159,6 +183,8 @@ async def reading_detail(request: Request, meterNo: str, period: str):
         meter = cur.fetchone()
         if not meter:
             raise HTTPException(404, "电表不存在")
+        if meter.get("landlord_id") is None:
+            raise HTTPException(404, "该电表尚未关联场地方")
         # 电表类型范围：受限账号只能看范围内电表的抄表信息
         ensure_meter_in_scope(request, meter.get("tag"), meter.get("landlord_id"), hide=True)
 
@@ -168,16 +194,18 @@ async def reading_detail(request: Request, meterNo: str, period: str):
                    curr_reading_date, curr_reading, prev_actual_reading, curr_actual_reading,
                    synced_at
             FROM meter_readings
-            WHERE address = %s AND month_period = %s
-        """, (meterNo, period))
+            WHERE meter_id = %s AND (period = %s OR month_period = %s)
+            ORDER BY id DESC LIMIT 1
+        """, (meter["id"], period, period))
         reading = cur.fetchone()
 
         # 上一个月的用量（供对比）
         prev_period = str(int(period) - 1) if period[4:6] != "01" else f"{int(period[:4]) - 1}12"
         cur.execute("""
             SELECT month_period, kwh FROM meter_readings
-            WHERE address = %s AND month_period = %s
-        """, (meterNo, prev_period))
+            WHERE meter_id = %s AND (period = %s OR month_period = %s)
+            ORDER BY id DESC LIMIT 1
+        """, (meter["id"], prev_period, prev_period))
         prev_row = cur.fetchone()
 
         # 该表当期台账费用（场地×品牌×月的记录中本表明细）
@@ -192,6 +220,7 @@ async def reading_detail(request: Request, meterNo: str, period: str):
             JOIN meters m ON d.meter_id = m.id
             LEFT JOIN brands b ON COALESCE(e.brand_id, m.brand_id) = b.id
             WHERE d.meter_id = %s AND e.period = %s
+              AND m.landlord_id = e.landlord_id AND m.landlord_id IS NOT NULL
             ORDER BY b.name
         """, (meter["id"], period))
         ledger_rows = cur.fetchall()
@@ -225,15 +254,17 @@ async def get_electricity(record_id: int, request: Request):
     record = electricity_repo.get_record(record_id)
     if not record:
         raise HTTPException(404, "电费记录不存在")
-    allowed = scope_landlord_ids(request)
-    if allowed is not None and (record.get("landlord_id") not in allowed):
-        raise HTTPException(403, "无权查看该电费记录")
+    ensure_electricity_record_in_scope(request, record_id, hide=True)
     details = electricity_repo.get_meter_details(record_id)
+    details = [d for d in details if d.get("landlord_id") == record.get("landlord_id") and d.get("landlord_id") is not None]
+    tag_scope = scope_meter_tag(request)
+    if tag_scope:
+        details = [d for d in details if d.get("tag") == tag_scope]
     return {**record, "meterDetails": details}
 
 
 @router.post("", status_code=201)
-async def create_electricity(data: dict):
+async def create_electricity(data: dict, request: Request):
     landlord_id = data.get("landlordId")
     brand_id = data.get("brandId")
     period = to_compact(data.get("period"))
@@ -243,6 +274,7 @@ async def create_electricity(data: dict):
     landlord_id = int(landlord_id)
     if landlord_id <= 0:
         raise HTTPException(400, "请选择场地方")
+    ensure_landlord_in_scope(request, landlord_id)
 
     # 主体归属：显式指定优先；未指定时取该场地×品牌下电表的主体众数（与自动生成同源）
     entity_id = data.get("entityId")
@@ -362,10 +394,13 @@ async def create_electricity(data: dict):
 
 
 @router.put("/{record_id:int}")
-async def update_electricity(record_id: int, data: dict):
+async def update_electricity(record_id: int, data: dict, request: Request):
     record = electricity_repo.get_record(record_id)
     if not record:
         raise HTTPException(404, "电费记录不存在")
+    ensure_electricity_record_in_scope(request, record_id)
+    if data.get("landlordId") is not None:
+        ensure_landlord_in_scope(request, int(data["landlordId"]))
 
     # period 统一为 6 位（避免手工编辑时把 6 位改成 7 位产生重复）
     if data.get("period"):
@@ -432,8 +467,11 @@ async def update_electricity(record_id: int, data: dict):
 
 
 @router.delete("/{record_id:int}")
-async def delete_electricity(record_id: int):
+async def delete_electricity(record_id: int, request: Request):
     record = electricity_repo.get_record(record_id)
+    if not record:
+        raise HTTPException(404, "电费记录不存在")
+    ensure_electricity_record_in_scope(request, record_id)
     electricity_repo.delete_record(record_id)
     # 分红联动：重算被删记录的「场地×月份」分红记录（失败不影响删除）
     try:
@@ -464,7 +502,7 @@ def _shared_full_kwh(readings: dict, meter: dict) -> float:
 
     这是付给场地方的结算电量口径（品牌倒推合计与它的差额即亏空/线损，由我方承担）。
     """
-    row = readings.get(meter["meter_no"]) or {}
+    row = readings.get(meter["id"]) or {}
     if row.get("actual") is not None:
         return round(float(row["actual"]), 2)
     return round(float(row.get("kwh") or 0) * float(meter.get("transformer_ratio") or 1), 2)
@@ -517,15 +555,15 @@ async def generate_electricity(data: dict):
         meters = cur.fetchall()
 
         # 2. 获取该月电表读数（只查相关电表）
-        meter_nos = [m["meter_no"] for m in meters if m.get("meter_no")]
-        if meter_nos:
-            placeholders = ",".join(["%s"] * len(meter_nos))
-            cur.execute(f"SELECT address, kwh, actual_kwh FROM meter_readings WHERE month_period = %s AND address IN ({placeholders})", (period, *meter_nos))
+        meter_ids = [m["id"] for m in meters]
+        if meter_ids:
+            placeholders = ",".join(["%s"] * len(meter_ids))
+            cur.execute(f"SELECT meter_id, kwh, actual_kwh FROM meter_readings WHERE period = %s AND meter_id IN ({placeholders})", (period, *meter_ids))
         else:
-            cur.execute("SELECT address, kwh, actual_kwh FROM meter_readings WHERE month_period = %s AND 1=0", (period,))
+            cur.execute("SELECT meter_id, kwh, actual_kwh FROM meter_readings WHERE period = %s AND 1=0", (period,))
         readings = {}
         for r in cur.fetchall():
-            readings[r["address"]] = {"kwh": r["kwh"], "actual": r["actual_kwh"]}
+            readings[r["meter_id"]] = {"kwh": r["kwh"], "actual": r["actual_kwh"]}
 
         # 3. 获取相关合同（按电表的 landlord 集合）
         from collections import defaultdict
@@ -582,7 +620,7 @@ async def generate_electricity(data: dict):
 
         def _pricing_of(lid):
             if lid not in _pricing_cache:
-                _pricing_cache[lid] = resolve_prices(landlord_contracts_map.get(lid, []) if lid else [])
+                _pricing_cache[lid] = resolve_prices(landlord_contracts_map.get(lid, []) if lid else [], period)
             return _pricing_cache[lid]
 
         alloc_kwh_by_meter = {}
@@ -614,8 +652,8 @@ async def generate_electricity(data: dict):
         updated = []
         warnings = []
         deleted = []
-        # ★V5：各场地「已入台账的品牌付款电量」合计 —— 用于算差额行（见 §5）
-        site_pay_kwh = defaultdict(float)
+        # 各场地已入台账明细的应付金额，供与最终场地账单金额做平衡。
+        site_pay_amount = defaultdict(float)
 
         for (lid, bid, eid, rtype), meter_list in groups.items():
             # ★V5：existing 按 (场地,品牌,主体,行类型) 四元组取 —— 民用行/普通行互不撞键
@@ -624,7 +662,7 @@ async def generate_electricity(data: dict):
             contracts = landlord_contracts_map.get(lid, []) if lid else []
             # 统一单价解析（#2）：付款=场地合同唯一单价；收款=按品牌匹配品牌方合同单价
             from ..domain.electricity_pricing import resolve_prices, brand_collect_price, brand_price_for
-            pricing = resolve_prices(contracts)
+            pricing = resolve_prices(contracts, period)
             landlord_price = pricing["pay_price"]
 
             # 有品牌分摊录入的组：金额是人工确认的应付款，无对应品牌合同也照常生成
@@ -632,7 +670,7 @@ async def generate_electricity(data: dict):
 
             # 只生成有合同的场地×品牌：无场地合同 且（该品牌无品牌方合同 且 无全品牌合同）→ 不生成；有旧记录则删除
             # ★V5：民用行（civil）没有收款对象，只需【场地合同】有单价即可生成（纯成本行）
-            has_site_contract = any(c.get("contract_type") == "场地合同" for c in contracts)
+            has_site_contract = pricing["pay_price"] is not None
             has_brand_contract = (bid in pricing["brand_prices"]) if bid is not None else pricing.get("shared_price") is not None
             if rtype == "civil":
                 if not has_site_contract or landlord_price is None:
@@ -710,7 +748,7 @@ async def generate_electricity(data: dict):
                     })
                     continue
 
-                row = readings.get(m["meter_no"]) or {}
+                row = readings.get(m["id"]) or {}
                 kwh = float(row.get("kwh") or 0)
                 if row.get("actual") is not None:
                     # 有实际值：优先使用（已含倍数）
@@ -753,8 +791,7 @@ async def generate_electricity(data: dict):
             total_pay_amount = sum(d["payAmount"] for d in meter_details)
             total_collect_amount = sum(d["collectAmount"] for d in meter_details)
             total_collect_net = sum(d["collectNet"] for d in meter_details)
-            # ★V5：累加该场地「已入台账的品牌付款电量」，供 §5 算差额行
-            site_pay_kwh[lid] += round(total_pay_kwh, 2)
+            site_pay_amount[lid] += total_pay_amount
 
             # 分摊组的表头收款单价取明细实际单价（可能是人工覆盖的单价，合同里查不到）
             if has_alloc and meter_details:
@@ -831,12 +868,17 @@ async def generate_electricity(data: dict):
             WHERE m.landlord_id IS NOT NULL AND m.meter_no NOT LIKE 'TEST%'
         """)
         site_ref = defaultdict(float)
+        site_shared_unallocated = defaultdict(float)
         for m in cur.fetchall():
-            row = readings.get(m["meter_no"])
+            row = readings.get(m["id"])
             if not row:
                 continue
             if m.get("is_shared"):
                 kwh_m = _shared_full_kwh(readings, m)      # 共用表：整表读数（付场地方的结算口径）
+                if alloc_map.get(m["meter_no"]):
+                    site_shared_unallocated[m["landlord_id"]] += (
+                        kwh_m - float(alloc_kwh_by_meter.get(m["meter_no"], 0.0))
+                    )
             elif row.get("actual") is not None:
                 kwh_m = round(float(row["actual"]), 2)
             else:
@@ -868,34 +910,46 @@ async def generate_electricity(data: dict):
             #   它同时涵盖 V5 的两个值：① 表内未分摊差额（表级）② 场地级损耗（final − Σ所有表）；
             #   ⇒ 账面恒等：Σ各品牌 pay_amount + 差额行 pay_amount = final_kwh × 场地单价
             #   （参考电量 ref_kwh 另存在 landlord_monthly_elec.ref_kwh，供页面对账展示）
-            site_pay = round(site_pay_kwh.get(lid, 0.0), 2)
-            # 无场地单价的场地：差额算不出金额，也谈不上"我方为它付了钱" ⇒ 一律记 0
-            loss_kwh = round(final_kwh - site_pay, 2) if price else 0.0
+            # 场地损耗与共享表未分摊差额是不同的经营数据，分别计算、分别保存。
+            loss_kwh = round(final_kwh - ref_kwh, 2)
             loss_amount = round(loss_kwh * price, 2) if price else 0.0
+            shared_unallocated_kwh = round(site_shared_unallocated.get(lid, 0.0), 2)
+            shared_unallocated_amount = round(shared_unallocated_kwh * price, 2) if price else 0.0
+            # 场地方实际账单金额优先；未单独填金额时按最终电量 × 合同单价。
+            target_pay_amount = (
+                float(lme["final_amount"])
+                if lme and lme.get("data_source") == "manual" and lme.get("final_amount") is not None
+                else round(final_kwh * price, 2) if price else 0.0
+            )
+            adjustment_amount = round(target_pay_amount - site_pay_amount.get(lid, 0.0), 2)
+            adjustment_kwh = round(adjustment_amount / price, 2) if price else 0.0
 
             # 场地级月度电费：ref/单价/损耗由系统算；final_kwh 同步为本轮采用的最终值
             #   （人工填的 = 人工值；没填的 = 参考值）—— 避免迁移预填的陈旧 final 残留在页面上误导
             cur.execute("""
                 INSERT INTO landlord_monthly_elec
-                    (landlord_id, period, ref_kwh, final_kwh, unit_price, loss_kwh, loss_amount, data_source)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, 'auto')
+                    (landlord_id, period, ref_kwh, final_kwh, unit_price, loss_kwh, loss_amount,
+                     shared_unallocated_kwh, shared_unallocated_amount, data_source)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'auto')
                 ON CONFLICT (landlord_id, period) DO UPDATE SET
                     ref_kwh = EXCLUDED.ref_kwh,
                     final_kwh = EXCLUDED.final_kwh,
                     unit_price = EXCLUDED.unit_price,
                     loss_kwh = EXCLUDED.loss_kwh,
                     loss_amount = EXCLUDED.loss_amount,
+                    shared_unallocated_kwh = EXCLUDED.shared_unallocated_kwh,
+                    shared_unallocated_amount = EXCLUDED.shared_unallocated_amount,
                     updated_at = NOW()
-            """, (lid, period, ref_kwh, final_kwh, price or None, loss_kwh, loss_amount))
+            """, (lid, period, ref_kwh, final_kwh, price or None, loss_kwh, loss_amount,
+                  shared_unallocated_kwh, shared_unallocated_amount))
 
             cur.execute("""
                 SELECT id FROM electricity_records
                 WHERE period = %s AND landlord_id = %s AND row_type = 'loss'
             """, (period, lid))
             ex_loss = cur.fetchone()
-            # 只有【知道场地单价】的场地才建差额行 —— 否则"我们为这部分电付了多少钱"无从计算，
-            # 把整场地电量写成"损耗"是误导（无场地合同的场地就是这样）。
-            if price and loss_kwh > 0:
+            # 该行用于保证已入账分表金额和场地最终账单一致；两类差额另存于场地月表。
+            if price and abs(adjustment_amount) >= 0.01:
                 if ex_loss:
                     cur.execute("""
                         UPDATE electricity_records SET
@@ -903,7 +957,7 @@ async def generate_electricity(data: dict):
                             collect_kwh=0, collect_unit_price=NULL, collect_amount=0, collect_net=0,
                             profit=%s, data_source='auto', updated_at=NOW()
                         WHERE id=%s
-                    """, (loss_kwh, price or None, loss_amount, -loss_amount, ex_loss["id"]))
+                    """, (adjustment_kwh, price or None, adjustment_amount, -adjustment_amount, ex_loss["id"]))
                     updated.append(f"{lid}-loss")
                 else:
                     cur.execute("""
@@ -916,12 +970,11 @@ async def generate_electricity(data: dict):
                                 %s, %s, %s, '未付款',
                                 0, NULL, 0, 0, '未到账',
                                 %s, 'auto', %s)
-                    """, (lid, period, loss_kwh, price or None, loss_amount, -loss_amount,
-                          "差额（我方承担）：表内未分摊差额 + 场地级损耗 = 最终付场地方电量 − 已入台账的各品牌电量；"
-                          "不归任何主体、不摊给品牌"))
+                    """, (lid, period, adjustment_kwh, price or None, adjustment_amount, -adjustment_amount,
+                          "场地应付平衡调整；场地损耗与共享表未分摊差额分别记录在场地月度电费中。"))
                     created.append("loss")
             elif ex_loss:
-                # 损耗为 0（财务填的最终电量 = 参考值）⇒ 清掉旧的损耗行，避免残留
+                # 无应付平衡金额时清掉旧行，避免残留。
                 cur.execute("DELETE FROM electricity_records WHERE id = %s", (ex_loss["id"],))
                 deleted.append(ex_loss["id"])
 
@@ -992,7 +1045,9 @@ async def auto_generate_for_meter(meter_no: str, from_period: str = None) -> int
             return 0
         # 有读数的月份 ∪ 有品牌分摊录入的月份（共享电表可能只录了分摊、没录读数）
         cur.execute("""
-            SELECT DISTINCT month_period AS p FROM meter_readings WHERE address = %s
+            SELECT DISTINCT mr.month_period AS p FROM meter_readings mr
+            JOIN meters m ON m.id = mr.meter_id
+            WHERE m.meter_no = %s
             UNION
             SELECT DISTINCT month_period AS p FROM meter_shared_allocations WHERE address = %s
         """, (meter_no, meter_no))
@@ -1103,6 +1158,7 @@ async def monthly_ledger(period: str, dim: str = "landlord", request: Request = 
                 JOIN meters m ON d.meter_id = m.id
                 LEFT JOIN brands b ON COALESCE(e.brand_id, m.brand_id) = b.id
                 WHERE e.period = %s{brand_scope_sql}
+                  AND m.landlord_id = e.landlord_id AND m.landlord_id IS NOT NULL
                 GROUP BY COALESCE(e.brand_id, m.brand_id), b.name
                 ORDER BY name
             """, (period, *brand_scope_vals))
@@ -1125,6 +1181,7 @@ async def monthly_ledger(period: str, dim: str = "landlord", request: Request = 
                     JOIN meters m ON d.meter_id = m.id
                     LEFT JOIN brands b ON COALESCE(e.brand_id, m.brand_id) = b.id
                     WHERE e.period = %s AND {brand_cond}{brand_scope_sql}
+                      AND m.landlord_id = e.landlord_id AND m.landlord_id IS NOT NULL
                     ORDER BY m.meter_name, m.meter_no
                 """, (*brand_vals, *brand_scope_vals))
                 r["details"] = cur.fetchall()
@@ -1134,7 +1191,27 @@ async def monthly_ledger(period: str, dim: str = "landlord", request: Request = 
             if allowed is not None:
                 entity_scope_sql = " AND e.landlord_id = ANY(%s::int[])"
                 entity_scope_vals.append(allowed)
-            cur.execute(f"""
+            if tag_scope:
+                cur.execute(f"""
+                    SELECT e.entity_id AS key, COALESCE(ent.name, '未指定主体') AS name,
+                           COALESCE(SUM(d.kwh), 0) AS kwh,
+                           COALESCE(SUM(d.pay_amount), 0) AS pay_amount,
+                           COALESCE(SUM(d.collect_amount), 0) AS collect_amount,
+                           COALESCE(SUM(d.collect_net), 0) AS collect_net,
+                           COALESCE(SUM(d.collect_net - d.pay_amount), 0) AS profit,
+                           CASE WHEN BOOL_AND(e.pay_status = '已付款') THEN '已付款' ELSE '未付款' END AS pay_status
+                    FROM electricity_meter_details d
+                    JOIN electricity_records e ON e.id = d.electricity_id
+                    JOIN meters m ON m.id = d.meter_id
+                    LEFT JOIN entities ent ON e.entity_id = ent.id
+                    WHERE e.period = %s AND e.row_type <> 'loss'
+                      AND m.landlord_id = e.landlord_id AND m.landlord_id IS NOT NULL
+                      AND m.tag = %s{entity_scope_sql}
+                    GROUP BY e.entity_id, ent.name
+                    ORDER BY name
+                """, (period, tag_scope, *entity_scope_vals))
+            else:
+                cur.execute(f"""
                 SELECT e.entity_id AS key, COALESCE(ent.name, '未指定主体') AS name,
                        COALESCE(SUM(e.pay_kwh), 0) AS kwh,
                        COALESCE(SUM(e.pay_amount), 0) AS pay_amount,
@@ -1148,9 +1225,15 @@ async def monthly_ledger(period: str, dim: str = "landlord", request: Request = 
                 FROM electricity_records e
                 LEFT JOIN entities ent ON e.entity_id = ent.id
                 WHERE e.period = %s AND COALESCE(e.row_type, 'normal') <> 'loss'{entity_scope_sql}
+                  AND EXISTS (
+                      SELECT 1 FROM electricity_meter_details d2
+                      JOIN meters m2 ON m2.id = d2.meter_id
+                      WHERE d2.electricity_id = e.id
+                        AND m2.landlord_id = e.landlord_id AND m2.landlord_id IS NOT NULL
+                  )
                 GROUP BY e.entity_id, ent.name
                 ORDER BY name
-            """, (period, *entity_scope_vals))
+                """, (period, *entity_scope_vals))
             rows = cur.fetchall()
             # 主体明细：该主体该月的 电表行（电表主体 = 台账主体）
             detail_scope_sql, detail_scope_vals = "", []
@@ -1172,6 +1255,7 @@ async def monthly_ledger(period: str, dim: str = "landlord", request: Request = 
                     LEFT JOIN brands b ON COALESCE(e.brand_id, m.brand_id) = b.id
                     LEFT JOIN landlords l ON m.landlord_id = l.id
                     WHERE e.period = %s AND m.entity_id IS NOT DISTINCT FROM %s{detail_scope_sql}
+                      AND m.landlord_id = e.landlord_id AND m.landlord_id IS NOT NULL
                     ORDER BY l.name, m.meter_name, m.meter_no
                 """, (period, r["key"], *detail_scope_vals))
                 r["details"] = cur.fetchall()
@@ -1181,26 +1265,56 @@ async def monthly_ledger(period: str, dim: str = "landlord", request: Request = 
             if allowed is not None:
                 landlord_scope_sql = " AND e.landlord_id = ANY(%s::int[])"
                 landlord_scope_vals.append(allowed)
-            cur.execute(f"""
-                SELECT e.landlord_id AS key, COALESCE(l.name, '未指定场地') AS name,
-                       e.entity_id AS entity_id, COALESCE(ent.name, '未指定主体') AS entity_name,
-                       e.row_type AS row_type,
-                       COALESCE(SUM(e.pay_kwh), 0) AS kwh,
-                       COALESCE(SUM(e.pay_amount), 0) AS pay_amount,
-                       COALESCE(SUM(e.collect_amount), 0) AS collect_amount,
-                       COALESCE(SUM(e.collect_net), 0) AS collect_net,
-                       COALESCE(SUM(e.profit), 0) AS profit,
-                       CASE
-                         WHEN COUNT(*) > 0 AND COUNT(*) FILTER (WHERE e.pay_status = '已付款') = COUNT(*) THEN '已付款'
-                         ELSE '未付款'
-                       END AS pay_status
-                FROM electricity_records e
-                LEFT JOIN landlords l ON e.landlord_id = l.id
-                LEFT JOIN entities ent ON e.entity_id = ent.id
-                WHERE e.period = %s{landlord_scope_sql}
-                GROUP BY e.landlord_id, l.name, e.entity_id, ent.name, e.row_type
-                ORDER BY name
-            """, (period, *landlord_scope_vals))
+            if tag_scope:
+                # 类别受限账号只汇总授权类别下的分表金额，不能由同场地的其他类别账单反推出全场地金额。
+                cur.execute(f"""
+                    SELECT e.landlord_id AS key, COALESCE(l.name, '未指定场地') AS name,
+                           e.entity_id AS entity_id, COALESCE(ent.name, '未指定主体') AS entity_name,
+                           e.row_type AS row_type,
+                           COALESCE(SUM(d.kwh), 0) AS kwh,
+                           COALESCE(SUM(d.pay_amount), 0) AS pay_amount,
+                           COALESCE(SUM(d.collect_amount), 0) AS collect_amount,
+                           COALESCE(SUM(d.collect_net), 0) AS collect_net,
+                           COALESCE(SUM(d.collect_net - d.pay_amount), 0) AS profit,
+                           CASE WHEN BOOL_AND(e.pay_status = '已付款') THEN '已付款' ELSE '未付款' END AS pay_status
+                    FROM electricity_meter_details d
+                    JOIN electricity_records e ON e.id = d.electricity_id
+                    JOIN meters m ON m.id = d.meter_id
+                    LEFT JOIN landlords l ON l.id = e.landlord_id
+                    LEFT JOIN entities ent ON ent.id = e.entity_id
+                    WHERE e.period = %s AND e.row_type <> 'loss'
+                      AND m.landlord_id = e.landlord_id AND m.landlord_id IS NOT NULL
+                      AND m.tag = %s{landlord_scope_sql}
+                    GROUP BY e.landlord_id, l.name, e.entity_id, ent.name, e.row_type
+                    ORDER BY name
+                """, (period, tag_scope, *landlord_scope_vals))
+            else:
+                cur.execute(f"""
+                    SELECT e.landlord_id AS key, COALESCE(l.name, '未指定场地') AS name,
+                           e.entity_id AS entity_id, COALESCE(ent.name, '未指定主体') AS entity_name,
+                           e.row_type AS row_type,
+                           COALESCE(SUM(e.pay_kwh), 0) AS kwh,
+                           COALESCE(SUM(e.pay_amount), 0) AS pay_amount,
+                           COALESCE(SUM(e.collect_amount), 0) AS collect_amount,
+                           COALESCE(SUM(e.collect_net), 0) AS collect_net,
+                           COALESCE(SUM(e.profit), 0) AS profit,
+                           CASE
+                             WHEN COUNT(*) > 0 AND COUNT(*) FILTER (WHERE e.pay_status = '已付款') = COUNT(*) THEN '已付款'
+                             ELSE '未付款'
+                           END AS pay_status
+                    FROM electricity_records e
+                    LEFT JOIN landlords l ON e.landlord_id = l.id
+                    LEFT JOIN entities ent ON e.entity_id = ent.id
+                    WHERE e.period = %s{landlord_scope_sql}
+                      AND EXISTS (
+                          SELECT 1 FROM electricity_meter_details d2
+                          JOIN meters m2 ON m2.id = d2.meter_id
+                          WHERE d2.electricity_id = e.id
+                            AND m2.landlord_id = e.landlord_id AND m2.landlord_id IS NOT NULL
+                      )
+                    GROUP BY e.landlord_id, l.name, e.entity_id, ent.name, e.row_type
+                    ORDER BY name
+                """, (period, *landlord_scope_vals))
             rows = cur.fetchall()
             # 场地明细：该场地该主体该月的 电表行（含 互感器倍数/单价/金额/状态）；受限账号只看范围内类型的电表行
             detail_scope_sql, detail_scope_vals = "", []
@@ -1220,10 +1334,30 @@ async def monthly_ledger(period: str, dim: str = "landlord", request: Request = 
                     JOIN meters m ON d.meter_id = m.id
                     LEFT JOIN brands b ON COALESCE(e.brand_id, m.brand_id) = b.id
                     WHERE e.period = %s AND m.landlord_id = %s
+                      AND m.landlord_id = e.landlord_id AND m.landlord_id IS NOT NULL
                       AND m.entity_id IS NOT DISTINCT FROM %s{detail_scope_sql}
                     ORDER BY m.meter_name, m.meter_no
                 """, (period, r["key"], r.get("entity_id"), *detail_scope_vals))
                 r["details"] = cur.fetchall()
+            if dim == "landlord" and not tag_scope:
+                cur.execute("""
+                    SELECT l.landlord_id, l.loss_kwh, l.loss_amount,
+                           l.shared_unallocated_kwh, l.shared_unallocated_amount
+                    FROM landlord_monthly_elec l
+                    WHERE l.period = %s
+                      AND EXISTS (
+                          SELECT 1 FROM meters m
+                          JOIN meter_readings mr ON mr.meter_id = m.id AND mr.month_period = l.period
+                          WHERE m.landlord_id = l.landlord_id
+                      )
+                """, (period,))
+                loss_by_landlord = {r["landlord_id"]: r for r in cur.fetchall()}
+                for r in rows:
+                    loss = loss_by_landlord.get(r["key"], {})
+                    r["site_loss_kwh"] = loss.get("loss_kwh")
+                    r["site_loss_amount"] = loss.get("loss_amount")
+                    r["shared_unallocated_kwh"] = loss.get("shared_unallocated_kwh")
+                    r["shared_unallocated_amount"] = loss.get("shared_unallocated_amount")
     finally:
         cur.close()
         conn.close()
@@ -1247,6 +1381,10 @@ async def monthly_ledger(period: str, dim: str = "landlord", request: Request = 
             "collectNet": round(net, 2),
             "elecTax": round(collect - net, 2),
             "profit": round(float(r.get("profit") or (net - pay)), 2),
+            "siteLossKwh": round(float(r.get("site_loss_kwh") or 0), 2),
+            "siteLossAmount": round(float(r.get("site_loss_amount") or 0), 2),
+            "sharedUnallocatedKwh": round(float(r.get("shared_unallocated_kwh") or 0), 2),
+            "sharedUnallocatedAmount": round(float(r.get("shared_unallocated_amount") or 0), 2),
             "payStatus": r.get("pay_status") or "未付款",
             "details": r["details"],
         }
@@ -1274,7 +1412,10 @@ async def get_landlord_monthly(request: Request, period: str):
     数据隔离：股东按可见场地过滤。
     """
     from ..infra.database import get_connection, get_dict_cursor
+    from ..infra.auth_scope import scope_meter_tag
     period = str(period).replace("-", "")
+    if scope_meter_tag(request):
+        raise HTTPException(403, "场地最终结算量属于全场地数据，当前账号不能查看")
     allowed = scope_landlord_ids(request) if request is not None else None
 
     conn = get_connection()
@@ -1287,15 +1428,20 @@ async def get_landlord_monthly(request: Request, period: str):
         cur.execute(f"""
             SELECT l.id AS landlord_id, l.name AS landlord_name,
                    lme.ref_kwh, lme.final_kwh, lme.final_amount,
-                   lme.unit_price, lme.loss_kwh, lme.loss_amount, lme.data_source,
+                   lme.unit_price, lme.loss_kwh, lme.loss_amount,
+                   lme.shared_unallocated_kwh, lme.shared_unallocated_amount, lme.data_source,
                    lme.remark
             FROM landlords l
             LEFT JOIN landlord_monthly_elec lme
                    ON lme.landlord_id = l.id AND lme.period = %s
-            WHERE EXISTS (SELECT 1 FROM meters m WHERE m.landlord_id = l.id)
+            WHERE EXISTS (
+                SELECT 1 FROM meters m
+                JOIN meter_readings mr ON mr.meter_id = m.id AND mr.month_period = %s
+                WHERE m.landlord_id = l.id AND m.landlord_id IS NOT NULL
+            )
               {where}
             ORDER BY l.name
-        """, (period, *vals))
+        """, (period, period, *vals))
         rows = cur.fetchall()
         return {
             "period": period,
@@ -1309,6 +1455,8 @@ async def get_landlord_monthly(request: Request, period: str):
                     "unitPrice": float(r["unit_price"]) if r.get("unit_price") is not None else None,
                     "lossKwh": float(r["loss_kwh"]) if r.get("loss_kwh") is not None else None,
                     "lossAmount": float(r["loss_amount"]) if r.get("loss_amount") is not None else None,
+                    "sharedUnallocatedKwh": float(r["shared_unallocated_kwh"] or 0),
+                    "sharedUnallocatedAmount": float(r["shared_unallocated_amount"] or 0),
                     "dataSource": r.get("data_source"),
                     "remark": r.get("remark"),
                 }
@@ -1337,12 +1485,15 @@ async def save_landlord_monthly(landlord_id: int, request: Request, data: dict):
     final_amount = float(final_amount) if final_amount not in (None, "") else None
     if final_kwh is None and final_amount is None:
         raise HTTPException(400, "最终电量 / 最终金额 至少填一个")
+    if (final_kwh is not None and final_kwh < 0) or (final_amount is not None and final_amount < 0):
+        raise HTTPException(400, "最终电量和最终金额不能为负数")
 
     # 数据隔离：股东只能写可见场地
     if request is not None:
-        allowed = scope_landlord_ids(request)
-        if allowed is not None and landlord_id not in set(allowed):
-            raise HTTPException(403, "无该场地的操作权限")
+        from ..infra.auth_scope import scope_meter_tag, ensure_landlord_in_scope
+        if scope_meter_tag(request):
+            raise HTTPException(403, "场地最终结算量属于全场地数据，当前账号不能修改")
+        ensure_landlord_in_scope(request, landlord_id)
     operator = (getattr(request.state, "current_user", None) or {}).get("id") if request is not None else None
 
     conn = get_connection()
@@ -1429,6 +1580,7 @@ async def export_ledger(request: Request, period: str, dim: str = "landlord"):
                        FROM operating_expenses GROUP BY landlord_id, period) op
                    ON op.landlord_id = m.landlord_id AND op.period = %s
             WHERE e.period = %s
+              AND m.landlord_id = e.landlord_id AND m.landlord_id IS NOT NULL
             ORDER BY l.name, b.name, m.meter_name, m.meter_no
         """, (period, period, period))
         rows = cur.fetchall()

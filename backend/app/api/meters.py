@@ -181,7 +181,7 @@ async def import_meters(request: Request, file: UploadFile = File(...)):
 
             # ── 保存当月读数（已关联/未关联都执行）──
             if actual_kwh is None and curr_reading is not None and prev_reading is not None:
-                actual_kwh = round(curr_reading - prev_reading, 2)
+                actual_kwh = round((curr_reading - prev_reading) * float(ratio or meter.get("transformer_ratio") or 1), 2)
 
             if actual_kwh is not None or curr_reading is not None or prev_reading is not None:
                 conn = get_connection()
@@ -189,8 +189,8 @@ async def import_meters(request: Request, file: UploadFile = File(...)):
                 try:
                     cur.execute("""
                         SELECT id FROM meter_readings
-                        WHERE address = %s AND month_period = %s
-                    """, (meter_no, month_key))
+                        WHERE meter_id = %s AND period = %s
+                    """, (meter["id"], month_key))
                     existing = cur.fetchone()
                     if existing:
                         set_sql, vals = [], []
@@ -202,12 +202,17 @@ async def import_meters(request: Request, file: UploadFile = File(...)):
                             set_sql.append("prev_actual_reading = %s"); vals.append(prev_reading)
                         if set_sql:
                             vals.append(existing["id"])
-                            cur.execute(f"UPDATE meter_readings SET {', '.join(set_sql)} WHERE id = %s", vals)
+                        set_sql.extend(["data_source = 'manual'", "month_period = %s", "address = %s"])
+                        vals.extend([month_key, meter_no, existing["id"]])
+                        cur.execute(f"UPDATE meter_readings SET {', '.join(set_sql)} WHERE id = %s", vals)
                     else:
                         cur.execute("""
-                            INSERT INTO meter_readings (address, month_period, actual_kwh, prev_actual_reading, curr_actual_reading)
-                            VALUES (%s, %s, %s, %s, %s)
-                        """, (meter_no, month_key, actual_kwh, prev_reading, curr_reading))
+                            INSERT INTO meter_readings
+                                (meter_id, period, address, month_period, actual_kwh,
+                                 prev_actual_reading, curr_actual_reading, data_source, transformer_ratio_snapshot)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, 'manual', %s)
+                        """, (meter["id"], month_key, meter_no, month_key, actual_kwh,
+                              prev_reading, curr_reading, ratio or meter.get("transformer_ratio") or 1))
                 finally:
                     cur.close(); conn.close()
 

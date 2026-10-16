@@ -49,6 +49,31 @@ class AdminAuthMiddleware(BaseHTTPMiddleware):
                 # 股东账号只读：禁止一切写操作（新增/修改/删除）
                 if user.get("role") == "shareholder" and request.method not in ("GET", "HEAD", "OPTIONS"):
                     return JSONResponse(status_code=403, content={"detail": "股东账号仅可查看，不能修改数据"})
+                role = user.get("role")
+                is_write = request.method not in ("GET", "HEAD", "OPTIONS")
+                # 经营看板含跨电表类别的场地汇总，目前不能安全裁成单一类别视图。
+                # 财务类别账号通过电费/电表专页查看其授权数据，避免从总览反推出其他类别经营额。
+                if role in ("finance", "finance_supervisor") and user.get("meter_tag_scope") in ("共享电表", "民用电表", "合作商电表") and path.startswith("/api/overview"):
+                    return JSONResponse(status_code=403, content={"detail": "该看板包含授权电表类别以外的汇总数据"})
+                if is_write and path.startswith("/api/directory/") and not path.startswith(("/api/directory/platform-users", "/api/directory/third-party-configs")) and role != "boss":
+                    return JSONResponse(status_code=403, content={"detail": "仅老板可维护基础档案"})
+                # 用户、平台凭据和系统密钥属于管理配置，不开放给普通财务账号。
+                if path.startswith("/api/directory/platform-users") and role != "boss":
+                    return JSONResponse(status_code=403, content={"detail": "仅老板可管理平台用户"})
+                if path.startswith("/api/directory/third-party-configs") and role != "boss":
+                    return JSONResponse(status_code=403, content={"detail": "仅老板可管理第三方接口配置"})
+                if path.startswith("/api/system-config") and role != "boss":
+                    return JSONResponse(status_code=403, content={"detail": "仅老板可管理系统配置"})
+                if is_write and path.startswith("/api/contracts") and role not in ("boss", "finance_supervisor"):
+                    return JSONResponse(status_code=403, content={"detail": "仅老板或财务主管可维护合同"})
+                if is_write and path.startswith("/api/approvals/flows") and role != "boss":
+                    return JSONResponse(status_code=403, content={"detail": "仅老板可维护审批流程"})
+                if is_write and path.startswith("/api/contract-schedules") and role not in ("boss", "finance_supervisor"):
+                    return JSONResponse(status_code=403, content={"detail": "仅老板或财务主管可维护合同分期"})
+                if path in ("/api/sync/trigger", "/api/meter-energy/sync") and role not in ("boss", "finance_supervisor"):
+                    return JSONResponse(status_code=403, content={"detail": "无权触发第三方数据同步"})
+                if path == "/api/electricity/generate" and role not in ("boss", "finance_supervisor"):
+                    return JSONResponse(status_code=403, content={"detail": "无权执行全量电费台账生成"})
                 request.state.current_user = dict(user)
             except HTTPException as e:
                 return JSONResponse(status_code=e.status_code, content={"detail": e.detail})
@@ -206,14 +231,14 @@ async def get_meter_monthly(address: str = None, month: str = None, request: Req
                 conditions.append("m.tag = %s")
                 values.append(tag_scope)
         if address:
-            conditions.append("mm.address = %s")
-            values.append(address)
+            conditions.append("(m.meter_no = %s OR m.device_address = %s OR mm.address = %s)")
+            values.extend([address, address, address])
         if month:
             conditions.append("mm.month_period = %s")
             values.append(month)
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         cur.execute(f"""
-            SELECT mm.address, mm.month_period, mm.kwh, mm.synced_at
+            SELECT COALESCE(m.meter_no, mm.address) AS address, mm.month_period, mm.kwh, mm.actual_kwh, mm.synced_at
             FROM meter_readings mm
             LEFT JOIN meters m ON m.id = mm.meter_id
             {where}

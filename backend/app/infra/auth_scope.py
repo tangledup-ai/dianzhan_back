@@ -58,6 +58,52 @@ def ensure_meter_in_scope(request, tag, landlord_id, hide: bool = False):
                             "电表不存在" if hide else "无权操作该场地下的电表")
 
 
+def ensure_landlord_in_scope(request, landlord_id: int, hide: bool = False):
+    """检查场地是否在用户范围内；类别受限用户仅能进入至少有该类表的场地。"""
+    from fastapi import HTTPException
+    if landlord_id is None:
+        raise HTTPException(404 if hide else 403,
+                            "场地不存在" if hide else "无权操作未关联场地的数据")
+    allowed = scope_landlord_ids(request)
+    if allowed is not None and int(landlord_id) not in set(allowed):
+        raise HTTPException(404 if hide else 403,
+                            "场地不存在" if hide else "无权操作该场地的数据")
+
+
+def ensure_electricity_record_in_scope(request, record_id: int, hide: bool = False):
+    """按账单下实际关联的电表校验权限，避免仅凭场地 ID 放行跨类别账单。"""
+    from fastapi import HTTPException
+    from .database import get_connection, get_dict_cursor
+
+    conn = get_connection()
+    cur = get_dict_cursor(conn)
+    try:
+        cur.execute("""
+            SELECT e.landlord_id, e.row_type,
+                   COUNT(m.id) AS meter_count,
+                   COUNT(m.id) FILTER (WHERE m.tag = %s) AS scoped_count
+            FROM electricity_records e
+            LEFT JOIN electricity_meter_details d ON d.electricity_id = e.id
+            LEFT JOIN meters m ON m.id = d.meter_id
+            WHERE e.id = %s
+            GROUP BY e.id, e.landlord_id, e.row_type
+        """, (scope_meter_tag(request) or "", record_id))
+        row = cur.fetchone()
+    finally:
+        cur.close()
+        conn.close()
+
+    if not row:
+        raise HTTPException(404, "电费记录不存在")
+    ensure_landlord_in_scope(request, row.get("landlord_id"), hide=hide)
+    tag_scope = scope_meter_tag(request)
+    if tag_scope:
+        # 场地级损耗是跨类别的整体结算值，不能暴露给只授权单一电表类别的账号。
+        if row.get("row_type") == "loss" or int(row.get("meter_count") or 0) == 0 or int(row.get("meter_count") or 0) != int(row.get("scoped_count") or 0):
+            raise HTTPException(404 if hide else 403,
+                                "电费记录不存在" if hide else "该账单包含授权范围外的电表，不能操作")
+
+
 def scope_landlord_ids(request) -> list or None:
     """返回当前用户允许的 landlord_id 列表；None 表示不限制。
 

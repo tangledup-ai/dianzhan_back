@@ -620,7 +620,7 @@ class DividendCalculator:
         """
         from .electricity_pricing import resolve_prices, brand_price_for
 
-        pricing = resolve_prices(contracts or [])
+        pricing = resolve_prices(contracts or [], period)
         month_period = period.replace("-", "") if period else ""
         alloc_map = shared_allocation_repo.list_allocations_by_period(month_period) if month_period else {}
 
@@ -668,17 +668,16 @@ class DividendCalculator:
                 for r in cur.fetchall():
                     cabinet_map[r["meter_id"]] = max(1, int(r["cnt"] or 0))
 
-            if meter_nos and period:
-                placeholders = ",".join(["%s"] * len(meter_nos))
+            if meter_ids and period:
+                placeholders = ",".join(["%s"] * len(meter_ids))
                 cur.execute(f"""
-                    SELECT mm.address as meter_no, COALESCE(SUM(mm.kwh), 0) as kwh, MAX(mm.actual_kwh) as actual_kwh
+                    SELECT mm.meter_id, mm.kwh, mm.actual_kwh
                     FROM meter_readings mm
-                    WHERE mm.address IN ({placeholders}) AND mm.month_period = %s
-                    GROUP BY mm.address
-                """, (*meter_nos, month_period))
+                    WHERE mm.meter_id IN ({placeholders}) AND mm.period = %s
+                """, (*meter_ids, month_period))
                 rows = cur.fetchall()
-                kwh_map = {r["meter_no"]: float(r["kwh"] or 0) for r in rows}
-                actual_map = {r["meter_no"]: r["actual_kwh"] for r in rows if r.get("actual_kwh") is not None}
+                kwh_map = {r["meter_id"]: float(r["kwh"] or 0) for r in rows}
+                actual_map = {r["meter_id"]: r["actual_kwh"] for r in rows if r.get("actual_kwh") is not None}
 
                 # ★V5：**已取消**"损耗按电量比例摊进品牌付款电量"的 pay_scale 系数 ——
                 #   品牌只承担【自己用电量】的成本；差额与场地级损耗由我方承担，
@@ -717,10 +716,10 @@ class DividendCalculator:
                         continue
                     if m.get("brand_id") is None and brand_id is not None:
                         continue  # 指定品牌时，未做分摊的共享电表不计入该品牌
-                    if m["meter_no"] in actual_map:
-                        kwh = round(float(actual_map[m["meter_no"]]), 2)
+                    if m["id"] in actual_map:
+                        kwh = round(float(actual_map[m["id"]]), 2)
                     else:
-                        kwh = round(kwh_map.get(m["meter_no"], 0) * float(m.get("transformer_ratio") or 1), 2)
+                        kwh = round(kwh_map.get(m["id"], 0) * float(m.get("transformer_ratio") or 1), 2)
                     total_kwh += kwh
                     details.append({
                         "meter_id": m["id"],

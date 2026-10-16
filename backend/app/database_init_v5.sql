@@ -519,8 +519,10 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ex_contract_no_overlap') THEN
         ALTER TABLE contracts ADD CONSTRAINT ex_contract_no_overlap
         EXCLUDE USING gist (
+            contract_type WITH =,
             landlord_id WITH =,
-            COALESCE(brand_id, 0) WITH =,
+            (CASE WHEN contract_type = '品牌方合同' THEN COALESCE(brand_id, 0) ELSE 0 END) WITH =,
+            (CASE WHEN contract_type = '品牌方合同' THEN COALESCE(entity_id, 0) ELSE 0 END) WITH =,
             daterange(COALESCE(start_date, DATE '1970-01-01'),
                       COALESCE(early_end_date, end_date, DATE '9999-12-31'), '[]') WITH &&
         );
@@ -641,6 +643,8 @@ CREATE TABLE IF NOT EXISTS landlord_monthly_elec (
     unit_price   NUMERIC(8,4),       -- 场地合同电费单价（快照，便于历史复现）
     loss_kwh     NUMERIC(14,2),      -- ★损耗电量 = final_kwh − ref_kwh
     loss_amount  NUMERIC(14,2),      -- ★损耗金额 = loss_kwh × unit_price
+    shared_unallocated_kwh NUMERIC(14,2) NOT NULL DEFAULT 0,
+    shared_unallocated_amount NUMERIC(14,2) NOT NULL DEFAULT 0,
     data_source  VARCHAR(16) DEFAULT 'auto' CHECK (data_source IN ('auto','manual')),
     updated_by   INTEGER,
     remark       TEXT,

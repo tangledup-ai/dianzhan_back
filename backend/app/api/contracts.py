@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException, Request, UploadFile, File
 from ..repositories import contract_repo
-from ..infra.auth_scope import scope_landlord_ids
+from ..infra.auth_scope import scope_landlord_ids, scope_meter_tag
 from ..infra.database import get_connection, get_dict_cursor
 from .base import CamelJSONResponse
 import openpyxl
@@ -18,6 +18,7 @@ async def list_contracts(request: Request, brandId: int = None, landlordId: int 
         brand_id=brandId, landlord_id=landlordId, station_id=stationId,
         contract_type=contractType, keyword=keyword,
         allowed_landlord_ids=allowed,
+        meter_tag_scope=scope_meter_tag(request),
     )
 
 
@@ -30,18 +31,22 @@ async def create_contract(data: dict, request: Request):
         raise HTTPException(400, str(e))
     # 动态生成：合同保存后，自动生成该场地所有实表电表有读数月份的台账
     from .electricity import auto_generate_for_landlord
+    warnings = []
     try:
         await auto_generate_for_landlord(result.get("landlord_id") or data.get("landlordId"))
-    except Exception:
-        pass  # 自动生成失败不影响合同保存（可手动点「自动生成」）
+    except Exception as e:
+        warnings.append(f"电费台账未能自动重算：{e}")
     # 分红联动：合同变更后重算该场地已有分红记录（失败不影响合同保存）
     try:
         from ..domain.dividend_refresh import refresh_dividend_records
-        refresh_dividend_records(result.get("landlord_id") or data.get("landlordId"))
-    except Exception:
-        pass
+        dividend_refresh = refresh_dividend_records(result.get("landlord_id") or data.get("landlordId"))
+    except Exception as e:
+        dividend_refresh = None
+        warnings.append(f"分红未能自动刷新：{e}")
     _sync_meter_entities_if_venue(result)
-    return result
+    if dividend_refresh and dividend_refresh.get("protected"):
+        warnings.append(f"有 {dividend_refresh['protected']} 条已提交/已审批/已结算分红未自动更改，请核对是否需要人工更正")
+    return {**result, "automationWarnings": warnings, "dividendRefresh": dividend_refresh}
 
 
 def _sync_meter_entities_if_venue(contract: dict):
@@ -506,18 +511,22 @@ async def update_contract(contract_id: int, data: dict, request: Request):
         raise HTTPException(404, "合同不存在")
     # 动态生成：合同变更后，自动生成该场地所有实表电表有读数月份的台账
     from .electricity import auto_generate_for_landlord
+    warnings = []
     try:
         await auto_generate_for_landlord(result.get("landlord_id") or data.get("landlordId"))
-    except Exception:
-        pass  # 自动生成失败不影响合同保存（可手动点「自动生成」）
+    except Exception as e:
+        warnings.append(f"电费台账未能自动重算：{e}")
     # 分红联动：合同变更后重算该场地已有分红记录（失败不影响合同保存）
     try:
         from ..domain.dividend_refresh import refresh_dividend_records
-        refresh_dividend_records(result.get("landlord_id") or data.get("landlordId"))
-    except Exception:
-        pass
+        dividend_refresh = refresh_dividend_records(result.get("landlord_id") or data.get("landlordId"))
+    except Exception as e:
+        dividend_refresh = None
+        warnings.append(f"分红未能自动刷新：{e}")
     _sync_meter_entities_if_venue(result)
-    return result
+    if dividend_refresh and dividend_refresh.get("protected"):
+        warnings.append(f"有 {dividend_refresh['protected']} 条已提交/已审批/已结算分红未自动更改，请核对是否需要人工更正")
+    return {**result, "automationWarnings": warnings, "dividendRefresh": dividend_refresh}
 
 
 @router.delete("/{contract_id}")
@@ -525,12 +534,16 @@ async def delete_contract(contract_id: int, request: Request):
     operator = (getattr(request.state, "current_user", None) or {}).get("name")
     landlord_id = contract_repo.delete_contract(contract_id, operator)
     # 分红联动：合同删除后重算该场地已有分红记录（失败不影响删除）
+    warning = None
     try:
         from ..domain.dividend_refresh import refresh_dividend_records
-        refresh_dividend_records(landlord_id)
-    except Exception:
-        pass
-    return {"ok": True}
+        dividend_refresh = refresh_dividend_records(landlord_id)
+    except Exception as e:
+        dividend_refresh = None
+        warning = f"合同已删除，但分红刷新失败：{e}"
+    if dividend_refresh and dividend_refresh.get("protected"):
+        warning = f"有 {dividend_refresh['protected']} 条已提交/已审批/已结算分红未自动更改，请核对是否需要人工更正"
+    return {"ok": True, "warning": warning, "dividendRefresh": dividend_refresh}
 
 
 @router.get("/{contract_id}/audit")

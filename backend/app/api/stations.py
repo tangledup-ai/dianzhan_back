@@ -110,19 +110,20 @@ async def get_landlord_meter_view(landlord_id: int, period: str = None, request:
     from ..repositories import contract_repo
     from ..domain.electricity_pricing import resolve_prices, split_tax, brand_price_for
     contracts = contract_repo.list_contracts(landlord_id=landlord_id) or []
-    pricing = resolve_prices(contracts)
+    pricing = resolve_prices(contracts, elec_period)
     pay_price = pricing["pay_price"]  # 场地合同唯一付款单价
 
     # 获取能耗数据（日用电量 + 月用电量）
     from ..infra.database import get_connection, get_dict_cursor
-    meter_nos = [m.get("meter_no") for m in meters if m.get("meter_no")]
+    meter_ids = [m["id"] for m in meters]
+    reading_addresses = list({str(value) for meter in meters for value in (meter.get("meter_no"), meter.get("device_address")) if value})
+    address_to_meter_no = {str(value): str(meter["meter_no"]) for meter in meters for value in (meter.get("meter_no"), meter.get("device_address")) if value}
     daily_energy = []
     monthly_energy = []
-    if meter_nos:
+    if meter_ids:
         conn = get_connection()
         cur = get_dict_cursor(conn)
         try:
-            placeholders = ",".join(["%s"] * len(meter_nos))
             start_d = f"{y}{m:02d}01"
             if m == 12:
                 end_d = f"{y + 1}0101"
@@ -131,18 +132,20 @@ async def get_landlord_meter_view(landlord_id: int, period: str = None, request:
             cur.execute(f"""
                 SELECT address, day_date, kwh
                 FROM meter_daily
-                WHERE address IN ({placeholders}) AND day_date >= %s AND day_date < %s
+                WHERE address = ANY(%s) AND day_date >= %s AND day_date < %s
                 ORDER BY day_date
-            """, (*meter_nos, start_d, end_d))
+            """, (reading_addresses, start_d, end_d))
             daily_energy = cur.fetchall()
+            for row in daily_energy:
+                row["address"] = address_to_meter_no.get(str(row["address"]), row["address"])
 
             cur.execute(f"""
-                SELECT address, month_period, kwh, actual_kwh
-                FROM meter_readings
-                WHERE address IN ({placeholders})
-                ORDER BY month_period DESC
+                SELECT m.meter_no AS address, mr.month_period, mr.kwh, mr.actual_kwh
+                FROM meter_readings mr JOIN meters m ON m.id = mr.meter_id
+                WHERE mr.meter_id = ANY(%s)
+                ORDER BY mr.period DESC
                 LIMIT 30
-            """, meter_nos)
+            """, (meter_ids,))
             monthly_energy = cur.fetchall()
         finally:
             cur.close()

@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException, Query, Request
 from ..repositories import rent_repo, dividend_repo, shared_allocation_repo
-from ..infra.auth_scope import scope_landlord_ids
+from ..infra.auth_scope import scope_landlord_ids, scope_meter_tag, ensure_landlord_in_scope
 from ..infra.period import to_compact
 from .base import CamelJSONResponse
 
@@ -20,6 +20,8 @@ def _scope_rows(request: Request, rows: list) -> list:
 
 @router.get("/expenses")
 async def list_expenses(request: Request, stationId: int = None, landlordId: int = None, period: str = None):
+    if scope_meter_tag(request):
+        raise HTTPException(403, "运营费用属于场地全口径数据，当前账号不能查看")
     # period 统一为 6 位 YYYYMM（与 operating_expenses.period 存储格式一致）
     if period:
         period = to_compact(period)
@@ -27,7 +29,10 @@ async def list_expenses(request: Request, stationId: int = None, landlordId: int
 
 
 @router.post("/expenses", status_code=201)
-async def save_expense(data: dict):
+async def save_expense(data: dict, request: Request):
+    if scope_meter_tag(request):
+        raise HTTPException(403, "运营费用属于场地全口径数据，当前账号不能修改")
+    ensure_landlord_in_scope(request, data.get("landlordId"))
     # period 统一为 6 位 YYYYMM 后入库，保证与分红计算（dividend_calc 用 6 位查）同口径
     period = to_compact(data.get("period"))
     entity_id = data.get("entityId")
@@ -39,19 +44,26 @@ async def save_expense(data: dict):
         entity_id=int(entity_id) if entity_id else None,
     )
     # 自动更新该场地该月的分红记录
-    _update_dividend_records(data.get("landlordId"), period)
-    return result
+    dividend_refresh = _update_dividend_records(data.get("landlordId"), period)
+    return {**result, "dividendRefresh": dividend_refresh}
 
 
 @router.delete("/expenses/{expense_id}")
-async def delete_expense(expense_id: int):
+async def delete_expense(expense_id: int, request: Request):
     # 先获取运营费用信息，用于后续更新分红记录
     expense = rent_repo.get_expense_by_id(expense_id)
+    if not expense:
+        raise HTTPException(404, "运营费用不存在")
+    if scope_meter_tag(request):
+        raise HTTPException(403, "运营费用属于场地全口径数据，当前账号不能修改")
+    ensure_landlord_in_scope(request, expense.get("landlord_id"))
     rent_repo.delete_expense(expense_id)
     # 自动更新该场地该月的分红记录
     if expense:
-        _update_dividend_records(expense.get("landlord_id"), expense.get("period"))
-    return {"ok": True}
+        refresh = _update_dividend_records(expense.get("landlord_id"), expense.get("period"))
+    else:
+        refresh = None
+    return {"ok": True, "dividendRefresh": refresh}
 
 
 # ─── 美团台账Excel数据（v2 已下线）────────────────────────────
@@ -74,7 +86,7 @@ def _update_dividend_records(landlord_id: int, period: str):
     （合同/电表/柜子/台账变更共用同一入口，含审批状态保护）。
     """
     from ..domain.dividend_refresh import refresh_dividend_records
-    refresh_dividend_records(landlord_id, [period] if period else None)
+    return refresh_dividend_records(landlord_id, [period] if period else None)
 
 
 # ─── 场地费月台账（Rent 页核心，v2 重设计）──────────────────
@@ -89,6 +101,8 @@ async def monthly_ledger(request: Request, period: str = Query(..., description=
     from ..infra.database import get_connection, get_dict_cursor
 
     period = to_compact(period)
+    if scope_meter_tag(request):
+        raise HTTPException(403, "场地费台账包含全场地合同信息，当前账号不能查看")
     if len(period) != 6 or not period.isdigit():
         raise HTTPException(400, "月份格式错误，应为 YYYY-MM 或 YYYYMM")
     y, m = int(period[:4]), int(period[4:6])
@@ -247,13 +261,20 @@ async def monthly_ledger(request: Request, period: str = Query(..., description=
             cabs += float((shared_cab_month.get(lid) or {}).get(str(ym), {}).get(bid, 0.0))
         return cabs
 
+    from ..domain.electricity_pricing import rent_income_for_period, rent_refund_for_period
+
     def _contract_item(c: dict) -> dict:
         """合同明细项：月租 + 税费 + 该月分期状态 + 年租金/押金/单台/负责人 + 逐年付款情况"""
         monthly = float(c["monthly_rent"] or 0)
-        annual = float(c["rent_amount"] or monthly * 12)
+        if c["contract_type"] == "品牌方合同":
+            monthly = rent_income_for_period(c, period) - rent_refund_for_period(c, period)
+        elif c.get("start_date") and str(c["start_date"])[:7].replace("-", "") == period:
+            # 场地合同首月租金覆盖普通月租；分期仍按合同周期显示，台账按实际账期展示。
+            monthly = float(c.get("first_month_rent") or monthly)
+        annual = float(c["rent_amount"] or float(c["monthly_rent"] or 0) * 12)
         rent_tax = 0.0
-        if c["contract_type"] == "品牌方合同" and c["rent_tax_enabled"] and c.get("post_tax_rent_price") is not None:
-            rent_tax = round(monthly - float(c["post_tax_rent_price"]), 2)
+        if c["contract_type"] == "品牌方合同" and c.get("rent_tax_enabled"):
+            rent_tax = round(monthly * float(c.get("rent_tax_rate") or 0), 2)
         # 收付拆分：品牌方合同=收款侧（已到账/未到账）；场地合同=付款侧（已付款/未付款）
         collected = uncollected = paid = unpaid = 0.0
         is_income = c["contract_type"] == "品牌方合同"

@@ -1053,17 +1053,19 @@ export default function Shareholders() {
       if (expenseAmount === "" || isNaN(amount) || amount < 0) throw new Error("请输入有效的运营费用金额");
       return saveExpense({ landlordId, period: toCompact(periodEnd), amount, remark: expenseRemark.trim() || null, entityId: expenseEntityId ? Number(expenseEntityId) : null });
     },
-    onSuccess: () => {
+    onSuccess: (result: any) => {
       invalidateOpExpense();
       toast.success(`已保存 ${toDisplay(periodEnd)} 运营费用`);
+      if (result?.dividendRefresh?.protected) toast.warning(`${result.dividendRefresh.protected} 条已提交/已审批/已结算分红未自动改写，请核对后走更正流程`);
     },
     onError: (e: any) => toast.error(e.response?.data?.detail || e.message || "保存失败"),
   });
   const deleteExpenseMutation = useMutation({
     mutationFn: (id: number) => deleteExpense(id),
-    onSuccess: () => {
+    onSuccess: (result: any) => {
       invalidateOpExpense();
       toast.success("运营费用已删除");
+      if (result?.dividendRefresh?.protected) toast.warning(`${result.dividendRefresh.protected} 条已提交/已审批/已结算分红未自动改写，请核对后走更正流程`);
     },
     onError: (e: any) => toast.error(e.response?.data?.detail || e.message || "删除失败"),
   });

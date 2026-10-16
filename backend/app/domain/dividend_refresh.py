@@ -1,8 +1,8 @@
 """分红记录刷新：上游数据（合同 / 电表归属 / 柜子 / 电费台账 / 运营费用）变更后自动重算。
 
 权威计算在 dividend_calc.calculate；本模块只负责"哪些记录需要重算、何时重算"。
-业务约定：分红记录一律跟随最新上游数据自动重算（含已提交/已审批的记录），
-不设状态保护——审批页展示的始终是当前口径下的真实金额。
+未进入审批的分红随上游变动重算。已提交、已批准或已结算记录保留原金额，避免
+静默改写已提交给股东或已经付款的财务凭证；这类记录返回 protected 供调用方提示复核/更正。
 """
 from ..infra.period import to_compact
 from ..repositories import dividend_repo
@@ -25,8 +25,12 @@ def refresh_dividend_records(landlord_id, periods: list = None) -> dict:
         targets = existing
 
     refreshed = 0
+    protected = 0
     for period in targets:
         for record in dividend_repo.list_records(landlord_id=landlord_id, period=period):
+            if record.get("status") in ("申报中", "已通过", "已结算"):
+                protected += 1
+                continue
             calc = dividend_calculator.calculate(landlord_id, record.get("brand_id"), period)
             if not calc:
                 continue
@@ -55,4 +59,4 @@ def refresh_dividend_records(landlord_id, periods: list = None) -> dict:
             for d in shares:
                 dividend_repo.create_share(record["id"], d)
             refreshed += 1
-    return {"refreshed": refreshed}
+    return {"refreshed": refreshed, "protected": protected}

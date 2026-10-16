@@ -154,7 +154,11 @@ export default function Contracts() {
 
   const del = useMutation({
     mutationFn: deleteContract,
-    onSuccess: () => { toast.success("已删除"); queryClient.invalidateQueries({ queryKey: ["contracts"] }); },
+    onSuccess: (result: any) => {
+      toast.success("已删除");
+      if (result?.warning) toast.warning(result.warning);
+      queryClient.invalidateQueries({ queryKey: ["contracts"] });
+    },
   });
 
   // 场地费退款审批（品牌方合同提前终止且填了退款金额的行可见）
@@ -1101,23 +1105,18 @@ function ContractForm({ open, onClose, record, defaultType }: { open: boolean; o
       }
       return contract;
     },
-    onSuccess: () => { toast.success("合同已保存"); queryClient.invalidateQueries(); onClose(); },
+    onSuccess: (result: any) => {
+      toast.success("合同已保存");
+      for (const warning of result?.automationWarnings ?? []) toast.warning(warning);
+      queryClient.invalidateQueries(); onClose();
+    },
     onError: (e: any) => toast.error(e.message),
   });
 
   const submit = (afterSave?: () => void) => {
     if (!f.landlordId) { toast.error("请选择场地方"); return; }
     if (f.contractType === "品牌方合同" && !f.landlordId) { toast.error("品牌方合同必须关联场地方"); return; }
-    // 唯一场地合同校验：同一个场地方只能有一个场地合同
-    if (f.contractType === "场地合同") {
-      const dup = (contracts.data ?? []).find((c: any) =>
-        c.landlordId === Number(f.landlordId) && c.contractType === "场地合同" && c.id !== record?.id
-      );
-      if (dup) {
-        toast.error(`该场地方已存在场地合同（${dup.landlordName || ""}），一个场地方只能有一份场地合同`);
-        return;
-      }
-    }
+    // 合同可按生效期续签/调价；是否与既有版本重叠由服务端按场地、品牌、主体校验。
     // 计算税后电费单价（统一口径：税费 = 收入 × 税率 → 税后单价 = 税前单价 × (1 − 税率)）
     const taxEnabled = f.taxEnabled;
     const taxRate = taxEnabled ? Number(f.taxRate) : null;
