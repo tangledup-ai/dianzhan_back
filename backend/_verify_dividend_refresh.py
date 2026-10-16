@@ -35,7 +35,7 @@ p1 = rec["profit"]
 
 # 3. 置为申报中，再改合同 → 审批保护应跳过
 import psycopg2
-conn = psycopg2.connect("postgresql://quant:quant-speed123@localhost:5432/huandian_v2")
+conn = psycopg2.connect("postgresql://quant:CHANGE_ME_DB_PASSWORD@localhost:5432/huandian_v2")
 cur = conn.cursor(); cur.execute("UPDATE dividend_records SET status='申报中' WHERE id=%s", (rid,)); conn.commit(); cur.close(); conn.close()
 requests.put(f"{B}/api/contracts/40", json={"monthlyRent": "300"}, headers=H)
 rec = get_record()
@@ -46,7 +46,7 @@ r = requests.post(f"{B}/api/dividends/refresh", json={"landlordId": 13}, headers
 print(f"4) 手动 /refresh（申报中）: {r.json()} -> {'✅' if r.json().get('skipped') == 1 else '❌'}")
 
 # 5. 恢复未结算 + 合同月租还原 100 → profit 应回到初始值
-conn = psycopg2.connect("postgresql://quant:quant-speed123@localhost:5432/huandian_v2")
+conn = psycopg2.connect("postgresql://quant:CHANGE_ME_DB_PASSWORD@localhost:5432/huandian_v2")
 cur = conn.cursor(); cur.execute("UPDATE dividend_records SET status='未结算' WHERE id=%s", (rid,)); conn.commit(); cur.close(); conn.close()
 requests.put(f"{B}/api/contracts/40", json={"monthlyRent": "100"}, headers=H)
 rec = get_record()

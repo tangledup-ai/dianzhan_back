@@ -40,7 +40,7 @@ DROP SERVER IF EXISTS src CASCADE;
 CREATE SERVER src FOREIGN DATA WRAPPER postgres_fdw
     OPTIONS (host '127.0.0.1', port '5432', dbname 'huandian_v2');
 CREATE USER MAPPING FOR quant SERVER src
-    OPTIONS (user 'quant', password 'quant-speed123');
+    OPTIONS (user 'quant', password 'CHANGE_ME_DB_PASSWORD');
 CREATE SCHEMA src;
 IMPORT FOREIGN SCHEMA public LIMIT TO (
     brands, entities, landlords, landlord_owners, shareholders, introducers,

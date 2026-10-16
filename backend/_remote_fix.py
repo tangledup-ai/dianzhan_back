@@ -3,12 +3,12 @@
 import psycopg2, re
 
 conn = psycopg2.connect(host="121.43.104.161", port=6433, dbname="huandian_v2",
-                        user="quant", password="quant-speed123", connect_timeout=15)
+                        user="quant", password="CHANGE_ME_DB_PASSWORD", connect_timeout=15)
 conn.autocommit = True
 cur = conn.cursor()
 
 # ── 1. 本地有而远程缺失的索引 ──
-loc = psycopg2.connect(host="localhost", port=5432, dbname="huandian_v2", user="quant", password="quant-speed123")
+loc = psycopg2.connect(host="localhost", port=5432, dbname="huandian_v2", user="quant", password="CHANGE_ME_DB_PASSWORD")
 lcur = loc.cursor()
 lcur.execute("SELECT indexdef FROM pg_indexes WHERE schemaname='public'")
 lidx = set(r[0] for r in lcur.fetchall())

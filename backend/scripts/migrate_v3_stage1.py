@@ -2,7 +2,7 @@
 """v3 阶段1：去站点层——表结构 + 数据迁移（先备份）"""
 import psycopg2, datetime
 
-HOST = "127.0.0.1"; USER = "quant"; PWD = "quant-speed123"; DB = "huandian_v2"
+HOST = "127.0.0.1"; USER = "quant"; PWD = "CHANGE_ME_DB_PASSWORD"; DB = "huandian_v2"
 BAK = r"backend\scripts\backup_v3_stage1.sql"
 
 conn = psycopg2.connect(host=HOST, user=USER, password=PWD, dbname=DB)

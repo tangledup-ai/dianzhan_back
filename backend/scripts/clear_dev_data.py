@@ -6,7 +6,7 @@
 """
 import psycopg2, datetime
 
-HOST = "127.0.0.1"; USER = "quant"; PWD = "quant-speed123"; DB = "huandian_v2"
+HOST = "127.0.0.1"; USER = "quant"; PWD = "CHANGE_ME_DB_PASSWORD"; DB = "huandian_v2"
 BAK = r"backend\scripts\backup_dev_data.sql"
 
 # 待清表（子表在前，TRUNCATE 用 CASCADE 更稳，但备份按依赖顺序）

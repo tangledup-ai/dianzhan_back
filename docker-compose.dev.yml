@@ -9,7 +9,7 @@ services:
     ports:
       - "3001:3001"
     environment:
-      - DATABASE_URL=postgresql://quant:quant-speed123@host.docker.internal:5432/dianzhan-test
+      - DATABASE_URL=postgresql://quant:CHANGE_ME_DB_PASSWORD@host.docker.internal:5432/dianzhan-test
       - PORT=3001
       - TQ_API_URL=https://api1.tqdianbiao.com
       - TQ_AUTH_CODE=5ec0b6bf6f59984d97ec54f775a3c780

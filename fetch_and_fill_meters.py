@@ -27,7 +27,7 @@ NEW_DB_CONFIG = {
     'host': 'localhost',
     'port': 5432,
     'user': 'quant',
-    'password': 'quant-speed123',
+    'password': 'CHANGE_ME_DB_PASSWORD',
     'dbname': 'dianzhan-test'
 }
 

@@ -2,8 +2,8 @@
 """远程 vs 本地 数据库结构与数据诊断（只读，不做任何修改）"""
 import psycopg2, json
 
-LOCAL = dict(host="localhost", port=5432, dbname="huandian_v2", user="quant", password="quant-speed123")
-REMOTE = dict(host="121.43.104.161", port=6433, dbname="huandian_v2", user="quant", password="quant-speed123", connect_timeout=15)
+LOCAL = dict(host="localhost", port=5432, dbname="huandian_v2", user="quant", password="CHANGE_ME_DB_PASSWORD")
+REMOTE = dict(host="121.43.104.161", port=6433, dbname="huandian_v2", user="quant", password="CHANGE_ME_DB_PASSWORD", connect_timeout=15)
 
 def q(conn, sql, params=None):
     cur = conn.cursor()

@@ -9,7 +9,7 @@
 """
 import psycopg2, json, re, datetime
 
-HOST = "127.0.0.1"; USER = "quant"; PWD = "quant-speed123"; DB = "huandian_v2"
+HOST = "127.0.0.1"; USER = "quant"; PWD = "CHANGE_ME_DB_PASSWORD"; DB = "huandian_v2"
 OUT = r"src\mocks\index.ts"
 
 conn = psycopg2.connect(host=HOST, user=USER, password=PWD, dbname=DB)

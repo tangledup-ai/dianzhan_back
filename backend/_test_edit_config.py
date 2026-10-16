@@ -35,7 +35,7 @@ except Exception:
     traceback.print_exc()
 finally:
     import psycopg2
-    conn = psycopg2.connect(host="127.0.0.1", port=5432, dbname="huandian_v2", user="quant", password="quant-speed123")
+    conn = psycopg2.connect(host="127.0.0.1", port=5432, dbname="huandian_v2", user="quant", password="CHANGE_ME_DB_PASSWORD")
     cur = conn.cursor()
     if cfg_id:
         cur.execute("DELETE FROM landlord_shareholder_configs WHERE id = %s", (cfg_id,))

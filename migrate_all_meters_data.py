@@ -20,7 +20,7 @@ DB_CONFIG = {
     'host': 'localhost',
     'port': 5432,
     'user': 'quant',
-    'password': 'quant-speed123'
+    'password': 'CHANGE_ME_DB_PASSWORD'
 }
 
 OLD_DB = {**DB_CONFIG, 'dbname': 'huandian_v2'}

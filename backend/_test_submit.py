@@ -68,7 +68,7 @@ except Exception:
 finally:
     # 清理
     import psycopg2
-    conn = psycopg2.connect(host="127.0.0.1", port=5432, dbname="huandian_v2", user="quant", password="quant-speed123")
+    conn = psycopg2.connect(host="127.0.0.1", port=5432, dbname="huandian_v2", user="quant", password="CHANGE_ME_DB_PASSWORD")
     cur = conn.cursor()
     if created_ids["approval"]:
         aid = created_ids["approval"]

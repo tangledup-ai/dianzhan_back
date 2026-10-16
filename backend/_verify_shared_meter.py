@@ -13,7 +13,7 @@ H = {"Authorization": f"Bearer {token}"}
 B = "http://localhost:3001"
 ok = []
 
-conn = psycopg2.connect("postgresql://quant:quant-speed123@localhost:5432/huandian_v2")
+conn = psycopg2.connect("postgresql://quant:CHANGE_ME_DB_PASSWORD@localhost:5432/huandian_v2")
 cur = conn.cursor()
 # 清理上次运行残留的测试全品牌合同
 cur.execute("DELETE FROM contract_audit_log WHERE contract_id IN (SELECT id FROM contracts WHERE landlord_id = 13 AND brand_id IS NULL AND contract_type = '品牌方合同' AND remark IS NULL AND unit_monthly_rent = 1200)")
@@ -61,7 +61,7 @@ ok.append((f"分红: brandBreakdown={bb} 全品牌共享 venueCost=1200（守恒
            bb.get("全品牌共享") == 1200 and abs(sum(bb.values()) - 1200) < 0.01))
 
 # 还原：电表 99 回到 云貂/民用电表，删测试全品牌合同
-conn = psycopg2.connect("postgresql://quant:quant-speed123@localhost:5432/huandian_v2")
+conn = psycopg2.connect("postgresql://quant:CHANGE_ME_DB_PASSWORD@localhost:5432/huandian_v2")
 cur = conn.cursor()
 cur.execute("UPDATE meters SET brand_id = 17, tag = '民用电表' WHERE id = 99")
 cur.execute("DELETE FROM contract_audit_log WHERE contract_id = %s", (shared_cid,))

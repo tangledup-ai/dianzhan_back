@@ -22,7 +22,7 @@ def calc(period, brand=BID):
     return d["income"]["rentIncome"]["total"], ref, d["profit"]
 
 def schedules():
-    conn = psycopg2.connect("postgresql://quant:quant-speed123@localhost:5432/huandian_v2")
+    conn = psycopg2.connect("postgresql://quant:CHANGE_ME_DB_PASSWORD@localhost:5432/huandian_v2")
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("SELECT seq, period_end, amount FROM rent_income_schedule WHERE contract_id=40 ORDER BY seq")
     rows = cur.fetchall(); cur.close(); conn.close()

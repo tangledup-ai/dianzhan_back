@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """清理本地 Excel 导入的合同与场地方（审计日志精准定位）"""
 import psycopg2
-conn = psycopg2.connect("postgresql://quant:quant-speed123@localhost:5432/huandian_v2")
+conn = psycopg2.connect("postgresql://quant:CHANGE_ME_DB_PASSWORD@localhost:5432/huandian_v2")
 cur = conn.cursor()
 
 # 1. 定位 Excel导入 创建的合同与场地方

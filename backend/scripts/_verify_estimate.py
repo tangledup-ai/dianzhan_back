@@ -1,6 +1,6 @@
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-os.environ["DATABASE_URL"] = "postgresql://quant:quant-speed123@127.0.0.1:5432/huandian_v2"
+os.environ["DATABASE_URL"] = "postgresql://quant:CHANGE_ME_DB_PASSWORD@127.0.0.1:5432/huandian_v2"
 from app.domain.dividend_calc import dividend_calculator
 from app.repositories import dividend_repo
 

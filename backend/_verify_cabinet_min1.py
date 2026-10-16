@@ -21,7 +21,7 @@ def dash_cabinets():
     return requests.get(f"{B}/api/overview", headers=H).json()["cabinetCount"]
 
 def mp_sql():
-    conn = psycopg2.connect("postgresql://quant:quant-speed123@localhost:5432/huandian_v2")
+    conn = psycopg2.connect("postgresql://quant:CHANGE_ME_DB_PASSWORD@localhost:5432/huandian_v2")
     cur = conn.cursor()
     cur.execute("""
         SELECT landlord_id, brand_id,

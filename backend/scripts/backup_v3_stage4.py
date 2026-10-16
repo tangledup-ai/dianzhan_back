@@ -1,7 +1,7 @@
 """v3 阶段4 备份：stations 及含 station_id 的表 → backend/scripts/backup_v3_stage4/ 目录 CSV"""
 import sys, os, csv
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # backend/
-os.environ.setdefault("DATABASE_URL", "postgresql://quant:quant-speed123@127.0.0.1:5432/huandian_v2")
+os.environ.setdefault("DATABASE_URL", "postgresql://quant:CHANGE_ME_DB_PASSWORD@127.0.0.1:5432/huandian_v2")
 from app.infra.database import get_connection
 
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backup_v3_stage4")

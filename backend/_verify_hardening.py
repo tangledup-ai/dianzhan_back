@@ -42,7 +42,7 @@ r = requests.post(f"{B}/api/approvals", json={
 ap_id = r.json()["id"]
 requests.post(f"{B}/api/approvals/{ap_id}/act", json={"action": "通过", "approver": "经办人"}, headers=H)
 import psycopg2
-conn = psycopg2.connect("postgresql://quant:quant-speed123@localhost:5432/huandian_v2")
+conn = psycopg2.connect("postgresql://quant:CHANGE_ME_DB_PASSWORD@localhost:5432/huandian_v2")
 cur = conn.cursor()
 cur.execute("SELECT deposit_refund_amount, deposit_refund_date, deposit_refund_approval_id FROM contracts WHERE id=22")
 dep = cur.fetchone()

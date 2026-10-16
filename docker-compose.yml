@@ -9,7 +9,7 @@ services:
     environment:
       # ★V5 适配（切片1）：切到 huandian_v5（45 表 + 4 视图，见 database_init_v5.sql）
       # 回滚：把库名改回 huandian_v2 即可（旧库一字未动）
-      - DATABASE_URL=postgresql://quant:quant-speed123@host.docker.internal:5432/huandian_v5
+      - DATABASE_URL=postgresql://quant:CHANGE_ME_DB_PASSWORD@host.docker.internal:5432/huandian_v5
       # ★V5：建库脚本改用 v5（否则启动时会把 v2 的 meter_monthly 等表建回新库）
       - DB_SCHEMA_FILE=database_init_v5.sql
       # 让 print() 立即输出，便于看启动/台账生成的日志
